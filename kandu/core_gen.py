@@ -176,20 +176,55 @@ def _parse_json(raw: str, want_array: bool):
     raise GenError(f"模型输出不是有效 JSON（可能被长度截断）：{raw[:200]}")
 
 
-def generate_digest(meta, cfg, on_progress=None, on_chars=None):
-    """生成整本摘要，分批（每批 6 篇）请求，逐批落盘。返回 BookDigest dict。"""
+PLACEHOLDER_SUMMARY = "（本篇摘要生成失败，可重试）"
+
+
+def digest_incomplete(meta) -> bool:
+    """digest 缺文章或含占位摘要即视为不完整。"""
+    digest = store.load_digest(meta["id"])
+    if not digest:
+        return True
+    try:
+        content = store.ensure_content(meta)
+    except Exception:
+        return False
+    have = {a.get("index"): a for a in digest.get("articles", [])}
+    for a in content["articles"]:
+        e = have.get(a["index"])
+        if not e or not (e.get("summaryZh") or "").strip() or e.get("summaryZh") == PLACEHOLDER_SUMMARY:
+            return True
+    return False
+
+
+def generate_digest(meta, cfg, on_progress=None, on_chars=None, resume=True):
+    """生成整本摘要，分批（每批 6 篇）请求，逐批落盘。
+
+    resume=True 时只对缺摘要/占位的文章发请求（智能续传）；
+    落盘保证全量文章都在，失败批次留占位（下次续传补齐）。
+    """
     content = store.ensure_content(meta)
     articles = content["articles"]
     if not articles:
         raise GenError("该文件没有解析出文章")
 
-    batches = [articles[i : i + 6] for i in range(0, len(articles), 6)]
-    collected = {}
     existing = {
         a["index"]: a for a in (store.load_digest(meta["id"]) or {}).get("articles", [])
     }
 
+    def is_done(a):
+        e = existing.get(a["index"])
+        if not e:
+            return False
+        s = (e.get("summaryZh") or "").strip()
+        return bool(s) and s != PLACEHOLDER_SUMMARY
+
+    todo = articles if not resume else [a for a in articles if not is_done(a)]
+    batches = [todo[i : i + 6] for i in range(0, len(todo), 6)]
     total = len(batches)
+    if total == 0:
+        return _final_digest(meta, articles, existing, {}, on_progress)
+
+    collected = {}
     for bi, batch in enumerate(batches):
         if on_progress:
             on_progress(bi, total)
@@ -213,26 +248,28 @@ def generate_digest(meta, cfg, on_progress=None, on_chars=None):
                 "titleZh": (el.get("titleZh") or "").strip(),
                 "summaryZh": (el.get("summaryZh") or "").strip(),
             }
-        merged = dict(existing)
-        merged.update(collected)
-        # 批内缺漏占位
-        for a in batch:
-            if a["index"] not in merged:
-                merged[a["index"]] = {
-                    "index": a["index"],
-                    "titleEn": a["title"],
-                    "titleZh": "",
-                    "summaryZh": "（本篇摘要生成失败，可重试）",
-                }
-        digest = {
-            "bookId": meta["id"],
-            "articles": [merged[k] for k in sorted(merged)],
-            "generatedAt": int(time.time() * 1000),
-        }
+        digest = _final_digest(meta, articles, existing, collected, on_progress, bi, total)
         store.save_digest(digest)
+        for a in batch:
+            if a["index"] in collected:
+                existing[a["index"]] = collected[a["index"]]
         if on_progress:
             on_progress(bi + 1, total)
     return store.load_digest(meta["id"]) or {"bookId": meta["id"], "articles": [], "generatedAt": 0}
+
+
+def _final_digest(meta, articles, existing, collected, on_progress=None, done=None, total=None):
+    merged = {}
+    for a in articles:
+        d = collected.get(a["index"]) or existing.get(a["index"])
+        if not d or not (d.get("summaryZh") or "").strip():
+            d = {"index": a["index"], "titleEn": a["title"], "titleZh": "", "summaryZh": PLACEHOLDER_SUMMARY}
+        merged[a["index"]] = d
+    return {
+        "bookId": meta["id"],
+        "articles": [merged[k] for k in sorted(merged)],
+        "generatedAt": int(time.time() * 1000),
+    }
 
 
 def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None):

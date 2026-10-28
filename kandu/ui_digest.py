@@ -6,6 +6,9 @@ from kandu import core_parsers as store
 from kandu import core_llm as llm
 from kandu import core_gen as gen
 
+# 单飞锁：同一本书同时只允许一个生成线程
+_RUNNING = set()
+
 
 class DigestFrame(tk.Frame):
     def __init__(self, parent, app, meta):
@@ -19,7 +22,7 @@ class DigestFrame(tk.Frame):
         ttk.Button(bar, text="← 返回", command=self.app.show_library).pack(side="left", padx=10, pady=6)
         tk.Label(bar, text=meta["fileName"], bg="#1b4b43", fg="white",
                  font=("Microsoft YaHei UI", 12, "bold")).pack(side="left", padx=6)
-        self.gen_btn = ttk.Button(bar, text="生成/刷新摘要", command=self.generate)
+        self.gen_btn = ttk.Button(bar, text="补全/刷新摘要", command=self.generate)
         self.gen_btn.pack(side="right", padx=10, pady=6)
 
         self.progress_row = tk.Frame(self, bg="white")
@@ -39,11 +42,15 @@ class DigestFrame(tk.Frame):
         self.tree.bind("<Double-1>", self._open)
 
         digest = store.load_digest(meta["id"])
-        if digest:
-            self._fill(digest)
-            self.status.config(text="已加载缓存摘要（点右上角可重新生成）")
-        else:
+        if digest is None:
             self.generate()
+        else:
+            self._fill(digest)
+            if gen.digest_incomplete(meta):
+                self.status.config(text="检测到摘要不完整，自动续传缺失批次…")
+                self.generate()
+            else:
+                self.status.config(text="已加载缓存摘要（点右上角可重新生成）")
 
     def _open(self, _e=None):
         sel = self.tree.selection()
@@ -55,12 +62,16 @@ class DigestFrame(tk.Frame):
     def generate(self):
         if self.generating:
             return
+        if self.meta["id"] in _RUNNING:
+            self.status.config(text="该刊物已在后台生成中，请稍候（防重复烧 token）")
+            return
         cfg = self.app.settings["llm"]
         invalid = llm.validate(cfg)
         if invalid:
             self.status.config(text=f"⚠ {invalid}（点右上角「设置」配置）")
             return
         self.generating = True
+        _RUNNING.add(self.meta["id"])
         self.gen_btn.config(state="disabled")
         self.bar.config(value=0)
         self.status.config(text="解析刊物正文…")
@@ -83,26 +94,33 @@ class DigestFrame(tk.Frame):
     def on_digest_progress(self, p):
         total = max(p["total"], 1)
         self.bar.config(maximum=total, value=p["done"])
-        self.status.config(text=f"生成中… 第 {p['done']}/{p['total']} 批")
+        if p["total"] == 0:
+            self.status.config(text="摘要已完整，无需生成")
+        else:
+            self.status.config(text=f"生成中… 第 {p['done']}/{p['total']} 批（只请求缺失部分）")
 
     def on_digest_chars(self, n):
         if n > 0:
-            self.status.config(text=f"生成中… {self.status.cget('text').split(' · ')[0]} · 已接收 {n} 字")
+            head = self.status.cget("text").split(" · ")[0]
+            self.status.config(text=f"{head} · 已接收 {n} 字")
 
     def on_digest_done(self, digest):
         self.generating = False
+        _RUNNING.discard(self.meta["id"])
         self.gen_btn.config(state="normal")
         self.status.config(text=f"完成：{len(digest['articles'])} 篇（已缓存，重开不再调用大模型）")
         self._fill(digest)
 
     def on_digest_error(self, msg):
         self.generating = False
+        _RUNNING.discard(self.meta["id"])
         self.gen_btn.config(state="normal")
-        self.status.config(text=f"出错：{msg}")
         digest = store.load_digest(self.meta["id"])
         if digest:
             self._fill(digest)
-            self.status.config(text=f"部分批次失败：{msg}（已生成部分已保存，可重试续上）")
+            self.status.config(text=f"部分批次失败：{msg}（已生成部分已保存，再点一次只补缺的）")
+        else:
+            self.status.config(text=f"出错：{msg}")
 
     def _fill(self, digest):
         self.tree.delete(*self.tree.get_children())
