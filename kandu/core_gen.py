@@ -158,6 +158,13 @@ def _parse_json(raw: str, want_array: bool):
 
     def load(s):
         obj = json.loads(s)
+        if want_array and isinstance(obj, dict):
+            # 模型偶发返回单个对象而非数组：尽量收敛
+            if "index" in obj:
+                return [obj]
+            lists = [v for v in obj.values() if isinstance(v, list)]
+            if len(lists) == 1:
+                return lists[0]
         if want_array and not isinstance(obj, list):
             raise ValueError("not array")
         if not want_array and not isinstance(obj, dict):
@@ -174,6 +181,46 @@ def _parse_json(raw: str, want_array: bool):
             except Exception:
                 pass
     raise GenError(f"模型输出不是有效 JSON（可能被长度截断）：{raw[:200]}")
+
+
+# cp1252 特有字符（€‚ƒ„…†‡ˆ‰Š‹ŒŽ''""•–—˜™š›œžŸ）+ Latin-1 补充区
+_MOJIBAKE_CHARS = re.compile(r"[\xa1-\xff€‚ƒ„…†‡ˆ‰Š‹ŒŽ''""•–—˜™š›œžŸ†]")
+
+
+def looks_mojibake(s: str) -> bool:
+    """UTF-8 被 latin-1/cp1252 误解码的特征：出现成片西文扩展区字符。
+    宽松判定即可——修复动作自带可逆性校验，误判只是原样返回，零成本。"""
+    if not s:
+        return False
+    hits = len(_MOJIBAKE_CHARS.findall(s))
+    has_cjk = any("一" <= c <= "鿿" for c in s)
+    return hits >= 2 and not has_cjk
+
+
+def fix_mojibake(s: str) -> str:
+    """被 latin-1/cp1252 误解码的 UTF-8 可确定性还原；不可还原则原样返回。"""
+    if not isinstance(s, str) or not looks_mojibake(s):
+        return s
+    for enc in ("cp1252", "latin-1"):
+        try:
+            return s.encode(enc).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    # cp1252 的 5 个未定义字节解码成 C1 控制符，编码器不接受：手工反向映射
+    out = bytearray()
+    for c in s:
+        o = ord(c)
+        try:
+            out += c.encode("cp1252")
+        except UnicodeEncodeError:
+            if o in (0x81, 0x8D, 0x8F, 0x90, 0x9D):
+                out.append(o)
+            else:
+                return s
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError:
+        return s
 
 
 PLACEHOLDER_SUMMARY = "（本篇摘要生成失败，可重试）"
@@ -216,7 +263,10 @@ def generate_digest(meta, cfg, on_progress=None, on_chars=None, resume=True):
         if not e:
             return False
         s = (e.get("summaryZh") or "").strip()
-        return bool(s) and s != PLACEHOLDER_SUMMARY
+        if not s or s == PLACEHOLDER_SUMMARY:
+            return False
+        # 乱码视为未生成（可被续传替换）
+        return not looks_mojibake(s)
 
     todo = articles if not resume else [a for a in articles if not is_done(a)]
     batches = [todo[i : i + 6] for i in range(0, len(todo), 6)]
@@ -229,8 +279,18 @@ def generate_digest(meta, cfg, on_progress=None, on_chars=None, resume=True):
         if on_progress:
             on_progress(bi, total)
         items = [(a["index"], a["title"], "\n\n".join(a["paragraphs"])[:1600]) for a in batch]
-        raw = _chat_retry(cfg, prompts.digest_system(), prompts.digest_user(meta["fileName"], items), 8000, on_chars)
-        arr = _parse_json(raw, want_array=True)
+        arr = None
+        last_err = None
+        for attempt in range(2):  # 解析失败整批重试一次
+            raw = _chat_retry(cfg, prompts.digest_system(), prompts.digest_user(meta["fileName"], items), 8000, on_chars)
+            try:
+                arr = _parse_json(raw, want_array=True)
+                break
+            except GenError as e:
+                last_err = e
+                time.sleep(1)
+        if arr is None:
+            raise last_err or GenError("批次解析失败")
         for el in arr:
             if not isinstance(el, dict):
                 continue
@@ -244,9 +304,9 @@ def generate_digest(meta, cfg, on_progress=None, on_chars=None, resume=True):
                 continue
             collected[index] = {
                 "index": index,
-                "titleEn": (el.get("titleEn") or "").strip() or art["title"],
-                "titleZh": (el.get("titleZh") or "").strip(),
-                "summaryZh": (el.get("summaryZh") or "").strip(),
+                "titleEn": fix_mojibake((el.get("titleEn") or "").strip()) or art["title"],
+                "titleZh": fix_mojibake((el.get("titleZh") or "").strip()),
+                "summaryZh": fix_mojibake((el.get("summaryZh") or "").strip()),
             }
         digest = _final_digest(meta, articles, existing, collected, on_progress, bi, total)
         store.save_digest(digest)

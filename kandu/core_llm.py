@@ -105,12 +105,17 @@ def _stream_once(cfg, system, user, max_tokens, temperature, state):
     ) as resp:
         if resp.status_code != 200:
             raise LlmError(f"HTTP {resp.status_code}（{endpoint(cfg)}）：{_first_line(resp.text)}")
-        for raw in resp.iter_lines(decode_unicode=True, chunk_size=1):
-            if not raw or raw.startswith(":"):
+        for raw in resp.iter_lines(chunk_size=1):
+            if isinstance(raw, bytes):
+                # 网关可能不标 charset，requests 默认按 latin-1 解码会产出 mojibake
+                line = raw.decode("utf-8", errors="replace")
+            else:
+                line = raw
+            if not line or line.startswith(":"):
                 continue
-            if not raw.startswith("data:"):
+            if not line.startswith("data:"):
                 continue
-            data = raw[5:].strip()
+            data = line[5:].strip()
             if data == "[DONE]":
                 break
             try:
@@ -215,6 +220,7 @@ def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None) -> 
                 raise LlmError(f"网络请求失败：{e}")
             if resp.status_code != 200:
                 raise LlmError(f"HTTP {resp.status_code}（{endpoint(cfg)}）：{_first_line(resp.text)}")
+            resp.encoding = "utf-8"
             content = (_parse_content(cfg, resp.text) or "").strip()
             if _looks_truncated(resp.text):
                 state.length_cut = True
