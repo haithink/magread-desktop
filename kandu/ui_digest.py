@@ -1,4 +1,4 @@
-"""目录页：每篇文章中英文标题 + 中文摘要。"""
+"""目录页：每篇文章中英文标题 + 中文摘要（卡片式，摘要自动换行）。"""
 import tkinter as tk
 from tkinter import ttk
 
@@ -6,7 +6,7 @@ from kandu import core_parsers as store
 from kandu import core_llm as llm
 from kandu import core_gen as gen
 
-# 单飞锁：同一本书同时只允许一个生成线程
+FAMILY = "Microsoft YaHei UI"
 _RUNNING = set()
 
 
@@ -16,12 +16,13 @@ class DigestFrame(tk.Frame):
         self.app = app
         self.meta = meta
         self.generating = False
+        self._summary_labels = []
 
         bar = tk.Frame(self, bg="#1b4b43")
         bar.pack(fill="x")
         ttk.Button(bar, text="← 返回", command=self.app.show_library).pack(side="left", padx=10, pady=6)
         tk.Label(bar, text=meta["fileName"], bg="#1b4b43", fg="white",
-                 font=("Microsoft YaHei UI", 12, "bold")).pack(side="left", padx=6)
+                 font=(FAMILY, 12, "bold")).pack(side="left", padx=6)
         self.gen_btn = ttk.Button(bar, text="补全/刷新摘要", command=self.generate)
         self.gen_btn.pack(side="right", padx=10, pady=6)
 
@@ -32,14 +33,21 @@ class DigestFrame(tk.Frame):
         self.bar.pack(side="left", padx=8, pady=4)
         self.progress_row.pack(fill="x")
 
-        cols = ("titleEn", "titleZh", "summaryZh")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
-        headings = {"titleEn": ("英文标题", 360), "titleZh": ("中文标题", 240), "summaryZh": ("中文摘要", 520)}
-        for c, (label, width) in headings.items():
-            self.tree.heading(c, text=label)
-            self.tree.column(c, width=width, anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=10, pady=(4, 10))
-        self.tree.bind("<Double-1>", self._open)
+        # 卡片式滚动列表（Treeview 不支持换行，弃用）
+        body = tk.Frame(self, bg="white")
+        body.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(body, bg="white", highlightthickness=0, bd=0)
+        self.vbar = ttk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
+        self.inner = tk.Frame(self.canvas, bg="white")
+        self.inner.bind("<Configure>",
+                        lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True, padx=(16, 0), pady=(4, 8))
+        self.vbar.pack(side="right", fill="y")
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+        self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+        self.bind("<Destroy>", self._on_destroy)
 
         digest = store.load_digest(meta["id"])
         if digest is None:
@@ -52,13 +60,36 @@ class DigestFrame(tk.Frame):
             else:
                 self.status.config(text="已加载缓存摘要（点右上角可重新生成）")
 
-    def _open(self, _e=None):
-        sel = self.tree.selection()
-        if not sel:
+    # ---- 布局 ----
+    def _on_canvas_resize(self, e):
+        self.canvas.itemconfigure(self._win, width=e.width)
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        w = max(e.width - 40, 320)
+        for lbl in self._summary_labels:
+            try:
+                lbl.configure(wraplength=w)
+            except tk.TclError:
+                pass
+
+    def _on_wheel(self, e):
+        try:
+            if self.canvas.winfo_exists():
+                self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        except tk.TclError:
+            pass
+
+    def _on_destroy(self, e):
+        if e.widget is not self:
             return
-        index = int(sel[0])
+        try:
+            self.unbind_all("<MouseWheel>")
+        except tk.TclError:
+            pass
+
+    def _open(self, index):
         self.app.open_reader(self.meta, index)
 
+    # ---- 生成 ----
     def generate(self):
         if self.generating:
             return
@@ -122,8 +153,32 @@ class DigestFrame(tk.Frame):
         else:
             self.status.config(text=f"出错：{msg}")
 
+    # ---- 渲染 ----
     def _fill(self, digest):
-        self.tree.delete(*self.tree.get_children())
+        for w in self.inner.winfo_children():
+            w.destroy()
+        self._summary_labels.clear()
         for a in digest["articles"]:
-            self.tree.insert("", "end", iid=str(a["index"]),
-                             values=(a.get("titleEn", ""), a.get("titleZh", ""), a.get("summaryZh", "")))
+            card = tk.Frame(self.inner, bg="white", bd=1, relief="solid")
+            card.pack(fill="x", padx=8, pady=5)
+            en = tk.Label(card, text=a.get("titleEn", ""), bg="white", fg="#1b4b43",
+                          font=(FAMILY, 11, "bold"), anchor="w", justify="left", wraplength=980)
+            en.pack(fill="x", padx=12, pady=(8, 0))
+            widgets = [card, en]
+            if a.get("titleZh", "").strip():
+                zh = tk.Label(card, text=a["titleZh"], bg="white", fg="#7fa829",
+                              font=(FAMILY, 10), anchor="w", justify="left", wraplength=980)
+                zh.pack(fill="x", padx=12, pady=(2, 0))
+                widgets.append(zh)
+            if a.get("summaryZh", "").strip():
+                sm = tk.Label(card, text=a["summaryZh"], bg="white", fg="#4a5568",
+                              font=(FAMILY, 10), anchor="w", justify="left", wraplength=980)
+                sm.pack(fill="x", padx=12, pady=(4, 10))
+                widgets.append(sm)
+                self._summary_labels.append(sm)
+            for w in widgets:
+                w.bind("<Button-1>", lambda e, i=a["index"]: self._open(i))
+                w.bind("<Enter>", lambda e, c=card: c.configure(bg="#eef6f2"))
+                w.bind("<Leave>", lambda e, c=card: c.configure(bg="white"))
+        self.canvas.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))

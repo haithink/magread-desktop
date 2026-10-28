@@ -112,6 +112,11 @@ class ReaderFrame(tk.Frame):
         self.text.configure(state="normal", font=(FAMILY, size))
         self.text.delete("1.0", "end")
 
+        self.text.tag_config("t_title", font=(FAMILY, size + 4, "bold"),
+                             foreground="#1b4b43", spacing1=6, spacing3=10)
+        self.text.tag_config("t_body", spacing1=2, spacing2=6, spacing3=14)
+        self.text.tag_config("t_hint", font=(FAMILY, 9), foreground="#8a9a94", spacing3=16)
+
         self.text.insert("end", self.article["title"] + "\n", "t_title")
         self.text.insert(
             "end",
