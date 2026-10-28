@@ -12,6 +12,7 @@ rem 生成 PE 版本信息（版本号取自 kandu/__init__.py）
   --add-binary "D:/anaconda/Library/bin/tk86t.dll;." ^
   --add-binary "D:/anaconda/Library/bin/zlib.dll;." ^
   --add-binary "D:/anaconda/Library/bin/zlib-ng2.dll;." ^
+  --add-binary "D:/anaconda/Library/bin/sqlite3.dll;." ^
   --add-data "D:/anaconda/Library/lib/tcl8.6;tcl8.6" ^
   --add-data "D:/anaconda/Library/lib/tk8.6;tk8.6" ^
   --runtime-hook "hooks/rthook_tcl.py" ^
