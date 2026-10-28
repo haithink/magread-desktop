@@ -8,11 +8,12 @@ from kandu import core_gen as gen
 from kandu.core_config import app_dir
 
 FAMILY = "Microsoft YaHei UI"
+INK_PAPER = "#EAF2E5"  # 阅读页浅豆绿纸色
 
 
 class ReaderFrame(tk.Frame):
     def __init__(self, parent, app, meta, article_index):
-        super().__init__(parent, bg="white")
+        super().__init__(parent, bg=INK_PAPER)
         self.app = app
         self.meta = meta
         self.article_index = article_index
@@ -33,12 +34,12 @@ class ReaderFrame(tk.Frame):
         ttk.Button(bar, text="A+", width=3, command=lambda: self._font(+1)).pack(side="right", padx=4, pady=6)
         ttk.Button(bar, text="A-", width=3, command=lambda: self._font(-1)).pack(side="right", padx=4, pady=6)
 
-        self.status = tk.Label(self, text="", bg="white", fg="#446", anchor="w")
+        self.status = tk.Label(self, text="", bg=INK_PAPER, fg="#5a6b5a", anchor="w")
         self.status.pack(fill="x", padx=14, pady=(4, 0))
 
-        body = tk.Frame(self, bg="white")
+        body = tk.Frame(self, bg=INK_PAPER)
         body.pack(fill="both", expand=True)
-        self.text = tk.Text(body, wrap="word", state="disabled", bg="white", bd=0,
+        self.text = tk.Text(body, wrap="word", state="disabled", bg=INK_PAPER, bd=0,
                             padx=28, pady=16, cursor="arrow",
                             font=(FAMILY, int(self.app.settings.get("readerFontSize", 13))))
         vbar = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
@@ -48,8 +49,8 @@ class ReaderFrame(tk.Frame):
 
         self.text.tag_config("t_title", font=(FAMILY, 17, "bold"), spacing3=6)
         self.text.tag_config("t_hint", foreground="#8a9", font=(FAMILY, 9))
-        self.text.tag_config("sel", background="#cde8e1")
-        self.text.tag_config("t_badge", foreground="#7fa829", font=(FAMILY, 9, "underline"))
+        self.text.tag_config("sel", background="#cfe3c8")
+        self.text.tag_config("t_badge", foreground="#5f8a17", font=(FAMILY, 9, "underline"))
         self.text.bind("<Double-Button-1>", self._on_double_click)
         self.text.bind("<Button-3>", self._on_right_click)
         self.text.bind("<Return>", lambda e: self._on_double_click(e))
