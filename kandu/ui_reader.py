@@ -25,7 +25,8 @@ class ReaderFrame(tk.Frame):
 
         bar = tk.Frame(self, bg="#1b4b43")
         bar.pack(fill="x")
-        ttk.Button(bar, text="← 返回", command=self.app.show_library).pack(side="left", padx=10, pady=6)
+        # 阅读页返回应回到该书的摘要页（书目页的返回才是回书架）
+        ttk.Button(bar, text="← 返回", command=lambda: self.app.open_digest(self.meta)).pack(side="left", padx=10, pady=6)
         self.title_label = tk.Label(bar, text="加载中…", bg="#1b4b43", fg="white",
                                     font=(FAMILY, 12, "bold"))
         self.title_label.pack(side="left", padx=6)
