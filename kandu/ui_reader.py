@@ -381,7 +381,6 @@ class ReaderFrame(tk.Frame):
         self.app.post(self._lookup_worker, word, para, win, txt)
 
     def _lookup_worker(self, word, para, win, txt):
-        import core_dict
         core_dict.ensure_db(background=False)
         result = core_dict.lookup(word)
         self.app.q.put(("lookup_done", (win, txt, word, para, result)))
