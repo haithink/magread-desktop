@@ -29,8 +29,18 @@ class App(tk.Tk):
 
         self.container = tk.Frame(self)
         self.container.pack(fill="both", expand=True)
+        # 滚轮统一路由：各页面实现 on_wheel 即可，销毁无需解绑
+        self.bind_all("<MouseWheel>", self._route_wheel)
         self.after(80, self._poll)
         self.show_library()
+
+    def _route_wheel(self, e):
+        handler = getattr(self.current, "on_wheel", None)
+        if handler:
+            try:
+                handler(e)
+            except tk.TclError:
+                pass
 
     # ---- 线程：worker 在后台跑，事件经队列回 UI 线程 ----
     def post(self, fn, *args):

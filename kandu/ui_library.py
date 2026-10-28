@@ -42,25 +42,15 @@ class LibraryFrame(tk.Frame):
         self.canvas.pack(side="left", fill="both", expand=True, padx=(10, 0))
         self.vbar.pack(side="right", fill="y")
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure("all", width=self._inner_width()))
-        # 滚轮：bind_all 是应用级绑定，离开本页时必须解绑，否则操作已销毁控件报 TclError
-        self.canvas.bind_all("<MouseWheel>", self._on_wheel)
-        self.bind("<Destroy>", self._on_destroy)
+        # 滚轮由 App 层 bind_all 统一路由到本页 on_wheel
         if not self.app.settings.get("libraryDir"):
             self.status.config(text="先点右上角「选择目录」挑选存放 EPUB / PDF 刊物的文件夹")
         self.rescan()
 
-    def _on_wheel(self, e):
+    def on_wheel(self, e):
         try:
-            if self.canvas.winfo_exists():
+            if self.winfo_exists() and self.canvas.winfo_exists():
                 self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
-        except tk.TclError:
-            pass
-
-    def _on_destroy(self, e):
-        if e.widget is not self:
-            return
-        try:
-            self.unbind_all("<MouseWheel>")
         except tk.TclError:
             pass
 

@@ -46,8 +46,6 @@ class DigestFrame(tk.Frame):
         self.canvas.pack(side="left", fill="both", expand=True, padx=(16, 0), pady=(4, 8))
         self.vbar.pack(side="right", fill="y")
         self.canvas.bind("<Configure>", self._on_canvas_resize)
-        self.canvas.bind_all("<MouseWheel>", self._on_wheel)
-        self.bind("<Destroy>", self._on_destroy)
 
         digest = store.load_digest(meta["id"])
         if digest is None:
@@ -71,18 +69,10 @@ class DigestFrame(tk.Frame):
             except tk.TclError:
                 pass
 
-    def _on_wheel(self, e):
+    def on_wheel(self, e):
         try:
-            if self.canvas.winfo_exists():
+            if self.winfo_exists() and self.canvas.winfo_exists():
                 self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
-        except tk.TclError:
-            pass
-
-    def _on_destroy(self, e):
-        if e.widget is not self:
-            return
-        try:
-            self.unbind_all("<MouseWheel>")
         except tk.TclError:
             pass
 
