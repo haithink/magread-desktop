@@ -276,7 +276,7 @@ class ReaderFrame(tk.Frame):
         if key in self.analysis_busy:
             return
         cached = store.load_analysis(self.meta["id"], sentence, self.article["index"])
-        if cached:
+        if cached and not cached.get("partial"):
             win, txt = self._make_sheet("句解", self.article["title"][:36])
             self._sheets[key] = (win, txt)
             _render_analysis(txt, cached, sentence)
@@ -360,6 +360,7 @@ def _config_tags(txt):
     txt.tag_config("mono", font=("Consolas", 10), background="#f2f6f4")
     txt.tag_config("trans", background="#e9f4ef", font=(FAMILY, 11))
     txt.tag_config("src", foreground="#667", font=(FAMILY, 10))
+    txt.tag_config("warn", foreground="#b06000", font=(FAMILY, 9))
 
 
 def _render_loading(txt, sentence):
@@ -376,6 +377,8 @@ def _render_analysis(txt, analysis, sentence=None):
     txt.delete("1.0", "end")
     if sentence:
         txt.insert("end", sentence + "\n", "src")
+    if analysis.get("partial"):
+        txt.insert("end", "⚠ 本次解析可能不完整（模型输出被截断）。关闭弹窗后重新双击本句将自动重试。\n\n", "warn")
     vocab = analysis.get("vocab") or []
     if vocab:
         txt.insert("end", "一、疑难词汇\n", "h1")

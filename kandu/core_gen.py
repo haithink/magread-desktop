@@ -441,12 +441,23 @@ def _parse_entry(el, seen):
     }
 
 
+def _analysis_partial(analysis: dict) -> bool:
+    """缺语境/译文/图解任一主要部分即视为不完整（多为输出被截断后修补）。"""
+    if not isinstance(analysis, dict):
+        return True
+    return not (
+        (analysis.get("context") or "").strip()
+        and (analysis.get("translation") or "").strip()
+        and (analysis.get("grammarDiagram") or "").strip()
+    )
+
+
 def analyze(meta, article, sentence, before, after, cfg):
     cached = store.load_analysis(meta["id"], sentence, article["index"])
-    if cached:
+    if cached and not _analysis_partial(cached):
         return cached
     user = prompts.analysis_user(sentence, before, after, article["title"])
-    raw = _chat_retry(cfg, prompts.analysis_system(), user, 8000)
+    raw = _chat_retry(cfg, prompts.analysis_system(), user, 12000)
     obj = _parse_json(raw, want_array=False)
 
     def _s(o, k, default=""):
@@ -474,7 +485,10 @@ def analyze(meta, article, sentence, before, after, cfg):
                     "note": _s(v, "note"),
                 }
             )
-    store.save_analysis(meta["id"], sentence, article["index"], analysis)
+    analysis["partial"] = _analysis_partial(analysis)
+    if not analysis["partial"]:
+        # 残缺结果不落盘：下次双击会自动重试
+        store.save_analysis(meta["id"], sentence, article["index"], analysis)
     return analysis
 
 
