@@ -115,7 +115,7 @@ def candidates(paragraph_texts, dict_set):
     seen = set()
     for text in paragraph_texts:
         for m in _TOKEN.finditer(text):
-            raw = m.value.strip("'-")
+            raw = m.group(0).strip("'-")
             if len(raw) < 3 or raw.lower() in ALWAYS_KNOWN:
                 continue
             forms = lemma_forms(raw)
