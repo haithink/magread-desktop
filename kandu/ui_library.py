@@ -45,6 +45,9 @@ class LibraryFrame(tk.Frame):
         # 滚轮：bind_all 是应用级绑定，离开本页时必须解绑，否则操作已销毁控件报 TclError
         self.canvas.bind_all("<MouseWheel>", self._on_wheel)
         self.bind("<Destroy>", self._on_destroy)
+        if not self.app.settings.get("libraryDir"):
+            self.status.config(text="先点右上角「选择目录」挑选存放 EPUB / PDF 刊物的文件夹")
+        self.rescan()
 
     def _on_wheel(self, e):
         try:
@@ -54,15 +57,12 @@ class LibraryFrame(tk.Frame):
             pass
 
     def _on_destroy(self, e):
-        if e.widget is self:
-            try:
-                self.unbind_all("<MouseWheel>")
-            except tk.TclError:
-                pass
-
-        if not self.app.settings.get("libraryDir"):
-            self.status.config(text="先点右上角「选择目录」挑选存放 EPUB / PDF 刊物的文件夹")
-        self.rescan()
+        if e.widget is not self:
+            return
+        try:
+            self.unbind_all("<MouseWheel>")
+        except tk.TclError:
+            pass
 
     def _inner_width(self):
         return max(self.canvas.winfo_width(), 900)
@@ -99,6 +99,8 @@ class LibraryFrame(tk.Frame):
 
     def on_scan_done(self, metas):
         self._scanning = False
+        if not self._alive():
+            return
         self.metas = metas
         self.status.config(text=f"共 {len(metas)} 本刊物")
         self._render()
@@ -168,4 +170,5 @@ class LibraryFrame(tk.Frame):
 
     def on_error(self, msg):
         self._scanning = False
-        messagebox.showerror("扫描失败", str(msg), parent=self)
+        if self._alive():
+            messagebox.showerror("扫描失败", str(msg), parent=self)

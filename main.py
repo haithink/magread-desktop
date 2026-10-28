@@ -45,21 +45,30 @@ class App(tk.Tk):
         self.q.put((kind, payload))
 
     def _poll(self):
-        while True:
-            try:
-                kind, payload = self.q.get_nowait()
-            except queue.Empty:
-                break
-            if kind == "error":
-                if not self._erroring:
-                    self._erroring = True
-                    messagebox.showerror("出错了", str(payload), parent=self)
-                    self._erroring = False
-                continue
-            handler = getattr(self.current, f"on_{kind}", None)
-            if handler:
-                handler(payload)
-        self.after(80, self._poll)
+        try:
+            while True:
+                try:
+                    kind, payload = self.q.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "error":
+                    if not self._erroring:
+                        self._erroring = True
+                        try:
+                            messagebox.showerror("出错了", str(payload), parent=self)
+                        except Exception:
+                            pass
+                        self._erroring = False
+                    continue
+                handler = getattr(self.current, f"on_{kind}", None)
+                if handler:
+                    try:
+                        handler(payload)
+                    except Exception as e:
+                        # 异常必须被隔离：否则 after 链中断，界面永久假死
+                        self._handle_handler_error(e)
+        finally:
+            self.after(80, self._poll)
 
     # ---- 导航 ----
     def _swap(self, frame):
@@ -80,8 +89,28 @@ class App(tk.Tk):
         if isinstance(val, tk.TclError) and "invalid command name" in str(val):
             return
         detail = "".join(traceback.format_exception_only(exc, val))[-1500:]
+        self._log_error(detail)
         try:
             messagebox.showerror("内部错误", detail, parent=self)
+        except Exception:
+            pass
+
+    def _log_error(self, detail: str):
+        try:
+            import datetime
+            with open(cfgmod.app_dir() / "error.log", "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {detail}\n")
+        except Exception:
+            pass
+
+    def _handle_handler_error(self, e: Exception):
+        """事件处理器异常：销毁后派发的 TclError 静默；其余记录并弹窗（限频）。
+        无论如何不让异常杀死 after 轮询链（否则界面永久假死）。"""
+        if isinstance(e, tk.TclError) and "invalid command name" in str(e):
+            return
+        self._log_error(traceback.format_exc()[-2000:])
+        try:
+            messagebox.showerror("内部错误", str(e), parent=self)
         except Exception:
             pass
 
