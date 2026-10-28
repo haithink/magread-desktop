@@ -337,22 +337,33 @@ def _key_priority(k: str):
 
 
 def parse_pasted_json(text: str):
-    """从粘贴的 JSON（cc-switch 配置/单条 provider/普通结构）启发式提取配置。"""
+    """从粘贴的 JSON（cc-switch 配置/单条 provider/普通结构）启发式提取配置。
+    provider 由键名决定：出现 ANTHROPIC_* 键即判定为 Anthropic 原生
+    （URL/模型名内容不含 anthropic/claude 字样的中转站也会被正确识别）。"""
     try:
         root = json.loads(text.strip())
     except Exception:
         return None
     urls, keys, models = {}, {}, {}
+    saw_anthropic_key = False
+    saw_openai_key = False
 
     def walk(el):
+        nonlocal saw_anthropic_key, saw_openai_key
         if isinstance(el, dict):
             for k, v in el.items():
                 p = _key_priority(k)
+                kl = k.lower()
+                if "anthropic" in kl:
+                    saw_anthropic_key = True
+                if "openai" in kl:
+                    saw_openai_key = True
                 if p is not None and isinstance(v, str) and v.strip():
                     kind, pri = p
                     table = {"url": urls, "key": keys, "model": models}[kind]
-                    if v.strip() not in table or pri > table[v.strip()]:
-                        table[v.strip()] = pri
+                    cur = table.get(v.strip())
+                    if cur is None or pri > cur[0]:
+                        table[v.strip()] = (pri, k)
                 else:
                     walk(v)
         elif isinstance(el, list):
@@ -362,19 +373,25 @@ def parse_pasted_json(text: str):
     walk(root)
     if not urls:
         return None
-    url = max(urls.items(), key=lambda kv: kv[1])[0]
+    url, (upri, ukey) = max(urls.items(), key=lambda kv: kv[1])
     key = max(keys.items(), key=lambda kv: kv[1])[0] if keys else ""
     model = max(models.items(), key=lambda kv: kv[1])[0] if models else ""
-    provider = (
-        "anthropic"
-        if re.search(r"(?i)anthropic", url) or re.search(r"(?i)claude|anthropic", model)
-        else "openai"
-    )
+
+    if saw_anthropic_key and "anthropic" in ukey.lower():
+        provider = "anthropic"
+    elif saw_openai_key and "openai" in ukey.lower():
+        provider = "openai"
+    elif saw_anthropic_key:
+        provider = "anthropic"
+    elif re.search(r"(?i)anthropic", url) or re.search(r"(?i)claude|anthropic", model):
+        provider = "anthropic"
+    else:
+        provider = "openai"
     note = ""
     if not key:
         note += "未在 JSON 中找到 API Key，请手动补填。"
     if not model:
         note += " 未找到模型名，请手动补填。"
     if key and model:
-        note = "已自动识别配置。"
+        note = "已自动识别配置（%s 接口）。" % ("Anthropic 原生" if provider == "anthropic" else "OpenAI 兼容")
     return {"provider": provider, "baseUrl": url, "apiKey": key, "model": model}, note
