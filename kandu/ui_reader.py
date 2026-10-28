@@ -276,7 +276,9 @@ class ReaderFrame(tk.Frame):
             return
         cached = store.load_analysis(self.meta["id"], sentence, self.article["index"])
         if cached:
-            self._show_analysis(sentence, cached)
+            win, txt = self._make_sheet("句解", self.article["title"][:36])
+            self._sheets[key] = (win, txt)
+            _render_analysis(txt, cached, sentence)
             return
         cfg = dict(self.app.settings["llm"])
         invalid = llm.validate(cfg)
@@ -306,7 +308,7 @@ class ReaderFrame(tk.Frame):
         self.analysis_busy.discard(key)
         entry = self._sheets.pop(key, None)
         if entry and entry[0].winfo_exists():
-            _render_analysis(entry[1], analysis)
+            _render_analysis(entry[1], analysis, sentence)
 
     def on_analysis_error(self, payload):
         key, msg = payload
@@ -367,10 +369,12 @@ def _render_loading(txt, sentence):
     txt.configure(state="disabled")
 
 
-def _render_analysis(txt, analysis):
-    """句解渲染：疑难词汇 → 语法对齐图解 → 语法点 → 语境 → 参考译文"""
+def _render_analysis(txt, analysis, sentence=None):
+    """句解渲染：原句 → 疑难词汇 → 语法对齐图解 → 语法点 → 语境 → 参考译文"""
     txt.configure(state="normal")
     txt.delete("1.0", "end")
+    if sentence:
+        txt.insert("end", sentence + "\n", "src")
     vocab = analysis.get("vocab") or []
     if vocab:
         txt.insert("end", "一、疑难词汇\n", "h1")
