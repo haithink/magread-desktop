@@ -121,9 +121,33 @@ class LibraryFrame(tk.Frame):
             for w in (card, img_label):
                 w.bind("<Double-Button-1>", lambda e, m=meta: self.app.open_digest(m))
                 w.bind("<Button-1>", lambda e, m=meta: self._hint(m))
+                w.bind("<Button-3>", lambda e, m=meta: self._card_menu(e, m))
+
+    def _card_menu(self, event, meta):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="打开", command=lambda: self.app.open_digest(meta))
+        menu.add_command(label="清除本书摘要", command=lambda: self._purge_one(meta, digest_only=True))
+        menu.add_command(label="清除本书全部缓存", command=lambda: self._purge_one(meta, digest_only=False))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _purge_one(self, meta, digest_only: bool):
+        store.purge_book_cache(meta["id"], digest_only=digest_only)
+        if self._alive():
+            self.status.config(text=f"已清除：{meta['fileName']}（{'仅摘要' if digest_only else '全部缓存'}）")
+            self._render()
+
+    def _alive(self):
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
 
     def _hint(self, meta):
-        self.status.config(text=f"双击打开：{meta['fileName']}")
+        if self._alive():
+            self.status.config(text=f"双击打开：{meta['fileName']}　右键卡片可清除该书缓存")
 
     def _load_thumb(self, label, meta):
         path = store.cover_file(meta["id"])

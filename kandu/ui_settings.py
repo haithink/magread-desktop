@@ -91,7 +91,10 @@ class SettingsDialog(tk.Toplevel):
         ttk.Label(box, text="缓存").grid(row=r, column=0, sticky="w")
         ttk.Label(box, text=f"正文/摘要/生词/句解缓存 {size_mb:.1f} MB").grid(row=r, column=1, sticky="w")
         r += 1
-        ttk.Button(box, text="清空全部缓存", command=self._purge).grid(row=r, column=1, sticky="w", pady=6)
+        purge_row = ttk.Frame(box)
+        purge_row.grid(row=r, column=1, sticky="w", pady=6)
+        ttk.Button(purge_row, text="清空摘要缓存", command=self._purge_digest).pack(side="left")
+        ttk.Button(purge_row, text="清空全部缓存", command=self._purge).pack(side="left", padx=8)
 
     def _parse_paste(self):
         text = self.paste.get("1.0", "end").strip()
@@ -197,6 +200,12 @@ class SettingsDialog(tk.Toplevel):
         if messagebox.askyesno("清空全部缓存", "将删除所有正文/摘要/生词/句解缓存，设置不会丢失。继续？", parent=self):
             store.purge_all()
             messagebox.showinfo("完成", "缓存已清空。", parent=self)
+            self.destroy()
+
+    def _purge_digest(self):
+        if messagebox.askyesno("清空摘要缓存", "将删除所有书目的摘要缓存（生词表与句解保留），下次打开会重新生成摘要。继续？", parent=self):
+            n = store.purge_digests()
+            messagebox.showinfo("完成", f"已清除 {n} 本书的摘要缓存。", parent=self)
             self.destroy()
 
 

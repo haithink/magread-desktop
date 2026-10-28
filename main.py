@@ -75,6 +75,9 @@ class App(tk.Tk):
 
     def report_callback_exception(self, exc, val, tb):
         """UI 回调异常弹窗可见（--windowed 下无 stderr，静默吞掉会难排查）"""
+        # 控件销毁后仍在派发的事件（双击打开页面瞬间）属无害噪音，忽略
+        if isinstance(val, tk.TclError) and "invalid command name" in str(val):
+            return
         detail = "".join(traceback.format_exception_only(exc, val))[-1500:]
         try:
             messagebox.showerror("内部错误", detail, parent=self)

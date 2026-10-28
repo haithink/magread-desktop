@@ -414,3 +414,28 @@ def purge_all():
         p = cfgmod.app_dir() / name
         if p.exists():
             shutil.rmtree(p, ignore_errors=True)
+
+
+def purge_digests():
+    """清空所有书目的摘要缓存（保留正文/生词/句解）。"""
+    cache_root = cfgmod.app_dir() / "cache"
+    if not cache_root.exists():
+        return 0
+    n = 0
+    for f in cache_root.glob("*/digest.json"):
+        f.unlink(missing_ok=True)
+        n += 1
+    return n
+
+
+def purge_book_cache(book_id: str, digest_only: bool = False):
+    """清除单本书缓存；digest_only=True 仅删摘要，否则整本缓存+封面。"""
+    d = cfgmod.app_dir() / "cache" / book_id
+    if digest_only:
+        (d / "digest.json").unlink(missing_ok=True)
+        return
+    import shutil
+
+    if d.exists():
+        shutil.rmtree(d, ignore_errors=True)
+    cover_file(book_id).unlink(missing_ok=True)
