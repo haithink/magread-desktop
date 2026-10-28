@@ -114,11 +114,14 @@ class LibraryFrame(tk.Frame):
             img_label.pack(padx=6, pady=(6, 2))
             self._load_thumb(img_label, meta)
             has_d = store.has_digest(meta["id"])
-            tk.Label(card, text=meta["fileName"][:40], bg="white", fg="#222",
-                     font=("Microsoft YaHei UI", 9), wraplength=THUMB_W + 20).pack(padx=4, pady=(0, 2))
-            tk.Label(card, text="已生成摘要 ✓" if has_d else "未生成摘要", bg="white",
-                     fg="#7fa829" if has_d else "#b0b8b6", font=("Microsoft YaHei UI", 8)).pack(pady=(0, 6))
-            for w in (card, img_label):
+            name_label = tk.Label(card, text=meta["fileName"][:40], bg="white", fg="#222",
+                                  font=("Microsoft YaHei UI", 9), wraplength=THUMB_W + 20)
+            name_label.pack(padx=4, pady=(0, 2))
+            state_label = tk.Label(card, text="已生成摘要 ✓" if has_d else "未生成摘要", bg="white",
+                                   fg="#7fa829" if has_d else "#b0b8b6", font=("Microsoft YaHei UI", 8))
+            state_label.pack(pady=(0, 6))
+            # 卡片内所有子控件统一绑定（只绑 card 本身时，点到文字标签无反应）
+            for w in (card, img_label, name_label, state_label):
                 w.bind("<Double-Button-1>", lambda e, m=meta: self.app.open_digest(m))
                 w.bind("<Button-1>", lambda e, m=meta: self._hint(m))
                 w.bind("<Button-3>", lambda e, m=meta: self._card_menu(e, m))
