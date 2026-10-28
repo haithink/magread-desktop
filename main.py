@@ -54,6 +54,7 @@ class App(tk.Tk):
                 if kind == "error":
                     if not self._erroring:
                         self._erroring = True
+                        self._log_error(f"出错了：{payload}")
                         try:
                             messagebox.showerror("出错了", str(payload), parent=self)
                         except Exception:

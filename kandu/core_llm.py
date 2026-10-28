@@ -193,17 +193,34 @@ def _looks_truncated(body: str) -> bool:
     )
 
 
+def _is_budget_reject(text: str) -> bool:
+    """网关对 max_tokens 超限/非法的拒绝（各家中转措辞不一，取并集）。"""
+    t = (text or "").lower()
+    keys = ("max_tokens", "max_output_tokens", "max output", "output token",
+            "maximum", "too large", "out of range", "must be less than",
+            "must be greater than", "invalid_request_error")
+    return any(k in t for k in keys)
+
+
 def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None) -> str:
-    """发一次对话。流式优先；推理模型烧额度/被 length 截断时加倍额度重试一次。"""
+    """发一次对话。流式优先。自适应：
+    - 推理模型烧额度/被 length 截断 → 额度加倍重试（上限 32768）
+    - 网关拒绝 max_tokens（超限）→ 额度减半重试（下限 4096）"""
     if not is_complete(cfg):
         raise LlmError("大模型配置不完整，请先在设置中填写 URL / API Key / 模型名")
 
     budget = max_tokens
-    for attempt in range(2):
+    last_err = ""
+    for attempt in range(4):
         state = _StreamState()
         stream_err = None
         try:
             _stream_once(cfg, system, user, budget, temperature, state)
+        except LlmError as e:
+            if _is_budget_reject(str(e)) and attempt < 3:
+                budget = max(4096, budget // 2)
+                continue
+            raise
         except Exception as e:  # 流式不被支持/网络错误 → 退回非流式
             stream_err = e
 
@@ -220,7 +237,11 @@ def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None) -> 
             except Exception as e:
                 raise LlmError(f"网络请求失败：{e}")
             if resp.status_code != 200:
-                raise LlmError(f"HTTP {resp.status_code}（{endpoint(cfg)}）：{_first_line(resp.text)}")
+                err_text = f"HTTP {resp.status_code}（{endpoint(cfg)}）：{_first_line(resp.text)}"
+                if _is_budget_reject(resp.text) and attempt < 3:
+                    budget = max(4096, budget // 2)
+                    continue
+                raise LlmError(err_text)
             resp.encoding = "utf-8"
             content = (_parse_content(cfg, resp.text) or "").strip()
             if _looks_truncated(resp.text):
@@ -233,18 +254,20 @@ def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None) -> 
             return _strip_think(content)
 
         burned = state.saw_reasoning or state.length_cut
-        if attempt == 0 and burned:
+        if burned and budget < 32768:
+            # 思考烧额度/输出被截断：加大额度再试；到顶仍截断则原样返回（上层修补）
             budget = min(budget * 2, 32768)
             continue
         if content:
             # 重试后仍截断：返回截断文本，上层 JSON 修补兜底
             return _strip_think(content)
+        last_err = "reasoning" if burned else f"{stream_err}"
         raise LlmError(
             "模型把输出额度耗在思考（reasoning）上且重试后仍无正文。建议换非推理模型（如 deepseek-chat）"
             if burned
-            else f"响应里没有内容：{stream_err}"
+            else f"响应里没有内容：{last_err}"
         )
-    raise LlmError("响应里没有内容")
+    raise LlmError(f"多次自适应重试后仍失败：{last_err}")
 
 
 def test(cfg) -> dict:
