@@ -5,8 +5,13 @@ from pathlib import Path
 
 
 def app_dir() -> Path:
-    base = os.environ.get("LOCALAPPDATA")
-    d = (Path(base) / "KanduDesktop") if base else (Path.home() / ".kandu_desktop")
+    """数据目录。测试/开发可设 KANDU_DATA_DIR 隔离，避免误动真实数据。"""
+    override = os.environ.get("KANDU_DATA_DIR")
+    if override:
+        d = Path(override)
+    else:
+        base = os.environ.get("LOCALAPPDATA")
+        d = (Path(base) / "KanduDesktop") if base else (Path.home() / ".kandu_desktop")
     d.mkdir(parents=True, exist_ok=True)
     return d
 
