@@ -7,6 +7,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from kandu import core_config as cfgmod
 from kandu import core_parsers as store
+from kandu import __version__
 from kandu.ui_library import LibraryFrame
 from kandu.ui_digest import DigestFrame
 from kandu.ui_reader import ReaderFrame
@@ -16,7 +17,7 @@ from kandu.ui_settings import SettingsDialog
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("刊读 · Kandu Desktop")
+        self.title(f"刊读 · Kandu Desktop v{__version__}")
         self.geometry("1180x800")
         self.minsize(900, 620)
 

@@ -9,6 +9,7 @@ from kandu import core_config as cfgmod
 from kandu import core_llm as llm
 from kandu import core_parsers as store
 from kandu import core_gen as gen
+from kandu import __version__
 
 FAMILY = "Microsoft YaHei UI"
 
@@ -90,6 +91,9 @@ class SettingsDialog(tk.Toplevel):
             size_mb = 0
         ttk.Label(box, text="缓存").grid(row=r, column=0, sticky="w")
         ttk.Label(box, text=f"正文/摘要/生词/句解缓存 {size_mb:.1f} MB").grid(row=r, column=1, sticky="w")
+        r += 1
+        ttk.Label(box, text="版本").grid(row=r, column=0, sticky="w")
+        ttk.Label(box, text=f"v{__version__}").grid(row=r, column=1, sticky="w")
         r += 1
         purge_row = ttk.Frame(box)
         purge_row.grid(row=r, column=1, sticky="w", pady=6)
