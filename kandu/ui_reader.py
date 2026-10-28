@@ -367,6 +367,39 @@ def _render_loading(txt, sentence):
     txt.configure(state="disabled")
 
 
+def _render_analysis(txt, analysis):
+    """句解渲染：疑难词汇 → 语法对齐图解 → 语法点 → 语境 → 参考译文"""
+    txt.configure(state="normal")
+    txt.delete("1.0", "end")
+    vocab = analysis.get("vocab") or []
+    if vocab:
+        txt.insert("end", "一、疑难词汇\n", "h1")
+        for v in vocab:
+            line = v.get("word", "")
+            if v.get("phonetic"):
+                line += f"  /{v['phonetic']}/"
+            txt.insert("end", line, "word")
+            if v.get("sense"):
+                txt.insert("end", "\n" + v["sense"], "sense")
+            if v.get("note"):
+                txt.insert("end", "\n" + v["note"], "root")
+            txt.insert("end", "\n\n")
+    if analysis.get("grammarDiagram"):
+        txt.insert("end", "二、语法图解\n", "h1")
+        txt.insert("end", analysis["grammarDiagram"] + "\n", "mono")
+    for i, p in enumerate(analysis.get("grammarPoints") or [], 1):
+        txt.insert("end", f"{i}. {p.get('title', '')}\n", "word")
+        if p.get("text"):
+            txt.insert("end", p["text"] + "\n\n", "sense")
+    if analysis.get("context"):
+        txt.insert("end", "三、语境\n", "h1")
+        txt.insert("end", analysis["context"] + "\n\n", "sense")
+    if analysis.get("translation"):
+        txt.insert("end", "参考译文\n", "h1")
+        txt.insert("end", analysis["translation"] + "\n", "trans")
+    txt.configure(state="disabled")
+
+
 def _render_error(txt, msg):
     txt.configure(state="normal")
     txt.insert("end", f"\n出错：{msg}", "term")
