@@ -208,7 +208,8 @@ def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None) -> 
             stream_err = e
 
         content = state.text.strip()
-        if not content and stream_err is not None:
+        if not content:
+            # 流式失败、或网关无视 stream:true 直接回普通 JSON（200 但无 data: 行）→ 退回非流式
             try:
                 resp = requests.post(
                     endpoint(cfg),

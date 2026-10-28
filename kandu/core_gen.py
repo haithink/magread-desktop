@@ -282,15 +282,18 @@ def generate_digest(meta, cfg, on_progress=None, on_chars=None, resume=True):
         arr = None
         last_err = None
         for attempt in range(2):  # 解析失败整批重试一次
-            raw = _chat_retry(cfg, prompts.digest_system(), prompts.digest_user(meta["fileName"], items), 8000, on_chars)
             try:
+                raw = _chat_retry(cfg, prompts.digest_system(), prompts.digest_user(meta["fileName"], items), 8000, on_chars)
                 arr = _parse_json(raw, want_array=True)
                 break
-            except GenError as e:
+            except (GenError, llm.LlmError) as e:
                 last_err = e
                 time.sleep(1)
         if arr is None:
-            raise last_err or GenError("批次解析失败")
+            # 该批放弃（留占位），继续后面的批次——不让一个坏批次阻塞整轮
+            if on_progress:
+                on_progress(bi + 1, total)
+            continue
         for el in arr:
             if not isinstance(el, dict):
                 continue
