@@ -5,7 +5,40 @@ from tkinter import ttk, messagebox
 from kandu import core_parsers as store
 from kandu import core_llm as llm
 from kandu import core_gen as gen
+from kandu import core_dict
 from kandu.core_config import app_dir
+
+
+def _render_lookup(txt, word, result):
+    """本地查词结果渲染"""
+    txt.configure(state="normal")
+    txt.delete("1.0", "end")
+    if not result:
+        txt.insert("end", "词典尚未就绪（首次初始化约需半分钟），稍后再试。", "meta")
+        txt.configure(state="disabled")
+        return
+    if result.get("miss"):
+        txt.insert("end", f"本地词典未收录「{word}」。\n\n", "word")
+        txt.insert("end", "可能是专有名词、生僻变形或合成词。可以选中整句用「解析」让大模型讲解，"
+                          "或确认拼写后重试。", "sense")
+        txt.configure(state="disabled")
+        return
+    txt.insert("end", result.get("word", word) + "\n", "word")
+    meta_bits = []
+    if result.get("phonetic"):
+        meta_bits.append("/" + result["phonetic"].strip("/") + "/")
+    if result.get("pos"):
+        meta_bits.append(result["pos"])
+    if meta_bits:
+        txt.insert("end", "  ".join(meta_bits) + "\n", "meta")
+    txt.insert("end", "\n" + (result.get("translation") or "（无释义）") + "\n", "sense")
+    if result.get("exchange"):
+        txt.insert("end", "\n变形：" + result["exchange"], "root")
+    if result.get("lookedUp") and result["lookedUp"].lower() != word.lower():
+        txt.insert("end", f"\n（由「{result['lookedUp']}」还原原形）", "meta")
+    txt.insert("end", "\n\n来源：本地词典 ECDICT（离线）", "meta")
+    txt.configure(state="disabled")
+
 
 FAMILY = "Microsoft YaHei UI"
 INK_PAPER = "#EAF2E5"  # 阅读页浅豆绿纸色
@@ -21,6 +54,8 @@ class ReaderFrame(tk.Frame):
         self.vocab = None
         self.vocab_running = False
         self.analysis_busy = set()
+        self._last_click = (None, None)
+        self._sheets = {}
         self._sheets = {}
 
         bar = tk.Frame(self, bg="#1b4b43")
@@ -57,6 +92,8 @@ class ReaderFrame(tk.Frame):
         self.text.bind("<Return>", lambda e: self._on_double_click(e))
 
         self.menu = tk.Menu(self, tearoff=0)
+        self.menu.add_command(label="查词（本地词典）", command=self._menu_lookup)
+        self.menu.add_separator()
         self.menu.add_command(label="解析选中内容", command=self._analyze_selection)
         self.menu.add_command(label="解析整段", command=self._analyze_whole_paragraph)
 
@@ -232,11 +269,28 @@ class ReaderFrame(tk.Frame):
         return "break"
 
     def _on_right_click(self, event):
+        self._last_click = self._word_at_click(event)
         try:
             self.menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.menu.grab_release()
         return "break"
+
+    def _menu_lookup(self):
+        para, offset = self._last_click
+        self._lookup_selection(para, offset)
+
+    def _word_at_click(self, event):
+        try:
+            index = self.text.index(f"@{event.x},{event.y}")
+            para = self._para_at(index)
+            if para is None:
+                return None, None
+            rng = self._para_range(para)
+            local = len(self.text.get(rng[0], index))
+            return para, local
+        except tk.TclError:
+            return None, None
 
     def _analyze_selection(self):
         try:
@@ -292,6 +346,79 @@ class ReaderFrame(tk.Frame):
         self._sheets[key] = (win, txt)
         _render_loading(txt, sentence)
         self.app.post(self._analysis_worker, cfg, para, sentence, key)
+
+    # ---------- 本地查词（不依赖 LLM） ----------
+    def _lookup_selection(self, para, offset):
+        """右键「查词」：优先取选中文本，否则取点击位置的单词。"""
+        word = ""
+        rng = self.text.tag_ranges("sel")
+        if rng:
+            word = self.text.get(rng[0], rng[1]).strip()
+        if not word and para is not None and para < len(self.article["paragraphs"]):
+            para_text = self.article["paragraphs"][para]
+            if offset is not None and 0 <= offset <= len(para_text):
+                left = max(para_text.rfind(" ", 0, offset), para_text.rfind("\n", 0, offset))
+                right = min(
+                    para_text.find(" ", offset) if para_text.find(" ", offset) >= 0 else len(para_text),
+                    para_text.find("\n", offset) if para_text.find("\n", offset) >= 0 else len(para_text),
+                )
+                word = para_text[left + (1 if left >= 0 else 0):right].strip(",.!?;:\"'()[]")
+        word = word.strip(",.!?;:\"'()[]“”‘’")
+        if not word:
+            self.status.config(text="先选中或把光标放到要查的单词上")
+            return
+        win = tk.Toplevel(self)
+        win.title(f"查词 · {word}")
+        win.geometry("560x420")
+        txt = tk.Text(win, wrap="word", bd=0, padx=18, pady=14, font=(FAMILY, 11))
+        vbar = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vbar.set)
+        txt.pack(side="left", fill="both", expand=True)
+        vbar.pack(side="right", fill="y")
+        _config_tags(txt)
+        txt.insert("end", word + "\n", "word")
+        txt.insert("end", "\n查询中…（词典首次初始化约需半分钟）", "meta")
+        self.app.post(self._lookup_worker, word, para, win, txt)
+
+    def _lookup_worker(self, word, para, win, txt):
+        import core_dict
+        core_dict.ensure_db(background=False)
+        result = core_dict.lookup(word)
+        self.app.q.put(("lookup_done", (win, txt, word, para, result)))
+
+    def on_lookup_done(self, payload):
+        win, txt, word, para, result = payload
+        if not win.winfo_exists():
+            return
+        _render_lookup(txt, word, result)
+        if result and not result.get("miss"):
+            add_btn = ttk.Button(win, text="收进本篇生词表", command=lambda: self._add_word_to_vocab(para, result))
+            add_btn.pack(anchor="w", padx=18, pady=(0, 12))
+
+    def _add_word_to_vocab(self, para, result):
+        level = self.app.settings["vocabLevel"]
+        vocab = self.vocab or {"level": level, "articleIndex": self.article_index,
+                               "titleEntries": [], "paragraphs": [], "idioms": []}
+        entry = {
+            "word": (result.get("word") or "").lower(),
+            "phonetic": result.get("phonetic", ""),
+            "pos": result.get("pos", ""),
+            "sense": result.get("translation", "").replace("\n", "；"),
+            "inText": "",
+            "root": "",
+            "term": False,
+        }
+        sections = {p["index"]: p for p in vocab["paragraphs"]}
+        sec = sections.setdefault(para, {"index": para, "startWords": "", "entries": []})
+        if all(e["word"] != entry["word"] for e in sec["entries"]):
+            sec["entries"].append(entry)
+        vocab["paragraphs"] = sorted(sections.values(), key=lambda x: x["index"])
+        from kandu.core_gen import vocab_normalize
+        normalized = vocab_normalize(vocab, self.article)
+        store.save_vocab(self.meta["id"], normalized)
+        self.vocab = normalized
+        self._rebuild(keep_scroll=True)
+        self.status.config(text=f"已把「{entry['word']}」收进第 {para + 1} 段生词表")
 
     def _analysis_worker(self, cfg, para, sentence, key):
         try:

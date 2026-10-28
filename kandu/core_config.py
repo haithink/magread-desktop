@@ -28,6 +28,7 @@ def asset_path(name: str) -> Path:
     roots = []
     if getattr(sys, "frozen", False):
         roots.append(Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)))
+    roots.append(Path(__file__).resolve().parent)
     roots.append(Path(__file__).resolve().parent.parent)
     for r in roots:
         p = r / "assets" / name
