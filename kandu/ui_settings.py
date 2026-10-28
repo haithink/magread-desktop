@@ -67,6 +67,7 @@ class SettingsDialog(tk.Toplevel):
         btns = ttk.Frame(box)
         g(btns, r, 1, sticky="w", pady=6)
         ttk.Button(btns, text="解析并填入", command=self._parse_paste).pack(side="left")
+        ttk.Button(btns, text="获取可用模型", command=self._fetch_models).pack(side="left", padx=8)
         ttk.Button(btns, text="测试连接", command=self._test).pack(side="left", padx=8)
         ttk.Button(btns, text="保存配置", command=self._save).pack(side="left", padx=8)
         r += 1
@@ -113,6 +114,36 @@ class SettingsDialog(tk.Toplevel):
             "model": self.model.get().strip(),
         }
 
+    def _fetch_models(self):
+        cfg = self._current_cfg()
+        invalid = llm.validate(cfg)
+        if invalid:
+            self.test_label.config(text=invalid, foreground="#b00")
+            return
+        self.test_label.config(text="获取模型列表中…", foreground="#446")
+        threading.Thread(target=self._models_worker, args=(cfg,), daemon=True).start()
+
+    def _models_worker(self, cfg):
+        try:
+            ids = llm.list_models(cfg)
+            self.q.put(("models", ids))
+        except Exception as e:
+            self.q.put(("models_err", str(e)))
+
+    def _show_models(self, ids):
+        self.test_label.config(text=f"该 Key 可用 {len(ids)} 个模型，双击名称填入（如仍 404，说明此分组不含该模型）", foreground="#446")
+        win = tk.Toplevel(self)
+        win.title("可用模型（双击填入）")
+        win.geometry("460x520")
+        lb = tk.Listbox(win, font=(FAMILY, 10))
+        vbar = ttk.Scrollbar(win, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=vbar.set)
+        lb.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
+        vbar.pack(side="right", fill="y", pady=10)
+        for m in ids:
+            lb.insert("end", m)
+        lb.bind("<Double-1>", lambda e: (self.model.set(lb.get(lb.curselection() or "")), win.destroy()))
+
     def _test(self):
         cfg = self._current_cfg()
         invalid = llm.validate(cfg)
@@ -140,7 +171,13 @@ class SettingsDialog(tk.Toplevel):
                         text=f"连接成功（{payload['latencyMs']} ms）：{payload['reply']}",
                         foreground="#5c7f10")
                 else:
-                    self.test_label.config(text=f"连接失败：{payload['error']}", foreground="#b00")
+                    err = payload["error"]
+                    hint = "（可点「获取可用模型」查看此 Key 支持的模型名）" if "model_not_found" in err or "404" in err else ""
+                    self.test_label.config(text=f"连接失败：{err}{hint}", foreground="#b00")
+            elif kind == "models":
+                self._show_models(payload)
+            elif kind == "models_err":
+                self.test_label.config(text=f"获取模型列表失败：{payload}", foreground="#b00")
         self.after(80, self._poll)
 
     def _save(self):

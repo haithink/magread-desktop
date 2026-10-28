@@ -104,7 +104,7 @@ def _stream_once(cfg, system, user, max_tokens, temperature, state):
         timeout=TIMEOUT,
     ) as resp:
         if resp.status_code != 200:
-            raise LlmError(f"HTTP {resp.status_code}：{_first_line(resp.text)}")
+            raise LlmError(f"HTTP {resp.status_code}（{endpoint(cfg)}）：{_first_line(resp.text)}")
         for raw in resp.iter_lines(decode_unicode=True, chunk_size=1):
             if not raw or raw.startswith(":"):
                 continue
@@ -214,7 +214,7 @@ def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None) -> 
             except Exception as e:
                 raise LlmError(f"网络请求失败：{e}")
             if resp.status_code != 200:
-                raise LlmError(f"HTTP {resp.status_code}：{_first_line(resp.text)}")
+                raise LlmError(f"HTTP {resp.status_code}（{endpoint(cfg)}）：{_first_line(resp.text)}")
             content = (_parse_content(cfg, resp.text) or "").strip()
             if _looks_truncated(resp.text):
                 state.length_cut = True
@@ -255,6 +255,44 @@ def test(cfg) -> dict:
         return {"ok": True, "latencyMs": int((time.time() - start) * 1000), "reply": reply[:80]}
     except Exception as e:
         return {"ok": False, "latencyMs": int((time.time() - start) * 1000), "error": str(e)}
+
+
+def list_models(cfg):
+    """拉取该 Key 可用的模型列表（OpenAI 与 Anthropic 的 /v1/models 同构）。"""
+    if not is_complete(cfg):
+        raise LlmError("配置不完整")
+    base = (cfg.get("baseUrl") or "").strip().rstrip("/")
+    if base.endswith("/chat/completions"):
+        url = base[: -len("/chat/completions")] + "/models"
+    elif base.endswith("/messages"):
+        url = base[: -len("/messages")] + "/models"
+    elif re.search(r"/v\d+$", base):
+        url = base + "/models"
+    else:
+        url = base + "/v1/models"
+    try:
+        r = requests.get(url, headers=_headers(cfg), timeout=(20, 60))
+    except Exception as e:
+        raise LlmError(f"网络请求失败：{e}")
+    if r.status_code != 200:
+        raise LlmError(f"HTTP {r.status_code}（{url}）：{_first_line(r.text)}")
+    try:
+        data = r.json()
+    except Exception:
+        raise LlmError(f"响应不是 JSON：{_first_line(r.text)}")
+    ids = []
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        items = data.get("models") if isinstance(data, dict) else None
+    if isinstance(items, list):
+        for m in items:
+            if isinstance(m, dict) and m.get("id"):
+                ids.append(str(m["id"]))
+            elif isinstance(m, str):
+                ids.append(m)
+    if not ids:
+        raise LlmError(f"网关没有返回模型列表：{_first_line(r.text)}")
+    return sorted(set(ids))
 
 
 # ---------------- cc-switch / 通用 JSON 配置提取 ----------------
