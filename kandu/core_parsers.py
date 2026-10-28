@@ -40,7 +40,7 @@ def scan(library_dir: str):
             continue
         metas.append(
             {
-                "id": sanitize_id(p.name[:-5]),
+                "id": sanitize_id(p.name[: -(len(ext) + 1)]),
                 "fileName": p.name,
                 "ext": ext,
                 "size": p.stat().st_size,
