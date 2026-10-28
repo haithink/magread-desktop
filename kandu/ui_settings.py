@@ -1,4 +1,5 @@
-"""设置对话框：LLM 接口配置 / cc-switch 粘贴 / 连接测试 / 缓存管理。"""
+"""设置对话框：LLM 接口配置 / cc-switch 粘贴 / 连接测试 / 缓存管理。
+全部子控件用显式行列 grid，避免几何管理器混用。"""
 import queue
 import threading
 import tkinter as tk
@@ -7,17 +8,18 @@ from tkinter import ttk, messagebox
 from kandu import core_config as cfgmod
 from kandu import core_llm as llm
 from kandu import core_parsers as store
+from kandu import core_gen as gen
 
 FAMILY = "Microsoft YaHei UI"
 
 
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, app: "App", on_saved=None):
+    def __init__(self, app, on_saved=None):
         super().__init__(app)
         self.app = app
         self.on_saved = on_saved
         self.title("设置 · 大模型接口")
-        self.geometry("640x640")
+        self.geometry("680x700")
         self.transient(app)
         self.grab_set()
 
@@ -27,47 +29,68 @@ class SettingsDialog(tk.Toplevel):
         s = app.settings
         box = ttk.Frame(self, padding=14)
         box.pack(fill="both", expand=True)
+        box.columnconfigure(1, weight=1)
+        r = 0
 
-        ttk.Label(box, text="接口类型").grid(row=0, column=0, sticky="w")
+        def g(w, row, col=1, sticky="ew", **kw):
+            w.grid(row=row, column=col, sticky=sticky, **kw)
+
+        # 接口类型
+        g(ttk.Label(box, text="接口类型"), r, 0, sticky="w")
         self.provider = tk.StringVar(value=s["llm"].get("provider", "openai"))
-        ttk.Radiobutton(box, text="OpenAI 兼容（/chat/completions）", variable=self.provider, value="openai").grid(row=0, column=1, sticky="w")
-        ttk.Radiobutton(box, text="Anthropic 原生（/v1/messages）", variable=self.provider, value="anthropic").grid(row=1, column=1, sticky="w")
+        g(ttk.Radiobutton(box, text="OpenAI 兼容（/chat/completions）", variable=self.provider, value="openai"), r, 1, sticky="w")
+        r += 1
+        g(ttk.Radiobutton(box, text="Anthropic 原生（/v1/messages）", variable=self.provider, value="anthropic"), r, 1, sticky="w")
+        r += 1
 
-        def row(label, key, width=70):
-            ttk.Label(box, text=label).grid(sticky="w", pady=(8, 0))
+        def field_row(label, key, show=None):
+            nonlocal r
+            g(ttk.Label(box, text=label), r, 0, sticky="w", pady=(8, 0))
             var = tk.StringVar(value=s["llm"].get(key, ""))
-            e = ttk.Entry(box, textvariable=var, width=width)
-            e.grid(sticky="ew")
+            e = ttk.Entry(box, textvariable=var, show=show)
+            g(e, r, 1, pady=(8, 0))
+            r += 1
             return var
 
-        self.base_url = row("API 地址 Base URL")
-        self.api_key = row("API Key")
-        self.model = row("模型名 Model")
+        self.base_url = field_row("API 地址 Base URL", "baseUrl")
+        self.api_key = field_row("API Key", "apiKey")
+        self.model = field_row("模型名 Model", "model")
 
-        ttk.Label(box, text="从 cc-switch JSON 粘贴：").grid(sticky="w", pady=(12, 0))
-        self.paste = tk.Text(box, height=5, font=(FAMILY, 9))
+        # cc-switch 粘贴
+        g(ttk.Label(box, text="从 cc-switch JSON 粘贴："), r, 0, sticky="nw", pady=(12, 0))
+        paste_frame = ttk.Frame(box)
+        g(paste_frame, r, 1, pady=(12, 0))
+        self.paste = tk.Text(paste_frame, height=5, font=(FAMILY, 9))
         self.paste.pack(fill="x")
-        row2 = ttk.Frame(box)
-        row2.pack(fill="x", pady=4)
-        ttk.Button(row2, text="解析并填入", command=self._parse_paste).pack(side="left")
-        ttk.Button(row2, text="测试连接", command=self._test).pack(side="left", padx=8)
-        ttk.Button(row2, text="保存配置", command=self._save).pack(side="left", padx=8)
-        self.test_label = ttk.Label(box, text="", wraplength=560)
-        self.test_label.pack(anchor="w", pady=4)
+        r += 1
 
-        ttk.Separator(box).pack(fill="x", pady=10)
-        info = ttk.Frame(box)
-        info.pack(fill="x")
-        ttk.Label(info, text=f"词汇级别：{gen_level_label(app.settings['vocabLevel'])}"
-                             f"（词表 {cfgmod.word_count(app.settings['vocabLevel'])} 词，内置离线词库）").pack(anchor="w")
+        btns = ttk.Frame(box)
+        g(btns, r, 1, sticky="w", pady=6)
+        ttk.Button(btns, text="解析并填入", command=self._parse_paste).pack(side="left")
+        ttk.Button(btns, text="测试连接", command=self._test).pack(side="left", padx=8)
+        ttk.Button(btns, text="保存配置", command=self._save).pack(side="left", padx=8)
+        r += 1
+
+        self.test_label = ttk.Label(box, text="", wraplength=520)
+        g(self.test_label, r, 1, sticky="w")
+        r += 1
+
+        ttk.Separator(box).grid(row=r, column=0, columnspan=2, sticky="ew", pady=12)
+        r += 1
+
+        ttk.Label(box, text="词汇级别").grid(row=r, column=0, sticky="w")
+        ttk.Label(box, text=f"{gen_level_label(app.settings['vocabLevel'])}"
+                            f"（词表 {cfgmod.word_count(app.settings['vocabLevel'])} 词，内置离线词库）").grid(row=r, column=1, sticky="w")
+        r += 1
+
         try:
             size_mb = sum(f.stat().st_size for f in (cfgmod.app_dir() / "cache").rglob("*") if f.is_file()) / 1048576
         except Exception:
             size_mb = 0
-        ttk.Label(info, text=f"缓存（正文/摘要/生词/句解）：{size_mb:.1f} MB").pack(anchor="w", pady=(4, 0))
-        ttk.Button(info, text="清空全部缓存", command=self._purge).pack(anchor="w", pady=4)
-
-        box.columnconfigure(1, weight=1)
+        ttk.Label(box, text="缓存").grid(row=r, column=0, sticky="w")
+        ttk.Label(box, text=f"正文/摘要/生词/句解缓存 {size_mb:.1f} MB").grid(row=r, column=1, sticky="w")
+        r += 1
+        ttk.Button(box, text="清空全部缓存", command=self._purge).grid(row=r, column=1, sticky="w", pady=6)
 
     def _parse_paste(self):
         text = self.paste.get("1.0", "end").strip()
@@ -141,5 +164,4 @@ class SettingsDialog(tk.Toplevel):
 
 
 def gen_level_label(level: str) -> str:
-    from kandu import core_gen as gen
     return gen.level_label(level)

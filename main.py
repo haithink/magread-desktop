@@ -1,5 +1,6 @@
 """刊读 · Kandu Desktop — LLM 辅助英文外刊精读（Windows 桌面版）"""
 import queue
+import traceback
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -71,6 +72,14 @@ class App(tk.Tk):
 
     def show_library(self):
         self._swap(LibraryFrame(self.container, self))
+
+    def report_callback_exception(self, exc, val, tb):
+        """UI 回调异常弹窗可见（--windowed 下无 stderr，静默吞掉会难排查）"""
+        detail = "".join(traceback.format_exception_only(exc, val))[-1500:]
+        try:
+            messagebox.showerror("内部错误", detail, parent=self)
+        except Exception:
+            pass
 
     def open_settings(self, on_saved=None):
         SettingsDialog(self, on_saved=on_saved)
