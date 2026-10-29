@@ -176,8 +176,9 @@ class ReaderFrame(tk.Frame):
         total = self._total_words()
         if self.vocab is None:
             self.vocab_btn.config(text="生成生词表")
-        elif self.vocab.get("failedChunks"):
-            self.vocab_btn.config(text=f"补缺生词表（缺 {self.vocab['failedChunks']} 块）")
+        elif self.vocab.get("failedChunks") or self._missing_paragraphs() is not None:
+            miss = self._missing_paragraphs()
+            self.vocab_btn.config(text=f"补缺生词表" + (f"（缺 {miss} 段）" if miss else ""))
         else:
             self.vocab_btn.config(text=f"生词表 {total}")
         self._refresh_status()
@@ -191,23 +192,36 @@ class ReaderFrame(tk.Frame):
     def _vocab_btn(self):
         if self.vocab_running:
             return
-        if self.vocab is not None and self._retryable_chunks() == 0:
+        state = self._vocab_state()
+        if state == "complete":
             self._show_full_vocab()
             return
-        # 无缓存，或有「还没试遍所有 LLM」的失败块 → 生成 / 轮换补缺
+        # none / partial（含旧版无失败记录的缺失块）→ 生成 / 轮换补缺
         self.generate_vocab()
 
-    def _retryable_chunks(self):
-        """还有未试遍全部已配置 LLM 的失败块数量。"""
+    def _vocab_state(self):
+        """none：未生成；partial：有段落缺失或存在可重试的失败块；complete：其余。"""
         if not self.vocab:
-            return 0
+            return "none"
+        if self.article is None:
+            return "complete"
+        processed = set(self.vocab.get("processedParagraphs", []))
+        if any(i not in processed for i in range(len(self.article["paragraphs"]))):
+            return "partial"  # 旧版缓存可能无 chunkFailures，缺段落即需补
         cf = self.vocab.get("chunkFailures") or {}
         names = {p.get("name") for p in (self.app.settings.get("llms") or [])}
-        cnt = 0
         for key, tried in cf.items():
             if len(set(tried) & names) < len(names):
-                cnt += 1
-        return cnt
+                return "partial"
+        return "complete"
+
+    def _missing_paragraphs(self):
+        """尚无生词数据的段落数（用于按钮文案）；完整时返回 None。"""
+        if not self.vocab or self.article is None:
+            return None
+        processed = set(self.vocab.get("processedParagraphs", []))
+        missing = sum(1 for i in range(len(self.article["paragraphs"])) if i not in processed)
+        return missing or None
 
     def generate_vocab(self, cfg=None):
         if self.article is None or self.vocab_running:
@@ -255,14 +269,9 @@ class ReaderFrame(tk.Frame):
         self.vocab = vocab
         self._rebuild(keep_scroll=True)
         failed = vocab.get("failedChunks") or 0
+        hint = "（部分内容可能触发模型安全过滤）" if vocab.get("censorHint") else ""
         if failed:
-            retryable = self._retryable_chunks()
-            hint = "（部分内容可能触发模型安全过滤）" if vocab.get("censorHint") else ""
-            if retryable > 0:
-                self.status.config(text=f"生词表部分完成：{failed} 块失败{hint}。点「补缺生词表」将自动轮换其他 LLM")
-            else:
-                self.status.config(text=f"生词表部分完成：{failed} 块在所有已配置 LLM 上均失败{hint}。"
-                                        "可在设置新增其他系模型（如海外模型）后补缺")
+            self.status.config(text=f"生词表部分完成：{failed} 块失败{hint}。点「补缺生词表」自动轮换其他 LLM 重试")
         else:
             self.status.config(text=f"生词表完成（{self._total_words()} 词，已缓存）")
         self._show_full_vocab()

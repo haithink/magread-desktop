@@ -169,7 +169,7 @@ class DigestFrame(tk.Frame):
         for a in digest["articles"]:
             card = tk.Frame(self.inner, bg="white", bd=1, relief="solid")
             card.pack(fill="x", padx=8, pady=5)
-            en = tk.Label(card, text=a.get("titleEn", ""), bg="white", fg="#1b4b43",
+            en = tk.Label(card, text=f"{a.get('index', 0) + 1}. {a.get('titleEn', '')}", bg="white", fg="#1b4b43",
                           font=(FAMILY, 11, "bold"), anchor="w", justify="left", wraplength=980)
             en.pack(fill="x", padx=12, pady=(8, 0))
             widgets = [card, en]
