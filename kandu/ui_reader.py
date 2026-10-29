@@ -174,7 +174,12 @@ class ReaderFrame(tk.Frame):
         self.text.yview_moveto(frac)
 
         total = self._total_words()
-        self.vocab_btn.config(text=f"生词表 {total}" if self.vocab else "生成生词表")
+        if self.vocab is None:
+            self.vocab_btn.config(text="生成生词表")
+        elif self.vocab.get("failedChunks"):
+            self.vocab_btn.config(text=f"补缺生词表（缺 {self.vocab['failedChunks']} 块）")
+        else:
+            self.vocab_btn.config(text=f"生词表 {total}")
         self._refresh_status()
 
     def _refresh_status(self):
@@ -184,10 +189,13 @@ class ReaderFrame(tk.Frame):
 
     # ---------- 生词表 ----------
     def _vocab_btn(self):
-        if self.vocab is not None:
+        if self.vocab_running:
+            return
+        if self.vocab is not None and not self.vocab.get("failedChunks"):
             self._show_full_vocab()
-        else:
-            self.generate_vocab()
+            return
+        # 无缓存，或有失败块（部分完成）→ 生成 / 续传补缺
+        self.generate_vocab()
 
     def generate_vocab(self, cfg=None):
         if self.article is None or self.vocab_running:
@@ -234,7 +242,7 @@ class ReaderFrame(tk.Frame):
         failed = vocab.get("failedChunks") or 0
         if failed:
             hint = "（部分内容可能触发模型安全过滤）" if vocab.get("censorHint") else ""
-            self.status.config(text=f"生词表部分完成：{failed} 块失败{hint}。再点一次「生词表」只补缺的块")
+            self.status.config(text=f"生词表部分完成：{failed} 块失败{hint}。再点一次「生词表」将只补缺的块")
         else:
             self.status.config(text=f"生词表完成（{self._total_words()} 词，已缓存）")
         self._show_full_vocab()
@@ -509,7 +517,7 @@ class ReaderFrame(tk.Frame):
     def _make_sheet(self, title, subtitle):
         win = tk.Toplevel(self)
         win.title(f"{title} — {subtitle}")
-        win.geometry("760x680")
+        win.geometry("860x800")
         txt = tk.Text(win, wrap="word", bd=0, padx=20, pady=14,
                       font=(FAMILY, 11))
         vbar = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
