@@ -57,6 +57,13 @@ class LibraryFrame(tk.Frame):
     def _inner_width(self):
         return max(self.canvas.winfo_width(), 900)
 
+    def on_wheel(self, e):
+        try:
+            if self._alive() and self.canvas.winfo_exists():
+                self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        except tk.TclError:
+            pass
+
     # ---------- 添加 / 导入 ----------
     def add_files(self):
         files = filedialog.askopenfilenames(
@@ -181,9 +188,31 @@ class LibraryFrame(tk.Frame):
         for w in self.inner.winfo_children():
             w.destroy()
         self._photo_cache.clear()
+        row = 0
+        # 最近阅读（最多 6 本，小卡片）
+        by_id = {m["id"]: m for m in self.metas}
+        recent = [by_id[i] for i in (self.app.settings.get("recentBooks") or []) if i in by_id][:6]
+        if recent:
+            tk.Label(self.inner, text="最近阅读", bg=PAPER, fg="#1b4b43",
+                     font=(FAMILY, 11, "bold")).grid(row=row, column=0, sticky="w", padx=6)
+            row += 1
+            for i, meta in enumerate(recent):
+                mini = tk.Frame(self.inner, bg="white", bd=1, relief="solid")
+                mini.grid(row=row, column=i, padx=8, pady=(4, 10), sticky="n")
+                img = tk.Label(mini, bg="#dde8e4", width=88, height=118)
+                img.pack(padx=4, pady=(4, 2))
+                self._load_thumb(img, meta, 88)
+                tk.Label(mini, text=meta["fileName"][:16], bg="white", fg="#333",
+                         font=(FAMILY, 8), wraplength=92).pack(padx=2, pady=(0, 4))
+                for w in (mini, img):
+                    w.bind("<Double-Button-1>", lambda e, m=meta: self.app.open_digest(m))
+            row += 1
+            tk.Label(self.inner, text="全部刊物", bg=PAPER, fg="#1b4b43",
+                     font=(FAMILY, 11, "bold")).grid(row=row, column=0, sticky="w", padx=6)
+            row += 1
         for i, meta in enumerate(self.metas):
             card = tk.Frame(self.inner, bg="white", bd=1, relief="solid")
-            card.grid(row=i // COLS, column=i % COLS, padx=10, pady=10, sticky="n")
+            card.grid(row=row + i // COLS, column=i % COLS, padx=10, pady=10, sticky="n")
             img_label = tk.Label(card, bg="#dde8e4", width=THUMB_W, height=THUMB_H)
             img_label.pack(padx=6, pady=(6, 2))
             self._load_thumb(img_label, meta)
@@ -240,7 +269,8 @@ class LibraryFrame(tk.Frame):
             self.status.config(text=f"已移出：{meta['fileName']}")
             self._render()
 
-    def _load_thumb(self, label, meta):
+    def _load_thumb(self, label, meta, w=THUMB_W):
+        h = int(w * THUMB_H / THUMB_W)
         path = store.cover_file(meta["id"])
         try:
             if not path.exists():
@@ -249,10 +279,10 @@ class LibraryFrame(tk.Frame):
         except Exception:
             label.config(text="无封面", fg="#778")
             return
-        img.thumbnail((THUMB_W, THUMB_H))
+        img.thumbnail((w, h))
         photo = ImageTk.PhotoImage(img)
-        self._photo_cache[meta["id"]] = photo
-        label.config(image=photo, width=THUMB_W, height=THUMB_H, bg="white")
+        self._photo_cache[f"{meta['id']}_{w}"] = photo
+        label.config(image=photo, width=w, height=h, bg="white")
 
     def on_error(self, msg):
         self._importing = False

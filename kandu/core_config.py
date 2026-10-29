@@ -42,6 +42,7 @@ DEFAULTS = {
     "levelChosen": False,
     "libraryDir": "",
     "booksDir": "",
+    "recentBooks": [],
     "migratedLibrary": False,
     "readerFontSize": 13,
     "sheetFontSize": 11,

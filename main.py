@@ -129,6 +129,11 @@ class App(tk.Tk):
         SettingsDialog(self, on_saved=on_saved)
 
     def open_digest(self, meta):
+        # 记录最近阅读（书库页顶部展示）
+        rec = [x for x in (self.settings.get("recentBooks") or []) if x != meta["id"]]
+        rec.insert(0, meta["id"])
+        self.settings["recentBooks"] = rec[:12]
+        self.save_settings()
         self._swap(DigestFrame(self.container, self, meta))
 
     def open_reader(self, meta, article_index):
