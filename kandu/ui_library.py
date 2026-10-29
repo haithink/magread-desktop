@@ -304,9 +304,12 @@ class LibraryFrame(tk.Frame):
                 self.index_btn.state(["!disabled"])
                 if st["done"] and not st.get("reported"):
                     st["reported"] = True
-                    msg = f"索引建立完成：{st['done']} 本"
+                    skipped = st.get("skipped", 0)
+                    msg = f"索引建立完成：本次处理 {st['done']} 本"
+                    if skipped:
+                        msg += f"（另有 {skipped} 本已有索引，自动跳过）"
                     if st["errors"]:
-                        msg += f"（失败 {len(st['errors'])}，详见 error.log）"
+                        msg += f"，失败 {len(st['errors'])}（详见 error.log）"
                         for e in st["errors"]:
                             self.app._log_error("索引失败：" + e)
                     self.status.config(text=msg)

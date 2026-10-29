@@ -27,7 +27,8 @@ class App(tk.Tk):
         self.current = None
         self._erroring = False
         self.index_state = {"running": False, "done": 0, "total": 0,
-                            "current": "", "errors": [], "reported": False}
+                            "current": "", "errors": [], "reported": False,
+                            "skipped": 0}
 
         self.container = tk.Frame(self)
         self.container.pack(fill="both", expand=True)
@@ -65,8 +66,7 @@ class App(tk.Tk):
             except Exception as e:
                 self.index_state["errors"].append(f"{m['fileName']}：{e}")
             self.index_state["done"] = i + 1
-        if skipped:
-            self.index_state["errors"].append(f"（另有 {skipped} 本已有索引，自动跳过）")
+        self.index_state["skipped"] = skipped
         self.index_state["running"] = False
         self.index_state["current"] = ""
 
