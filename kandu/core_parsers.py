@@ -348,6 +348,18 @@ def _json_write(p: Path, obj):
     p.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
 
 
+def has_content(meta: dict) -> bool:
+    """正文索引已存在且与源文件大小匹配。"""
+    f = _cache_dir(meta["id"]) / "content.json"
+    if not f.exists():
+        return False
+    try:
+        import json
+        return json.loads(f.read_text(encoding="utf-8")).get("bookSize") == meta["size"]
+    except Exception:
+        return False
+
+
 def ensure_content(meta: dict) -> dict:
     """解析正文（content.json 缓存，源文件大小变化时失效）。"""
     cf = _cache_dir(meta["id"]) / "content.json"

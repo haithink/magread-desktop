@@ -26,6 +26,42 @@ class App(tk.Tk):
         self.q = queue.Queue()
         self.current = None
         self._erroring = False
+        self.index_state = {"running": False, "done": 0, "total": 0,
+                            "current": "", "errors": [], "reported": False}
+
+    def start_indexing(self):
+        """后台为书库全部书籍建立内容索引与封面（可随时查看进度）。"""
+        if self.index_state["running"]:
+            return
+        metas = store.load_library()
+        if not metas:
+            messagebox.showinfo("建立索引", "书库为空，先添加刊物", parent=self)
+            return
+        self.index_state.update(running=True, done=0, total=len(metas),
+                                current="", errors=[], reported=False)
+        self.post(self._index_worker, metas)
+
+    def _index_worker(self, metas):
+        skipped = 0
+        for i, m in enumerate(metas):
+            if not self.index_state["running"]:
+                break
+            self.index_state["current"] = m["fileName"]
+            self.index_state["done"] = i
+            if store.has_content(m):
+                skipped += 1
+                self.index_state["done"] = i + 1
+                continue
+            try:
+                store.ensure_content(m)
+                store.ensure_cover(m)
+            except Exception as e:
+                self.index_state["errors"].append(f"{m['fileName']}：{e}")
+            self.index_state["done"] = i + 1
+        if skipped:
+            self.index_state["errors"].append(f"（另有 {skipped} 本已有索引，自动跳过）")
+        self.index_state["running"] = False
+        self.index_state["current"] = ""
 
         self.container = tk.Frame(self)
         self.container.pack(fill="both", expand=True)

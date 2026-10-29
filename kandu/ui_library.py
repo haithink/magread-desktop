@@ -32,6 +32,9 @@ class LibraryFrame(tk.Frame):
 
         self.status = tk.Label(self, text="", bg=PAPER, fg="#446", anchor="w")
         self.status.pack(fill="x", padx=14, pady=(6, 0))
+        self.index_btn = ttk.Button(bar, text="建立索引", command=self.app.start_indexing)
+        self.index_btn.pack(side="right", padx=6, pady=6)
+        self.after(400, self._tick_index_status)
 
         self.canvas = tk.Canvas(self, bg=PAPER, highlightthickness=0)
         self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
@@ -287,3 +290,26 @@ class LibraryFrame(tk.Frame):
     def on_error(self, msg):
         self._importing = False
         messagebox.showerror("操作失败", str(msg), parent=self)
+
+    # ---------- 后台索引进度 ----------
+    def _tick_index_status(self):
+        if not self._alive():
+            return
+        st = self.app.index_state
+        try:
+            if st["running"]:
+                self.status.config(text=f"后台索引中… {st['done']}/{st['total']}　{st['current']}")
+                self.index_btn.state(["disabled"])
+            else:
+                self.index_btn.state(["!disabled"])
+                if st["done"] and not st.get("reported"):
+                    st["reported"] = True
+                    msg = f"索引建立完成：{st['done']} 本"
+                    if st["errors"]:
+                        msg += f"（失败 {len(st['errors'])}，详见 error.log）"
+                        for e in st["errors"]:
+                            self.app._log_error("索引失败：" + e)
+                    self.status.config(text=msg)
+        except tk.TclError:
+            pass
+        self.after(400, self._tick_index_status)
