@@ -29,6 +29,13 @@ class App(tk.Tk):
         self.index_state = {"running": False, "done": 0, "total": 0,
                             "current": "", "errors": [], "reported": False}
 
+        self.container = tk.Frame(self)
+        self.container.pack(fill="both", expand=True)
+        # 滚轮统一路由：各页面实现 on_wheel 即可，销毁无需解绑
+        self.bind_all("<MouseWheel>", self._route_wheel)
+        self.after(80, self._poll)
+        self.show_library()
+
     def start_indexing(self):
         """后台为书库全部书籍建立内容索引与封面（可随时查看进度）。"""
         if self.index_state["running"]:
@@ -62,13 +69,6 @@ class App(tk.Tk):
             self.index_state["errors"].append(f"（另有 {skipped} 本已有索引，自动跳过）")
         self.index_state["running"] = False
         self.index_state["current"] = ""
-
-        self.container = tk.Frame(self)
-        self.container.pack(fill="both", expand=True)
-        # 滚轮统一路由：各页面实现 on_wheel 即可，销毁无需解绑
-        self.bind_all("<MouseWheel>", self._route_wheel)
-        self.after(80, self._poll)
-        self.show_library()
 
     def _route_wheel(self, e):
         handler = getattr(self.current, "on_wheel", None)
