@@ -400,8 +400,8 @@ class ReaderFrame(tk.Frame):
             return
         cached = store.load_analysis(self.meta["id"], sentence, self.article["index"])
         if cached and not cached.get("partial"):
-            win, txt = self._make_sheet("句解", self.article["title"][:36])
-            self._sheets[key] = (win, txt)
+            win, txt, bar = self._make_sheet("句解", self.article["title"][:36])
+            self._sheets[key] = (win, txt, bar)
             _render_analysis(txt, cached, sentence)
             return
         cfg = dict(cfgmod.get_llm(self.app.settings))
@@ -410,8 +410,8 @@ class ReaderFrame(tk.Frame):
             self.status.config(text=f"⚠ {invalid}（设置里配置）")
             return
         self.analysis_busy.add(key)
-        win, txt = self._make_sheet("句解", self.article["title"][:36])
-        self._sheets[key] = (win, txt)
+        win, txt, bar = self._make_sheet("句解", self.article["title"][:36])
+        self._sheets[key] = (win, txt, bar)
         _render_loading(txt, sentence)
         self.app.post(self._analysis_worker, cfg, para, sentence, key)
 
@@ -435,32 +435,25 @@ class ReaderFrame(tk.Frame):
         if not word:
             self.status.config(text="先选中或把光标放到要查的单词上")
             return
-        win = tk.Toplevel(self)
-        win.title(f"查词 · {word}")
-        win.geometry("560x420")
-        txt = tk.Text(win, wrap="word", bd=0, padx=18, pady=14, font=(FAMILY, 11))
-        vbar = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=vbar.set)
-        txt.pack(side="left", fill="both", expand=True)
-        vbar.pack(side="right", fill="y")
-        _config_tags(txt)
+        win, txt, bar = self._make_sheet(f"查词 · {word}", self.article["title"][:36])
         txt.insert("end", word + "\n", "word")
         txt.insert("end", "\n查询中…（词典首次初始化约需半分钟）", "meta")
-        self.app.post(self._lookup_worker, word, para, win, txt)
+        self._lookup_bar = bar
+        self.app.post(self._lookup_worker, word, para, win, bar, txt)
 
-    def _lookup_worker(self, word, para, win, txt):
+    def _lookup_worker(self, word, para, win, bar, txt):
         core_dict.ensure_db(background=False)
         result = core_dict.lookup(word)
-        self.app.q.put(("lookup_done", (win, txt, word, para, result)))
+        self.app.q.put(("lookup_done", (win, bar, txt, word, para, result)))
 
     def on_lookup_done(self, payload):
-        win, txt, word, para, result = payload
+        win, bar, txt, word, para, result = payload
         if not win.winfo_exists():
             return
         _render_lookup(txt, word, result)
         if result and not result.get("miss"):
-            add_btn = ttk.Button(win, text="收进本篇生词表", command=lambda: self._add_word_to_vocab(para, result))
-            add_btn.pack(anchor="w", padx=18, pady=(0, 12))
+            ttk.Button(bar, text="收进本篇生词表",
+                       command=lambda: self._add_word_to_vocab(para, result)).pack(side="right", padx=8, pady=3)
 
     def _add_word_to_vocab(self, para, result):
         level = self.app.settings["vocabLevel"]
@@ -539,7 +532,7 @@ class ReaderFrame(tk.Frame):
         self._render_vocab_sheet(f"本篇生词表（{label}，{self._total_words()} 词）", only_para=None)
 
     def _render_vocab_sheet(self, title, only_para):
-        win, txt = self._make_sheet(title, self.article["title"][:36])
+        win, txt, bar = self._make_sheet(title, self.article["title"][:36])
         _render_vocab(txt, self.vocab, only_para)
 
     # ---------- 公共弹层 ----------
@@ -547,29 +540,50 @@ class ReaderFrame(tk.Frame):
         win = tk.Toplevel(self)
         win.title(f"{title} — {subtitle}")
         win.geometry("860x800")
+        bar = tk.Frame(win, bg="#1b4b43")
+        bar.pack(fill="x")
+        tk.Label(bar, text=title, bg="#1b4b43", fg="white",
+                 font=(FAMILY, 10, "bold")).pack(side="left", padx=10, pady=4)
+
+        size = int(self.app.settings.get("sheetFontSize", 11))
+
+        def apply_size(delta=None):
+            s = int(self.app.settings.get("sheetFontSize", 11))
+            if delta:
+                s = max(9, min(22, s + delta))
+                self.app.settings["sheetFontSize"] = s
+                self.app.save_settings()
+            txt.configure(font=(FAMILY, s))
+            _config_tags(txt, s)
+
+        ttk.Button(bar, text="A-", width=3, command=lambda: apply_size(-1)).pack(side="right", padx=(2, 8), pady=3)
+        ttk.Button(bar, text="A+", width=3, command=lambda: apply_size(1)).pack(side="right", padx=2, pady=3)
+
         txt = tk.Text(win, wrap="word", bd=0, padx=20, pady=14,
-                      font=(FAMILY, 11))
+                      font=(FAMILY, size))
         vbar = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=vbar.set)
         txt.pack(side="left", fill="both", expand=True)
         vbar.pack(side="right", fill="y")
-        _config_tags(txt)
-        return win, txt
+        _config_tags(txt, size)
+        return win, txt, bar
 
 
-def _config_tags(txt):
-    txt.tag_config("h1", font=(FAMILY, 13, "bold"), foreground="#1b4b43", spacing1=10)
-    txt.tag_config("h2", font=(FAMILY, 11, "bold"), foreground="#7fa829", spacing1=10)
-    txt.tag_config("word", font=(FAMILY, 11, "bold"), foreground="#1b4b43")
-    txt.tag_config("meta", foreground="#7a8a86", font=(FAMILY, 9))
-    txt.tag_config("sense", font=(FAMILY, 11))
-    txt.tag_config("root", foreground="#5c7f10", font=(FAMILY, 10))
-    txt.tag_config("term", foreground="#8a6d00", font=(FAMILY, 9, "bold"))
-    txt.tag_config("quote", foreground="#556", font=(FAMILY, 10, "italic"))
-    txt.tag_config("mono", font=("Consolas", 10), background="#f2f6f4")
-    txt.tag_config("trans", background="#e9f4ef", font=(FAMILY, 11))
-    txt.tag_config("src", foreground="#667", font=(FAMILY, 10))
-    txt.tag_config("warn", foreground="#b06000", font=(FAMILY, 9))
+def _config_tags(txt, size=11):
+    """弹层文本样式：字号以 size 为基准缩放，供 A-/A+ 调节。"""
+    small = max(8, size - 2)
+    txt.tag_config("h1", font=(FAMILY, size + 2, "bold"), foreground="#1b4b43", spacing1=10)
+    txt.tag_config("h2", font=(FAMILY, size, "bold"), foreground="#7fa829", spacing1=10)
+    txt.tag_config("word", font=(FAMILY, size, "bold"), foreground="#1b4b43")
+    txt.tag_config("meta", foreground="#7a8a86", font=(FAMILY, small))
+    txt.tag_config("sense", font=(FAMILY, size))
+    txt.tag_config("root", foreground="#5c7f10", font=(FAMILY, max(8, size - 1)))
+    txt.tag_config("term", foreground="#8a6d00", font=(FAMILY, small, "bold"))
+    txt.tag_config("quote", foreground="#556", font=(FAMILY, max(8, size - 1), "italic"))
+    txt.tag_config("mono", font=("Consolas", max(8, size - 1)), background="#f2f6f4")
+    txt.tag_config("trans", background="#e9f4ef", font=(FAMILY, size))
+    txt.tag_config("src", foreground="#667", font=(FAMILY, max(8, size - 1)))
+    txt.tag_config("warn", foreground="#b06000", font=(FAMILY, small))
 
 
 def _render_loading(txt, sentence):

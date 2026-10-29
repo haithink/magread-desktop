@@ -44,6 +44,7 @@ DEFAULTS = {
     "booksDir": "",
     "migratedLibrary": False,
     "readerFontSize": 13,
+    "sheetFontSize": 11,
     "llms": [],
     "defaultLlm": "",
 }
