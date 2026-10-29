@@ -191,11 +191,23 @@ class ReaderFrame(tk.Frame):
     def _vocab_btn(self):
         if self.vocab_running:
             return
-        if self.vocab is not None and not self.vocab.get("failedChunks"):
+        if self.vocab is not None and self._retryable_chunks() == 0:
             self._show_full_vocab()
             return
-        # 无缓存，或有失败块（部分完成）→ 生成 / 续传补缺
+        # 无缓存，或有「还没试遍所有 LLM」的失败块 → 生成 / 轮换补缺
         self.generate_vocab()
+
+    def _retryable_chunks(self):
+        """还有未试遍全部已配置 LLM 的失败块数量。"""
+        if not self.vocab:
+            return 0
+        cf = self.vocab.get("chunkFailures") or {}
+        names = {p.get("name") for p in (self.app.settings.get("llms") or [])}
+        cnt = 0
+        for key, tried in cf.items():
+            if len(set(tried) & names) < len(names):
+                cnt += 1
+        return cnt
 
     def generate_vocab(self, cfg=None):
         if self.article is None or self.vocab_running:
@@ -211,23 +223,26 @@ class ReaderFrame(tk.Frame):
         self.app.post(self._vocab_worker, cfg)
 
     def _vocab_worker(self, cfg):
-        def progress(done, total):
-            self.app.emit("vocab_progress", {"done": done, "total": total})
+        def progress(done, total, llm_name=None):
+            self.app.emit("vocab_progress", {"done": done, "total": total, "llm": llm_name})
 
         def chars(n):
             self.app.emit("vocab_chars", n)
 
+        rotation = [dict(p) for p in (self.app.settings.get("llms") or [])]
         try:
             vocab = gen.generate_vocab(
                 self.meta, self.article, self.app.settings["vocabLevel"], cfg,
-                on_progress=progress, on_chars=chars,
+                on_progress=progress, on_chars=chars, llm_rotation=rotation,
             )
             self.app.emit("vocab_done", vocab)
         except Exception as e:
             self.app.emit("vocab_error", str(e))
 
     def on_vocab_progress(self, p):
-        self.status.config(text=f"生词表生成中… 第 {p['done']}/{p['total']} 块")
+        llm = p.get("llm")
+        self.status.config(text=f"生词表生成中… 第 {p['done']}/{p['total']} 块"
+                                + (f" · {llm}" if llm else ""))
 
     def on_vocab_chars(self, n):
         if n > 0:
@@ -241,8 +256,13 @@ class ReaderFrame(tk.Frame):
         self._rebuild(keep_scroll=True)
         failed = vocab.get("failedChunks") or 0
         if failed:
+            retryable = self._retryable_chunks()
             hint = "（部分内容可能触发模型安全过滤）" if vocab.get("censorHint") else ""
-            self.status.config(text=f"生词表部分完成：{failed} 块失败{hint}。再点一次「生词表」将只补缺的块")
+            if retryable > 0:
+                self.status.config(text=f"生词表部分完成：{failed} 块失败{hint}。点「补缺生词表」将自动轮换其他 LLM")
+            else:
+                self.status.config(text=f"生词表部分完成：{failed} 块在所有已配置 LLM 上均失败{hint}。"
+                                        "可在设置新增其他系模型（如海外模型）后补缺")
         else:
             self.status.config(text=f"生词表完成（{self._total_words()} 词，已缓存）")
         self._show_full_vocab()

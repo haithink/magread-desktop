@@ -78,28 +78,41 @@ def test_digest_resume():
     assert len(d2["articles"]) == 8
 
 
-@case("vocab 分块隔离与续传")
+@case("vocab 分块隔离与 LLM 轮换补缺")
 def test_vocab_resume():
-    import json as J2
     calls = []
     def fake(cfg, system, user, max_tokens=0, on_delta=None):
-        calls.append(1)
+        calls.append(cfg["model"])
         idxs = [int(m) for m in re.findall(r"### 段落 (\d+)", user)]
-        if 3 in idxs:
+        if 3 in idxs and cfg["model"] == "bad":
             raise llm.LlmError("sensitive information upstream_error")
         arr = [{"index": i, "startWords": f"p{i}",
                 "entries": [{"word": f"w{i}", "sense": f"释{i}"}]} for i in idxs]
-        return J2.dumps({"paragraphs": arr}, ensure_ascii=False)
+        return J.dumps({"paragraphs": arr}, ensure_ascii=False)
     gen._chat_retry = fake
+    llm.chat = fake
     meta = dict(META, id="T_VOCAB")
     art = {"index": 0, "title": "t", "paragraphs": [(f"para {i} " + "word " * 150) for i in range(9)]}
-    v1 = gen.generate_vocab(meta, art, "cet4", {"provider": "openai", "baseUrl": "x", "apiKey": "k", "model": "m"})
+    bad = {"name": "bad", "provider": "openai", "baseUrl": "x", "apiKey": "k", "model": "bad"}
+    good = {"name": "good", "provider": "openai", "baseUrl": "x", "apiKey": "k", "model": "good"}
+    # 第一轮：轮换里只有坏渠道 → 含第 3 段的块失败
+    v1 = gen.generate_vocab(meta, art, "cet4", bad, llm_rotation=[bad])
     assert v1.get("censorHint") is True
-    before = set(v1.get("processedParagraphs", []))
+    assert "0,1,2,3,4" in v1.get("chunkFailures", {})
+    assert 3 not in v1.get("processedParagraphs", [])
+    # 第二轮：轮换加入好渠道 → 自动换好渠道补缺成功
     calls.clear()
-    v2 = gen.generate_vocab(meta, art, "cet4", {"provider": "openai", "baseUrl": "x", "apiKey": "k", "model": "m"})
-    assert calls == [1]  # 只重试失败块
-    assert set(v2.get("processedParagraphs", [])) >= before
+    v2 = gen.generate_vocab(meta, art, "cet4", bad, llm_rotation=[bad, good])
+    print('  pass2 calls:', calls)
+    print('  pass2 processed:', sorted(v2.get("processedParagraphs", [])))
+    print('  pass2 chunkFailures:', v2.get("chunkFailures"))
+    assert "good" in calls, "应自动换好渠道"
+    assert 3 in v2.get("processedParagraphs", [])
+    assert not v2.get("failedChunks")
+    # 第三轮：全部完成 → 无可补
+    calls.clear()
+    gen.generate_vocab(meta, art, "cet4", bad, llm_rotation=[bad, good])
+    assert calls == []
 
 
 @case("本地词典查词")

@@ -353,19 +353,28 @@ def _is_censor(text: str) -> bool:
     return any(k in t for k in keys)
 
 
-def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None):
+def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, llm_rotation=None):
     """生成一篇文章的生词表：本地粗筛候选 → 分块 LLM 确认 → 规范化落盘。
 
-    支持续传：已生成过的段落块自动跳过；单块失败（如内容触发模型
-    安全过滤）留待下次，不阻塞其余块。"""
+    支持续传与 LLM 轮换：已成功块自动跳过；失败块记录试用过的 LLM，
+    重试时自动轮换到「没用过的」配置；全部配置都失败的块才放弃
+    （不再重复烧 token）。"""
     dict_set = cfgmod.wordset(level)
     label = level_label(level)
 
     existing = store.load_vocab(meta["id"], article["index"], level) or {}
     processed = set(existing.get("processedParagraphs", []))
+    chunk_failures = dict(existing.get("chunkFailures", {}))
     merged_sections = {p["index"]: p for p in existing.get("paragraphs", [])}
     merged_title = list(existing.get("titleEntries", []))
     merged_idioms = list(existing.get("idioms", []))
+    seen = set()
+
+    # LLM 轮换序列：传入的默认配置优先，其余配置按设置顺序跟上
+    rotation = [dict(cfg)]
+    for p in llm_rotation or []:
+        if all(p.get("name") != r.get("name") for r in rotation):
+            rotation.append(dict(p))
 
     units = [(-1, article["title"])]
     for i, p in enumerate(article["paragraphs"]):
@@ -392,78 +401,89 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None):
     if current:
         chunks.append(current)
 
-    # 续传：块内所有单元（含标题单元 -1）都已处理过则跳过
+    def chunk_key(chunk):
+        return ",".join(str(idx) for idx, _ in sorted(chunk))
+
+    # 续传：块内所有单元都已处理过则跳过
     def chunk_done(chunk):
         return all(idx in processed for idx, _ in chunk)
 
-    pending = [c for c in chunks if not chunk_done(c)]
-    failed_chunks = []
-    censor_hit = False
-    seen = set()
-
-    total = len(pending)
-    done_count = len(chunks) - total
-    if on_progress:
-        on_progress(0, total)
-    for ci, chunk in enumerate(pending):
-        if on_progress:
-            on_progress(ci, total)
-        if on_chars:
-            on_chars(0)
-        user = prompts.vocab_user(article["title"], -1, chunk, cand)
-        obj = None
-        last_err = None
-        for attempt in range(2):
-            try:
-                raw = _chat_retry(cfg, prompts.vocab_system(label), user, 16000, on_chars)
-                obj = _parse_json(raw, want_array=False)
-                break
-            except Exception as e:
-                last_err = e
-                msg = str(e)
-                if _is_censor(msg) or _is_censor(getattr(getattr(e, '__cause__', None), 'message', '')):
-                    censor_hit = True
-                    break  # 内容过滤重试也没用
-                time.sleep(1)
-        if obj is None:
-            failed_chunks.append({"chunk": ci, "error": str(last_err)})
-            if on_progress:
-                on_progress(ci + 1, total)
+    # 待处理块及其「未试用过」的 LLM 序列；全部 LLM 都试过的块直接放弃
+    pending = []
+    for chunk in chunks:
+        if chunk_done(chunk):
             continue
+        key = chunk_key(chunk)
+        tried = set(chunk_failures.get(key, []))
+        llms = [c for c in rotation if c.get("name") not in tried]
+        pending.append((chunk, llms))
+    pending = [(c, ls) for c, ls in pending if ls]
 
-        new_sections = {}
-        for p in obj.get("paragraphs", []):
-            if not isinstance(p, dict):
-                continue
+    total_units = sum(max(1, len(ls)) for _, ls in pending)
+    done_units = 0
+    failed_chunks = 0
+    censor_hit = False
+
+    for chunk, llms_to_try in pending:
+        key = chunk_key(chunk)
+        chunk_ok = False
+        for lcfg in llms_to_try:
+            lname = lcfg.get("name", "?")
+            if on_progress:
+                on_progress(done_units, total_units, lname)
+            if on_chars:
+                on_chars(0)
+            user = prompts.vocab_user(article["title"], -1, chunk, cand)
+            obj = None
             try:
-                idx = int(p.get("index"))
-            except Exception:
+                raw = llm.chat(lcfg, prompts.vocab_system(label), user, max_tokens=16000, on_delta=on_chars)
+                obj = _parse_json(raw, want_array=False)
+            except Exception as e:
+                msg = str(e)
+                chunk_failures.setdefault(key, []).append(lname)
+                if _is_censor(msg):
+                    censor_hit = True
+                done_units += 1
                 continue
-            entries = [_parse_entry(e, seen) for e in p.get("entries", [])]
-            entries = [e for e in entries if e]
-            if idx < 0:
-                by_word = {e["word"]: e for e in merged_title}
-                for e in entries:
-                    by_word[e["word"]] = e
-                merged_title = list(by_word.values())
-                continue
-            start_words = (p.get("startWords") or "").strip() or (
-                article["paragraphs"][idx][:30] if 0 <= idx < len(article["paragraphs"]) else ""
-            )
-            new_sections[idx] = {"index": idx, "startWords": start_words, "entries": entries}
-        merged_sections.update(new_sections)
-        for e in obj.get("titleEntries", []):
-            entry = _parse_entry(e, seen)
-            if entry:
-                by_word = {x["word"]: x for x in merged_title}
-                by_word[entry["word"]] = entry
-                merged_title = list(by_word.values())
-        for io in obj.get("idioms", []):
-            if isinstance(io, dict) and (io.get("word") or "").strip():
-                merged_idioms.append(
-                    {"word": io["word"], "common": io.get("common", ""), "inText": io.get("inText", "")}
+
+            for p in obj.get("paragraphs", []):
+                if not isinstance(p, dict):
+                    continue
+                try:
+                    idx = int(p.get("index"))
+                except Exception:
+                    continue
+                entries = [_parse_entry(e, seen) for e in p.get("entries", [])]
+                entries = [e for e in entries if e]
+                if idx < 0:
+                    by_word = {x["word"]: x for x in merged_title}
+                    for e in entries:
+                        by_word[e["word"]] = e
+                    merged_title = list(by_word.values())
+                    continue
+                start_words = (p.get("startWords") or "").strip() or (
+                    article["paragraphs"][idx][:30] if 0 <= idx < len(article["paragraphs"]) else ""
                 )
-        processed.update(idx for idx, _ in chunk)
+                merged_sections[idx] = {"index": idx, "startWords": start_words, "entries": entries}
+            for e in obj.get("titleEntries", []):
+                entry = _parse_entry(e, seen)
+                if entry:
+                    by_word = {x["word"]: x for x in merged_title}
+                    by_word[entry["word"]] = entry
+                    merged_title = list(by_word.values())
+            for io in obj.get("idioms", []):
+                if isinstance(io, dict) and (io.get("word") or "").strip():
+                    merged_idioms.append(
+                        {"word": io["word"], "common": io.get("common", ""), "inText": io.get("inText", "")}
+                    )
+            chunk_ok = True
+            done_units += 1
+            break  # 本块成功，无需轮换
+
+        if chunk_ok:
+            processed.update(idx for idx, _ in chunk)
+        else:
+            failed_chunks += 1
 
         draft = {
             "level": level,
@@ -472,14 +492,13 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None):
             "paragraphs": sorted(merged_sections.values(), key=lambda x: x["index"]),
             "idioms": merged_idioms,
             "processedParagraphs": sorted(processed),
+            "chunkFailures": chunk_failures,
         }
         result = vocab_normalize(draft, article)
         if failed_chunks:
-            result["failedChunks"] = len(failed_chunks)
+            result["failedChunks"] = failed_chunks
             result["censorHint"] = censor_hit
         store.save_vocab(meta["id"], result)
-        if on_progress:
-            on_progress(ci + 1, total)
 
     draft = {
         "level": level,
@@ -488,14 +507,14 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None):
         "paragraphs": sorted(merged_sections.values(), key=lambda x: x["index"]),
         "idioms": list({i["word"].lower(): i for i in merged_idioms}.values()),
         "processedParagraphs": sorted(processed),
+        "chunkFailures": chunk_failures,
     }
     if failed_chunks:
-        draft["failedChunks"] = len(failed_chunks)
-        if censor_hit:
-            draft["censorHint"] = True
+        draft["failedChunks"] = failed_chunks
+        draft["censorHint"] = censor_hit
     result = vocab_normalize(draft, article)
     if failed_chunks:
-        result["failedChunks"] = len(failed_chunks)
+        result["failedChunks"] = failed_chunks
         result["censorHint"] = censor_hit
     store.save_vocab(meta["id"], result)
     return result
