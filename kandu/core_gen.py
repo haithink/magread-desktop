@@ -495,9 +495,9 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
             "chunkFailures": chunk_failures,
         }
         result = vocab_normalize(draft, article)
-        if failed_chunks:
-            result["failedChunks"] = failed_chunks
-            result["censorHint"] = censor_hit
+        all_entries = [e for p in result.get("paragraphs", []) for e in p.get("entries", [])]
+        all_entries += result.get("titleEntries", [])
+        backfill_phonetics(all_entries)
         store.save_vocab(meta["id"], result)
 
     draft = {
@@ -513,9 +513,9 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
         draft["failedChunks"] = failed_chunks
         draft["censorHint"] = censor_hit
     result = vocab_normalize(draft, article)
-    if failed_chunks:
-        result["failedChunks"] = failed_chunks
-        result["censorHint"] = censor_hit
+    all_entries = [e for p in result.get("paragraphs", []) for e in p.get("entries", [])]
+    all_entries += result.get("titleEntries", [])
+    backfill_phonetics(all_entries)
     store.save_vocab(meta["id"], result)
     return result
 
@@ -539,6 +539,27 @@ def _parse_entry(el, seen):
         "root": (el.get("root") or "").strip(),
         "term": el.get("term") in (True, "true", "True"),
     }
+
+
+def backfill_phonetics(entries):
+    """词条音标缺失时从本地 ECDICT 词典离线回填（原位修改，返回是否有改动）。"""
+    changed = False
+    missing = [e for e in entries if isinstance(e, dict) and not (e.get("phonetic") or "").strip()]
+    if not missing:
+        return False
+    try:
+        from . import core_dict
+        core_dict.ensure_db(background=False)
+        if not core_dict.STATE.get("ready"):
+            return False
+        for e in missing:
+            r = core_dict.lookup(e.get("word", ""))
+            if r and (r.get("phonetic") or "").strip():
+                e["phonetic"] = r["phonetic"]
+                changed = True
+    except Exception:
+        pass
+    return changed
 
 
 def _analysis_partial(analysis: dict) -> bool:
@@ -585,6 +606,7 @@ def analyze(meta, article, sentence, before, after, cfg):
                     "note": _s(v, "note"),
                 }
             )
+    backfill_phonetics(analysis["vocab"])
     analysis["partial"] = _analysis_partial(analysis)
     if not analysis["partial"]:
         # 残缺结果不落盘：下次双击会自动重试
