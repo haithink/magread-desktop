@@ -257,6 +257,8 @@ def generate_digest(meta, cfg, on_progress=None, on_chars=None, resume=True):
     existing = {
         a["index"]: a for a in (store.load_digest(meta["id"]) or {}).get("articles", [])
     }
+    failed_batches = []
+    censor_flag = {"hit": False}
 
     def is_done(a):
         e = existing.get(a["index"])
@@ -291,6 +293,10 @@ def generate_digest(meta, cfg, on_progress=None, on_chars=None, resume=True):
                 time.sleep(1)
         if arr is None:
             # 该批放弃（留占位），继续后面的批次——不让一个坏批次阻塞整轮
+            err_text = str(last_err)
+            failed_batches.append(err_text)
+            if _is_censor(err_text):
+                censor_flag["hit"] = True
             if on_progress:
                 on_progress(bi + 1, total)
             continue
@@ -318,7 +324,12 @@ def generate_digest(meta, cfg, on_progress=None, on_chars=None, resume=True):
                 existing[a["index"]] = collected[a["index"]]
         if on_progress:
             on_progress(bi + 1, total)
-    return store.load_digest(meta["id"]) or {"bookId": meta["id"], "articles": [], "generatedAt": 0}
+    final = _final_digest(meta, articles, existing, collected)
+    final["failedBatches"] = len(failed_batches)
+    final["censorHint"] = censor_flag["hit"]
+    final["lastError"] = failed_batches[-1] if failed_batches else ""
+    store.save_digest(final)
+    return final
 
 
 def _final_digest(meta, articles, existing, collected, on_progress=None, done=None, total=None):

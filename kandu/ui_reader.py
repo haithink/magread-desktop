@@ -6,6 +6,7 @@ from kandu import core_parsers as store
 from kandu import core_llm as llm
 from kandu import core_gen as gen
 from kandu import core_dict
+from kandu import core_config as cfgmod
 from kandu.core_config import app_dir
 
 
@@ -188,17 +189,17 @@ class ReaderFrame(tk.Frame):
         else:
             self.generate_vocab()
 
-    def generate_vocab(self):
+    def generate_vocab(self, cfg=None):
         if self.article is None or self.vocab_running:
             return
-        cfg = dict(self.app.settings["llm"])
+        cfg = dict(cfg or cfgmod.get_llm(self.app.settings))
         invalid = llm.validate(cfg)
         if invalid:
             self.status.config(text=f"⚠ {invalid}（设置里配置）")
             return
         self.vocab_running = True
         self.vocab_btn.config(state="disabled")
-        self.status.config(text="生词表生成中… 准备中")
+        self.status.config(text=f"生词表生成中… 准备中（{cfg.get('name', '默认')}）")
         self.app.post(self._vocab_worker, cfg)
 
     def _vocab_worker(self, cfg):
@@ -242,6 +243,31 @@ class ReaderFrame(tk.Frame):
         self.vocab_running = False
         self.vocab_btn.config(state="normal")
         self.status.config(text=f"生词表出错：{msg}")
+        self._offer_other_llm(lambda cfg: self.generate_vocab(cfg))
+
+    def _offer_other_llm(self, retry, failed_name=None):
+        """默认 LLM 失败时，若配置了其他 LLM 则弹出选择框供换用重试。"""
+        others = cfgmod.other_llms(self.app.settings, exclude_name=failed_name)
+        if not others:
+            return
+        win = tk.Toplevel(self)
+        win.title("换一个 LLM 重试")
+        win.geometry("480x300")
+        ttk.Label(win, text="当前 LLM 生成失败。选择其他配置重试：",
+                  font=(FAMILY, 10)).pack(padx=14, pady=(12, 8), anchor="w")
+        lb = tk.Listbox(win, font=(FAMILY, 10), selectmode="browse")
+        lb.pack(fill="both", expand=True, padx=12)
+        for p in others:
+            lb.insert("end", f"{p.get('name')}  —  {p.get('provider')} / {p.get('model')}")
+
+        def go(_e=None):
+            sel = lb.curselection()
+            if sel:
+                cfg = others[sel[0]]
+                win.destroy()
+                retry(dict(cfg))
+        ttk.Button(win, text="用此配置重试", command=go).pack(pady=8)
+        lb.bind("<Double-1>", go)
 
     # ---------- 句解 ----------
     def _para_at(self, index):
@@ -341,7 +367,7 @@ class ReaderFrame(tk.Frame):
             self._sheets[key] = (win, txt)
             _render_analysis(txt, cached, sentence)
             return
-        cfg = dict(self.app.settings["llm"])
+        cfg = dict(cfgmod.get_llm(self.app.settings))
         invalid = llm.validate(cfg)
         if invalid:
             self.status.config(text=f"⚠ {invalid}（设置里配置）")
@@ -446,9 +472,23 @@ class ReaderFrame(tk.Frame):
     def on_analysis_error(self, payload):
         key, msg = payload
         self.analysis_busy.discard(key)
-        entry = self._sheets.pop(key, None)
+        entry = self._sheets.get(key)
         if entry and entry[0].winfo_exists():
             _render_error(entry[1], msg)
+        # 多 LLM 时提供换用重试（保留弹窗，重试后原窗渲染）
+        failed_name = cfgmod.default_llm_name(self.app.settings)
+        self._offer_other_llm(lambda cfg: self._retry_analysis(cfg, key), failed_name=failed_name)
+
+    def _retry_analysis(self, cfg, key):
+        if self.article is None or key in self.analysis_busy:
+            return
+        sentence = key
+        para = next((i for i, p in enumerate(self.article["paragraphs"]) if sentence[:40] in p), 0)
+        self.analysis_busy.add(key)
+        entry = self._sheets.get(key)
+        if entry and entry[0].winfo_exists():
+            _render_loading(entry[1], sentence)
+        self.app.post(self._analysis_worker, cfg, para, sentence, key)
 
     # ---------- 生词表弹层 ----------
     def _show_para_vocab(self, para):

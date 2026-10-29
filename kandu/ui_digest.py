@@ -5,6 +5,7 @@ from tkinter import ttk
 from kandu import core_parsers as store
 from kandu import core_llm as llm
 from kandu import core_gen as gen
+from kandu import core_config as cfgmod
 
 FAMILY = "Microsoft YaHei UI"
 _RUNNING = set()
@@ -25,6 +26,13 @@ class DigestFrame(tk.Frame):
                  font=(FAMILY, 12, "bold")).pack(side="left", padx=6)
         self.gen_btn = ttk.Button(bar, text="补全/刷新摘要", command=self.generate)
         self.gen_btn.pack(side="right", padx=10, pady=6)
+        # 本次生成使用的 LLM（默认 ★ 优先）
+        names = cfgmod.llm_names(self.app.settings)
+        if len(names) > 1:
+            tk.Label(bar, text="使用", bg="#1b4b43", fg="#cde8e1").pack(side="right", padx=(6, 2))
+            self.llm_choice = ttk.Combobox(bar, values=names, state="readonly", width=16)
+            self.llm_choice.set(cfgmod.default_llm_name(self.app.settings))
+            self.llm_choice.pack(side="right", padx=4)
 
         self.progress_row = tk.Frame(self, bg="white")
         self.status = tk.Label(self.progress_row, text="", bg="white", fg="#446")
@@ -86,11 +94,15 @@ class DigestFrame(tk.Frame):
         if self.meta["id"] in _RUNNING:
             self.status.config(text="该刊物已在后台生成中，请稍候（防重复烧 token）")
             return
-        cfg = self.app.settings["llm"]
+        name = self.llm_choice.get() if hasattr(self, "llm_choice") else None
+        cfg = dict(cfgmod.get_llm(self.app.settings, name))
         invalid = llm.validate(cfg)
         if invalid:
             self.status.config(text=f"⚠ {invalid}（点右上角「设置」配置）")
             return
+        others = cfgmod.other_llms(self.app.settings, exclude_name=cfg.get("name"))
+        self._tried_name = cfg.get("name", "")
+        self._can_switch = bool(others)
         self.generating = True
         _RUNNING.add(self.meta["id"])
         self.gen_btn.config(state="disabled")
@@ -129,7 +141,13 @@ class DigestFrame(tk.Frame):
         self.generating = False
         _RUNNING.discard(self.meta["id"])
         self.gen_btn.config(state="normal")
-        self.status.config(text=f"完成：{len(digest['articles'])} 篇（已缓存，重开不再调用大模型）")
+        fb = digest.get("failedBatches") or 0
+        if fb:
+            censor = "（部分内容触发模型安全过滤）" if digest.get("censorHint") else ""
+            switch = "；可换上方 LLM 再点一次只补缺的" if getattr(self, "_can_switch", False) else ""
+            self.status.config(text=f"部分批次失败（{fb} 批）{censor}{switch}")
+        else:
+            self.status.config(text=f"完成：{len(digest['articles'])} 篇（已缓存，重开不再调用大模型）")
         self._fill(digest)
 
     def on_digest_error(self, msg):
