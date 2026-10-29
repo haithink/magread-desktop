@@ -1,5 +1,6 @@
-"""书架：目录扫描 + 封面网格。"""
+"""书库：应用自管的刊物收藏（添加/移除），不依赖磁盘目录。"""
 import os
+import shutil
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
@@ -7,34 +8,34 @@ from PIL import Image, ImageTk
 from kandu import core_config as cfgmod
 from kandu import core_parsers as store
 
+FAMILY = "Microsoft YaHei UI"
 THUMB_W, THUMB_H = 128, 172
 COLS = 5
+PAPER = "#f7faf7"
 
 
 class LibraryFrame(tk.Frame):
     def __init__(self, parent, app: "App"):
-        super().__init__(parent, bg="#f7faf7")
+        super().__init__(parent, bg=PAPER)
         self.app = app
-        self.metas = []
+        self.metas = store.load_library()
         self._photo_cache = {}
-        self._scanning = False
+        self._importing = False
 
         bar = tk.Frame(self, bg="#1b4b43")
         bar.pack(fill="x")
-        tk.Label(bar, text="刊读 · 书架", bg="#1b4b43", fg="white",
-                 font=("Microsoft YaHei UI", 13, "bold")).pack(side="left", padx=14, pady=8)
-        self.dir_label = tk.Label(bar, text=self._dir_text(), bg="#1b4b43", fg="#cde8e1")
-        self.dir_label.pack(side="left", padx=8)
-        ttk.Button(bar, text="选择目录", command=self.pick_dir).pack(side="right", padx=(6, 12), pady=6)
-        ttk.Button(bar, text="重新扫描", command=self.rescan).pack(side="right", padx=6, pady=6)
+        tk.Label(bar, text="刊读 · 书库", bg="#1b4b43", fg="white",
+                 font=(FAMILY, 13, "bold")).pack(side="left", padx=14, pady=8)
+        ttk.Button(bar, text="添加刊物", command=self.add_files).pack(side="right", padx=(6, 12), pady=6)
+        ttk.Button(bar, text="从文件夹导入", command=self.import_folder).pack(side="right", padx=6, pady=6)
         ttk.Button(bar, text="设置", command=self.app.open_settings).pack(side="right", padx=6, pady=6)
 
-        self.status = tk.Label(self, text="", bg="#f7faf7", fg="#446", anchor="w")
+        self.status = tk.Label(self, text="", bg=PAPER, fg="#446", anchor="w")
         self.status.pack(fill="x", padx=14, pady=(6, 0))
 
-        self.canvas = tk.Canvas(self, bg="#f7faf7", highlightthickness=0)
+        self.canvas = tk.Canvas(self, bg=PAPER, highlightthickness=0)
         self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.inner = tk.Frame(self.canvas, bg="#f7faf7")
+        self.inner = tk.Frame(self.canvas, bg=PAPER)
         self.inner.bind("<Configure>",
                         lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.create_window((0, 0), window=self.inner, anchor="nw", width=self._inner_width())
@@ -42,59 +43,140 @@ class LibraryFrame(tk.Frame):
         self.canvas.pack(side="left", fill="both", expand=True, padx=(10, 0))
         self.vbar.pack(side="right", fill="y")
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure("all", width=self._inner_width()))
-        # 滚轮由 App 层 bind_all 统一路由到本页 on_wheel
-        if not self.app.settings.get("libraryDir"):
-            self.status.config(text="先点右上角「选择目录」挑选存放 EPUB / PDF 刊物的文件夹")
-        self.rescan()
 
-    def on_wheel(self, e):
-        try:
-            if self.winfo_exists() and self.canvas.winfo_exists():
-                self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
-        except tk.TclError:
-            pass
+        if self.metas:
+            self.status.config(text=f"书库共 {len(self.metas)} 本 · 双击打开，右键管理 · 点「添加刊物」扩充")
+            self._render()
+            self._maybe_migrate()
+        elif self.app.settings.get("libraryDir") and not self.app.settings.get("migratedLibrary"):
+            # 旧版本用户：从原目录自动迁移进书库
+            self._maybe_migrate()
+        else:
+            self.status.config(text="书库还是空的。点右上角「添加刊物」或「从文件夹导入」开始")
 
     def _inner_width(self):
         return max(self.canvas.winfo_width(), 900)
 
-    def _dir_text(self):
-        d = self.app.settings.get("libraryDir") or "（未选择目录）"
-        return f"目录：{d}"
+    # ---------- 添加 / 导入 ----------
+    def add_files(self):
+        files = filedialog.askopenfilenames(
+            title="选择刊物文件（可多选）",
+            filetypes=[("刊物文件", "*.epub *.pdf"), ("所有文件", "*.*")],
+            initialdir=self._suggest_dir())
+        if not files:
+            return
+        self._import(list(files))
 
-    def pick_dir(self):
-        d = filedialog.askdirectory(title="选择刊物文件所在目录",
-                                    initialdir=self.app.settings.get("libraryDir") or os.path.expanduser("~"))
+    def import_folder(self):
+        d = filedialog.askdirectory(title="选择包含 EPUB / PDF 的文件夹",
+                                    initialdir=self._suggest_dir())
         if not d:
             return
-        self.app.settings["libraryDir"] = os.path.normpath(d)
+        files = []
+        for name in sorted(os.listdir(d)):
+            if name.lower().endswith((".epub", ".pdf")):
+                files.append(os.path.join(d, name))
+        if not files:
+            messagebox.showinfo("没有找到刊物", "该文件夹下没有 EPUB / PDF 文件", parent=self)
+            return
+        self._import(files)
+
+    def _suggest_dir(self):
+        bd = self.app.settings.get("booksDir")
+        if bd and os.path.isdir(bd):
+            return bd
+        ld = self.app.settings.get("libraryDir")
+        return ld if ld and os.path.isdir(ld) else os.path.expanduser("~")
+
+    def _import(self, files):
+        if self._importing:
+            return
+        # 存储位置：设置指定；否则默认 appdata/books，
+        # 若空间不足且源文件在别的盘，则自动改用源盘 KanduLibrary
+        books_dir = self.app.settings.get("booksDir") or str(cfgmod.app_dir() / "books")
+        try:
+            need = sum(os.path.getsize(f) for f in files)
+            free = shutil.disk_usage(books_dir.split(":")[0] + ":").free if ":" in books_dir else 0
+            src_drive = os.path.splitdrive(files[0])[0]
+            if free < need + 1024 ** 3 and src_drive and src_drive != os.path.splitdrive(books_dir)[0]:
+                books_dir = src_drive + "\\KanduLibrary"
+                self.app.settings["booksDir"] = books_dir
+                self.app.save_settings()
+                messagebox.showinfo(
+                    "存储位置调整",
+                    f"默认存储盘空间不足，书库文件将存放在：\n{books_dir}", parent=self)
+        except Exception:
+            pass
+        self._importing = True
+        self.status.config(text=f"导入中… 0/{len(files)}")
+        self.app.post(self._import_worker, files, books_dir)
+
+    def _import_worker(self, files, books_dir):
+        added = skipped = 0
+        for i, f in enumerate(files):
+            self.app.emit("import_progress", {"done": i, "total": len(files), "name": os.path.basename(f)})
+            try:
+                meta, status = store.add_book(f, books_dir)
+                if status == "added":
+                    added += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                self.app.emit("import_error", f"{os.path.basename(f)}：{e}")
+                continue
+            store.ensure_cover(meta)
+        self.app.emit("import_done", {"added": added, "skipped": skipped, "total": len(files)})
+
+    def _maybe_migrate(self):
+        """旧版本迁移：把原 libraryDir 里的刊物一次性导入书库。"""
+        if self.app.settings.get("migratedLibrary"):
+            return
+        src = self.app.settings.get("libraryDir")
+        if not src or not os.path.isdir(src):
+            return
+        files = [os.path.join(src, n) for n in sorted(os.listdir(src))
+                 if n.lower().endswith((".epub", ".pdf"))]
+        if not files:
+            return
+        self.app.settings["migratedLibrary"] = True
         self.app.save_settings()
-        self.dir_label.config(text=self._dir_text())
-        self.rescan()
+        # 存储位置：与源同盘的 KanduLibrary（同盘移动瞬时完成，不占 C 盘）
+        drive = os.path.splitdrive(src)[0]
+        books_dir = drive + "\\KanduLibrary"
+        self.app.settings["booksDir"] = books_dir
+        self.app.save_settings()
+        self._importing = True
+        self.status.config(text=f"检测到原目录有 {len(files)} 本刊物，正在迁移进书库…")
+        self.app.post(self._migrate_worker, files, books_dir)
 
-    def rescan(self):
-        if self._scanning:
-            return
-        d = self.app.settings.get("libraryDir") or ""
-        if not d:
-            return
-        self._scanning = True
-        self.status.config(text="扫描中…")
-        self.app.post(self._scan_worker, d)
+    def _migrate_worker(self, files, books_dir):
+        added = 0
+        for i, f in enumerate(files):
+            self.app.emit("import_progress", {"done": i, "total": len(files), "name": os.path.basename(f)})
+            try:
+                meta, status = store.add_book(f, books_dir)
+                if status == "added":
+                    added += 1
+            except Exception as e:
+                self.app.emit("import_error", f"{os.path.basename(f)}：{e}")
+                continue
+            store.ensure_cover(meta)
+        self.app.emit("import_done", {"added": added, "skipped": 0, "total": len(files)})
 
-    def _scan_worker(self, d):
-        metas = store.scan(d)
-        for m in metas:
-            store.ensure_cover(m)
-        self.app.emit("scan_done", metas)
+    def on_import_progress(self, p):
+        self.status.config(text=f"导入中… {p['done']}/{p['total']}　{p['name']}")
 
-    def on_scan_done(self, metas):
-        self._scanning = False
-        if not self._alive():
-            return
-        self.metas = metas
-        self.status.config(text=f"共 {len(metas)} 本刊物")
+    def on_import_done(self, r):
+        self._importing = False
+        self.metas = store.load_library()
+        self.status.config(text=f"导入完成：新增 {r['added']} 本" +
+                                (f"，跳过已存在 {r['skipped']} 本" if r["skipped"] else ""))
         self._render()
 
+    def on_import_error(self, msg):
+        messagebox.showerror("导入失败", str(msg), parent=self)
+
+    # ---------- 渲染 ----------
     def _render(self):
         for w in self.inner.winfo_children():
             w.destroy()
@@ -107,22 +189,32 @@ class LibraryFrame(tk.Frame):
             self._load_thumb(img_label, meta)
             has_d = store.has_digest(meta["id"])
             name_label = tk.Label(card, text=meta["fileName"][:40], bg="white", fg="#222",
-                                  font=("Microsoft YaHei UI", 9), wraplength=THUMB_W + 20)
+                                  font=(FAMILY, 9), wraplength=THUMB_W + 20)
             name_label.pack(padx=4, pady=(0, 2))
             state_label = tk.Label(card, text="已生成摘要 ✓" if has_d else "未生成摘要", bg="white",
-                                   fg="#7fa829" if has_d else "#b0b8b6", font=("Microsoft YaHei UI", 8))
+                                   fg="#7fa829" if has_d else "#b0b8b6", font=(FAMILY, 8))
             state_label.pack(pady=(0, 6))
-            # 卡片内所有子控件统一绑定（只绑 card 本身时，点到文字标签无反应）
             for w in (card, img_label, name_label, state_label):
                 w.bind("<Double-Button-1>", lambda e, m=meta: self.app.open_digest(m))
                 w.bind("<Button-1>", lambda e, m=meta: self._hint(m))
                 w.bind("<Button-3>", lambda e, m=meta: self._card_menu(e, m))
 
+    def _alive(self):
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _hint(self, meta):
+        if self._alive():
+            self.status.config(text=f"双击打开：{meta['fileName']}　右键卡片可管理")
+
     def _card_menu(self, event, meta):
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="打开", command=lambda: self.app.open_digest(meta))
         menu.add_command(label="清除本书摘要", command=lambda: self._purge_one(meta, digest_only=True))
-        menu.add_command(label="清除本书全部缓存", command=lambda: self._purge_one(meta, digest_only=False))
+        menu.add_separator()
+        menu.add_command(label="移出书库（删除文件与缓存）", command=lambda: self._remove_book(meta))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -134,15 +226,19 @@ class LibraryFrame(tk.Frame):
             self.status.config(text=f"已清除：{meta['fileName']}（{'仅摘要' if digest_only else '全部缓存'}）")
             self._render()
 
-    def _alive(self):
-        try:
-            return bool(self.winfo_exists())
-        except tk.TclError:
-            return False
-
-    def _hint(self, meta):
+    def _remove_book(self, meta):
+        if not messagebox.askyesno(
+                "移出书库",
+                f"将「{meta['fileName']}」移出书库？\n\n"
+                "会删除：书库中的文件副本、摘要、生词表与句解缓存。\n"
+                "不影响你磁盘上其他位置的文件。",
+                parent=self):
+            return
+        store.remove_book(meta["id"])
         if self._alive():
-            self.status.config(text=f"双击打开：{meta['fileName']}　右键卡片可清除该书缓存")
+            self.metas = store.load_library()
+            self.status.config(text=f"已移出：{meta['fileName']}")
+            self._render()
 
     def _load_thumb(self, label, meta):
         path = store.cover_file(meta["id"])
@@ -159,6 +255,5 @@ class LibraryFrame(tk.Frame):
         label.config(image=photo, width=THUMB_W, height=THUMB_H, bg="white")
 
     def on_error(self, msg):
-        self._scanning = False
-        if self._alive():
-            messagebox.showerror("扫描失败", str(msg), parent=self)
+        self._importing = False
+        messagebox.showerror("操作失败", str(msg), parent=self)

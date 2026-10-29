@@ -416,6 +416,80 @@ def purge_all():
             shutil.rmtree(p, ignore_errors=True)
 
 
+# ---------------- 书库（应用自管，不依赖磁盘目录） ----------------
+
+def library_file() -> Path:
+    return cfgmod.app_dir() / "books.json"
+
+
+def load_library():
+    lib = library_file()
+    if not lib.exists():
+        return []
+    try:
+        import json
+        return json.loads(lib.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def save_library(entries):
+    import json
+    library_file().write_text(json.dumps(entries, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def add_book(src: str, books_dir: str):
+    """把刊物文件复制进书库存储并返回 (meta, status)；status: added/exists。"""
+    import json
+    import shutil
+    import time
+    from pathlib import Path
+
+    src = Path(src)
+    ext = src.suffix.lower().lstrip(".")
+    if ext not in ("epub", "pdf"):
+        raise ValueError(f"不支持的格式：{src.suffix}")
+    bd = Path(books_dir)
+    bd.mkdir(parents=True, exist_ok=True)
+    bid = sanitize_id(src.stem)
+    dst = bd / f"{bid}.{ext}"
+    status = "exists" if dst.exists() else "added"
+    if not dst.exists():
+        shutil.copy2(str(src), str(dst))
+    meta = {
+        "id": bid,
+        "fileName": src.name,
+        "ext": ext,
+        "size": dst.stat().st_size,
+        "lastModified": int(dst.stat().st_mtime * 1000),
+        "path": str(dst),
+        "addedAt": int(time.time() * 1000),
+    }
+    entries = load_library()
+    entries = [e for e in entries if e.get("id") != bid]
+    entries.append(meta)
+    entries.sort(key=lambda e: e.get("addedAt", 0), reverse=True)
+    save_library(entries)
+    return meta, status
+
+
+def remove_book(book_id: str):
+    """从书库移除：删除登记、书库内文件副本与全部缓存/封面。"""
+    entries = [e for e in load_library() if e.get("id") != book_id]
+    save_library(entries)
+    settings = cfgmod.load_settings()
+    for f in Path(cfgmod.books_dir(settings)).glob(f"{book_id}.*"):
+        f.unlink(missing_ok=True)
+    purge_book_cache(book_id)
+
+
+def get_book(book_id: str):
+    for e in load_library():
+        if e.get("id") == book_id:
+            return e
+    return None
+
+
 def purge_digests():
     """清空所有书目的摘要缓存（保留正文/生词/句解）。"""
     cache_root = cfgmod.app_dir() / "cache"

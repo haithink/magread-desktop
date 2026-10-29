@@ -41,10 +41,26 @@ DEFAULTS = {
     "vocabLevel": "cet4",
     "levelChosen": False,
     "libraryDir": "",
+    "booksDir": "",
+    "migratedLibrary": False,
     "readerFontSize": 13,
     "llms": [],
     "defaultLlm": "",
 }
+
+
+def books_dir(settings: dict = None) -> Path:
+    """书库文件存储位置：设置指定优先，否则 appdata/books。"""
+    bd = ""
+    if settings and settings.get("booksDir"):
+        bd = settings["booksDir"]
+    else:
+        d = app_dir() / "books"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    d = Path(bd)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def settings_path() -> Path:
