@@ -132,6 +132,27 @@ def test_repair():
     assert obj["paragraphs"][0]["entries"][0]["word"] == "patent"
 
 
+@case("UI 启动完整性（防编辑错位回归）")
+def test_ui_startup():
+    import time
+    import tkinter as tk
+    import main as appmod
+    app = appmod.App()
+    try:
+        app.update()
+        assert type(app.current).__name__ == "LibraryFrame", f"启动页异常: {type(app.current).__name__}"
+        bar = app.current.winfo_children()[0]
+        btns = [c for c in bar.winfo_children() if c.winfo_class() == "TButton"]
+        labels = [b.cget("text") for b in btns]
+        for need in ("添加刊物", "从文件夹导入", "建立索引"):
+            assert need in labels, f"缺少按钮: {need}（实际 {labels}）"
+        t0 = time.time()
+        while time.time() - t0 < 3:
+            app.update(); time.sleep(0.02)
+    finally:
+        app.destroy()
+
+
 def main():
     only = set(sys.argv[1:])
     if os.path.exists(SANDBOX):
