@@ -335,10 +335,26 @@ def _final_digest(meta, articles, existing, collected, on_progress=None, done=No
     }
 
 
+def _is_censor(text: str) -> bool:
+    """模型侧内容安全过滤的拒绝（中国系上游常见）。"""
+    t = (text or "").lower()
+    keys = ("sensitive", "敏感", "upstream_error", "content_filter", "content filter", "risk")
+    return any(k in t for k in keys)
+
+
 def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None):
-    """生成一篇文章的生词表：本地粗筛候选 → 分块 LLM 确认 → 规范化落盘。"""
+    """生成一篇文章的生词表：本地粗筛候选 → 分块 LLM 确认 → 规范化落盘。
+
+    支持续传：已生成过的段落块自动跳过；单块失败（如内容触发模型
+    安全过滤）留待下次，不阻塞其余块。"""
     dict_set = cfgmod.wordset(level)
     label = level_label(level)
+
+    existing = store.load_vocab(meta["id"], article["index"], level) or {}
+    processed = set(existing.get("processedParagraphs", []))
+    merged_sections = {p["index"]: p for p in existing.get("paragraphs", [])}
+    merged_title = list(existing.get("titleEntries", []))
+    merged_idioms = list(existing.get("idioms", []))
 
     units = [(-1, article["title"])]
     for i, p in enumerate(article["paragraphs"]):
@@ -365,21 +381,46 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None):
     if current:
         chunks.append(current)
 
-    paragraphs_out = []
-    title_entries = []
-    idioms_out = []
+    # 续传：块内所有单元（含标题单元 -1）都已处理过则跳过
+    def chunk_done(chunk):
+        return all(idx in processed for idx, _ in chunk)
+
+    pending = [c for c in chunks if not chunk_done(c)]
+    failed_chunks = []
+    censor_hit = False
     seen = set()
 
-    total = len(chunks)
-    for ci, chunk in enumerate(chunks):
+    total = len(pending)
+    done_count = len(chunks) - total
+    if on_progress:
+        on_progress(0, total)
+    for ci, chunk in enumerate(pending):
         if on_progress:
             on_progress(ci, total)
         if on_chars:
             on_chars(0)
         user = prompts.vocab_user(article["title"], -1, chunk, cand)
-        raw = _chat_retry(cfg, prompts.vocab_system(label), user, 16000, on_chars)
-        obj = _parse_json(raw, want_array=False)
+        obj = None
+        last_err = None
+        for attempt in range(2):
+            try:
+                raw = _chat_retry(cfg, prompts.vocab_system(label), user, 16000, on_chars)
+                obj = _parse_json(raw, want_array=False)
+                break
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if _is_censor(msg) or _is_censor(getattr(getattr(e, '__cause__', None), 'message', '')):
+                    censor_hit = True
+                    break  # 内容过滤重试也没用
+                time.sleep(1)
+        if obj is None:
+            failed_chunks.append({"chunk": ci, "error": str(last_err)})
+            if on_progress:
+                on_progress(ci + 1, total)
+            continue
 
+        new_sections = {}
         for p in obj.get("paragraphs", []):
             if not isinstance(p, dict):
                 continue
@@ -390,32 +431,61 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None):
             entries = [_parse_entry(e, seen) for e in p.get("entries", [])]
             entries = [e for e in entries if e]
             if idx < 0:
-                title_entries.extend(entries)
+                by_word = {e["word"]: e for e in merged_title}
+                for e in entries:
+                    by_word[e["word"]] = e
+                merged_title = list(by_word.values())
                 continue
             start_words = (p.get("startWords") or "").strip() or (
                 article["paragraphs"][idx][:30] if 0 <= idx < len(article["paragraphs"]) else ""
             )
-            paragraphs_out.append({"index": idx, "startWords": start_words, "entries": entries})
+            new_sections[idx] = {"index": idx, "startWords": start_words, "entries": entries}
+        merged_sections.update(new_sections)
         for e in obj.get("titleEntries", []):
             entry = _parse_entry(e, seen)
             if entry:
-                title_entries.append(entry)
+                by_word = {x["word"]: x for x in merged_title}
+                by_word[entry["word"]] = entry
+                merged_title = list(by_word.values())
         for io in obj.get("idioms", []):
             if isinstance(io, dict) and (io.get("word") or "").strip():
-                idioms_out.append(
+                merged_idioms.append(
                     {"word": io["word"], "common": io.get("common", ""), "inText": io.get("inText", "")}
                 )
+        processed.update(idx for idx, _ in chunk)
+
+        draft = {
+            "level": level,
+            "articleIndex": article["index"],
+            "titleEntries": merged_title,
+            "paragraphs": sorted(merged_sections.values(), key=lambda x: x["index"]),
+            "idioms": merged_idioms,
+            "processedParagraphs": sorted(processed),
+        }
+        result = vocab_normalize(draft, article)
+        if failed_chunks:
+            result["failedChunks"] = len(failed_chunks)
+            result["censorHint"] = censor_hit
+        store.save_vocab(meta["id"], result)
         if on_progress:
             on_progress(ci + 1, total)
 
     draft = {
         "level": level,
         "articleIndex": article["index"],
-        "titleEntries": title_entries,
-        "paragraphs": sorted(paragraphs_out, key=lambda x: x["index"]),
-        "idioms": list({i["word"].lower(): i for i in idioms_out}.values()),
+        "titleEntries": merged_title,
+        "paragraphs": sorted(merged_sections.values(), key=lambda x: x["index"]),
+        "idioms": list({i["word"].lower(): i for i in merged_idioms}.values()),
+        "processedParagraphs": sorted(processed),
     }
+    if failed_chunks:
+        draft["failedChunks"] = len(failed_chunks)
+        if censor_hit:
+            draft["censorHint"] = True
     result = vocab_normalize(draft, article)
+    if failed_chunks:
+        result["failedChunks"] = len(failed_chunks)
+        result["censorHint"] = censor_hit
     store.save_vocab(meta["id"], result)
     return result
 

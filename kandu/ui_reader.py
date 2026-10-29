@@ -230,7 +230,12 @@ class ReaderFrame(tk.Frame):
         self.vocab_btn.config(state="normal")
         self.vocab = vocab
         self._rebuild(keep_scroll=True)
-        self.status.config(text=f"生词表完成（{self._total_words()} 词，已缓存）")
+        failed = vocab.get("failedChunks") or 0
+        if failed:
+            hint = "（部分内容可能触发模型安全过滤）" if vocab.get("censorHint") else ""
+            self.status.config(text=f"生词表部分完成：{failed} 块失败{hint}。再点一次「生词表」只补缺的块")
+        else:
+            self.status.config(text=f"生词表完成（{self._total_words()} 词，已缓存）")
         self._show_full_vocab()
 
     def on_vocab_error(self, msg):
