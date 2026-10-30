@@ -37,3 +37,14 @@ tcl/tk DLL 从 anaconda（`D:\anaconda\Library`）手动打入，见脚本参数
 
 缓存/设置 JSON 字段与 Android 版同构（digest.json / vocab_*_level.json /
 analysis_<sha1>.json），提示词、生成流程、修复策略保持一致，便于双端对照排错。
+
+## 许可证
+
+Copyright (c) 2026 haithink and contributors.
+
+本项目原创代码采用 [GNU Affero General Public License v3.0](LICENSE)
+（SPDX：`AGPL-3.0-only`）。桌面版使用的 PyMuPDF 提供 AGPL 与商业许可，
+本项目采用与其开源许可兼容的 AGPL 授权方式。
+
+分发打包应用时，应按适用许可随附许可证并提供对应版本的完整源码和构建材料。
+词典、词表和其他依赖保留各自的许可，详见 [第三方资源说明](THIRD_PARTY_NOTICES.md)。
