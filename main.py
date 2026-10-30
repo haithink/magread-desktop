@@ -7,9 +7,11 @@ from tkinter import ttk, filedialog, messagebox
 
 from kandu import core_config as cfgmod
 from kandu import core_parsers as store
+from kandu import core_gen as gen
+from kandu import core_llm as llm
 from kandu import __version__
 from kandu.ui_library import LibraryFrame
-from kandu.ui_digest import DigestFrame
+from kandu.ui_digest import DigestFrame, _RUNNING as DIGEST_RUNNING
 from kandu.ui_reader import ReaderFrame
 from kandu.ui_settings import SettingsDialog
 
@@ -29,6 +31,8 @@ class App(tk.Tk):
         self.index_state = {"running": False, "done": 0, "total": 0,
                             "current": "", "errors": [], "reported": False,
                             "skipped": 0}
+        self.batch_state = {"running": False, "done": 0, "total": 0,
+                            "current": "", "failed": 0, "reported": False}
 
         self.container = tk.Frame(self)
         self.container.pack(fill="both", expand=True)
@@ -69,6 +73,51 @@ class App(tk.Tk):
         self.index_state["skipped"] = skipped
         self.index_state["running"] = False
         self.index_state["current"] = ""
+
+    def start_batch_digest(self):
+        """后台批量生成全部书籍的摘要（默认 LLM；自动跳过已完整的书）。"""
+        if self.batch_state["running"] or self.index_state["running"]:
+            return
+        cfg = dict(cfgmod.get_llm(self.settings))
+        invalid = llm.validate(cfg)
+        if invalid:
+            messagebox.showerror("批量生成摘要", invalid, parent=self)
+            return
+        metas = store.load_library()
+        todo = [m for m in metas if gen.digest_incomplete(m)]
+        if not todo:
+            messagebox.showinfo("批量生成摘要", "所有书籍都已有完整摘要，无需生成", parent=self)
+            return
+        self.batch_state.update(running=True, done=0, total=len(todo),
+                                current="", failed=0, reported=False)
+        self.post(self._batch_worker, todo, cfg)
+
+    def _batch_worker(self, todo, cfg):
+        import time as _time
+        failed = []
+        for i, m in enumerate(todo):
+            if m["id"] in DIGEST_RUNNING:
+                _time.sleep(2)  # 该书正被书目页生成，稍候
+            if m["id"] in DIGEST_RUNNING:
+                failed.append((m["fileName"], "该书正被其他任务生成"))
+                self.batch_state.update(done=i + 1, current=m["fileName"])
+                continue
+            DIGEST_RUNNING.add(m["id"])
+            self.batch_state["current"] = m["fileName"]
+            try:
+                d = gen.generate_digest(m, cfg)
+                if d.get("failedBatches"):
+                    failed.append((m["fileName"], f"{d['failedBatches']} 批失败（可再跑续补）"))
+            except Exception as e:
+                failed.append((m["fileName"], str(e)[:120]))
+            finally:
+                DIGEST_RUNNING.discard(m["id"])
+            self.batch_state["done"] = i + 1
+        self.batch_state["failed"] = len(failed)
+        self.batch_state["running"] = False
+        self.batch_state["current"] = ""
+        for name, err in failed:
+            self._log_error(f"批量摘要 [{name}]：{err}")
 
     def _route_wheel(self, e):
         handler = getattr(self.current, "on_wheel", None)

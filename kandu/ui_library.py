@@ -34,6 +34,8 @@ class LibraryFrame(tk.Frame):
         self.status.pack(fill="x", padx=14, pady=(6, 0))
         self.index_btn = ttk.Button(bar, text="建立索引", command=self.app.start_indexing)
         self.index_btn.pack(side="right", padx=6, pady=6)
+        self.digest_btn = ttk.Button(bar, text="生成全部摘要", command=self.app.start_batch_digest)
+        self.digest_btn.pack(side="right", padx=6, pady=6)
         self.after(400, self._tick_index_status)
 
         self.canvas = tk.Canvas(self, bg=PAPER, highlightthickness=0)
@@ -296,13 +298,24 @@ class LibraryFrame(tk.Frame):
         if not self._alive():
             return
         st = self.app.index_state
+        bt = self.app.batch_state
         try:
-            if st["running"]:
+            if bt["running"]:
+                self.status.config(text=f"批量生成摘要中… {bt['done']}/{bt['total']}　{bt['current']}")
+                self.index_btn.state(["disabled"])
+                self.digest_btn.state(["disabled"])
+            elif st["running"]:
                 self.status.config(text=f"后台索引中… {st['done']}/{st['total']}　{st['current']}")
                 self.index_btn.state(["disabled"])
+                self.digest_btn.state(["disabled"])
             else:
                 self.index_btn.state(["!disabled"])
-                if st["done"] and not st.get("reported"):
+                self.digest_btn.state(["!disabled"])
+                if bt["done"] and not bt.get("reported"):
+                    bt["reported"] = True
+                    msg = f"批量摘要完成：{bt['total']} 本" + (f"，{bt['failed']} 本有失败批次（可再跑续补）" if bt["failed"] else "")
+                    self.status.config(text=msg)
+                elif st["done"] and not st.get("reported"):
                     st["reported"] = True
                     skipped = st.get("skipped", 0)
                     msg = f"索引建立完成：本次处理 {st['done']} 本"
