@@ -516,6 +516,177 @@ def test_vocab_sheet_scroll():
         app.destroy()
 
 
+@case("文章标记独立保存、缓存清理与写入失败")
+def test_article_states():
+    bid = "T_STATES"
+    assert store.load_article_states(bid) == {}
+    store.set_article_state(bid, 2, "read")
+    store.set_article_state(bid, 8, "uninterested")
+    assert store.load_article_states(bid) == {"2": "read", "8": "uninterested"}
+    assert store.load_article_states("T_OTHER_BOOK") == {}
+    digest = {"bookId": bid, "articles": []}
+    store.save_digest(digest)
+    store.save_digest(digest)  # 摘要重新生成不能覆盖阅读记录
+    store.purge_book_cache(bid, digest_only=True)
+    store.save_digest(digest)
+    store.purge_digests()
+    store.purge_book_cache(bid)
+    assert store.load_article_states(bid)["8"] == "uninterested"
+    store.purge_all()
+    assert store.load_article_states(bid)["2"] == "read"
+    for index, status in [(2, "bad"), (-1, "read"), (True, "read")]:
+        try:
+            store.set_article_state(bid, index, status)
+            raise AssertionError("无效标记应被拒绝")
+        except ValueError:
+            pass
+    target = store._article_states_file(bid)
+    original = target.read_bytes()
+    with patch("os.replace", side_effect=OSError("模拟磁盘写入失败")):
+        try:
+            store.set_article_state(bid, 2, "unread")
+            raise AssertionError("写入失败应上报")
+        except OSError:
+            pass
+    assert target.read_bytes() == original, "保存失败不能破坏原有标记"
+    assert not list(target.parent.glob("*.tmp"))
+    store.set_article_state(bid, 2, "unread")
+    assert store.load_article_states(bid) == {"2": "unread", "8": "uninterested"}
+    store.remove_book(bid)
+    assert store.load_article_states(bid) == {}
+
+
+@case("摘要浏览标记、筛选搜索、返回位置与布局")
+def test_digest_browsing():
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_digest import DigestFrame
+
+    meta = dict(META, id="T_DIGEST_UI", fileName="wired_2026.10.02.epub")
+    titles = [
+        ("You’ve Never Heard of China’s Greatest Sci-Fi Novel", "你可能从未听说过的中国科幻巨著"),
+        ("The Quiet Return of the Repair Shop", "修理铺正在悄悄回归"),
+        ("What Happens When We Let Nature Back In?", "当我们重新接纳自然，会发生什么？"),
+    ]
+    articles = [{"index": i, "titleEn": titles[i % 3][0], "titleZh": titles[i % 3][1],
+                 "summaryZh": "从一部小说出发，重新认识技术、社会和想象力之间的关系。"
+                              "作者探访创作者与读者，讲述作品背后的时代变迁，也提出了关于未来的思考。"}
+                for i in range(18)]
+    digest = {"bookId": meta["id"], "articles": articles}
+    store.save_digest(digest)
+    opened = []
+    errors = []
+    app = SimpleNamespace(settings={"llms": [{"name": "测试模型一"}, {"name": "测试模型二"}]},
+                          show_library=lambda: None,
+                          open_reader=lambda m, i: opened.append((m["id"], i)),
+                          post=lambda *args: (_ for _ in ()).throw(AssertionError("界面测试不可调用 LLM")))
+    root = tk.Tk()
+    root.title("刊读 · 摘要浏览预览")
+    root.geometry("1180x800+40+40")
+    root.report_callback_exception = lambda *args: errors.append(args)
+    frame = None
+    try:
+        with patch.object(gen, "digest_incomplete", return_value=False):
+            frame = DigestFrame(root, app, meta)
+        frame.pack(fill="both", expand=True)
+        root.update()
+        time.sleep(.05)
+        root.update()
+        assert frame._counts == {"unread": 18, "read": 0, "uninterested": 0}
+        frame._cards[0]["marks"]["read"].invoke()
+        frame._cards[1]["marks"]["uninterested"].invoke()
+        assert opened == [], "标记按钮不能打开正文"
+        assert frame._counts == {"unread": 16, "read": 1, "uninterested": 1}
+        frame._cards[2]["open"].invoke()
+        assert opened == [(meta["id"], 2)]
+        assert frame._state(2) == "unread", "进入正文不应自动标记已读"
+        frame.filter_buttons["read"].invoke()
+        assert list(frame._cards) == [0]
+        frame._cards[0]["marks"]["unread"].invoke()
+        assert not frame._cards, "标记改变后应立即更新当前筛选结果"
+        frame.filter_buttons["uninterested"].invoke()
+        assert list(frame._cards) == [1]
+        frame._reset_filters()
+        frame.search_var.set("CHINA 小说")  # 英文不分大小写，同时搜索中文摘要
+        root.update()
+        time.sleep(.2)
+        root.update()
+        assert list(frame._cards) == list(range(0, 18, 3))
+        frame.search_var.set("修理铺")
+        frame._apply_search()
+        assert list(frame._cards) == list(range(1, 18, 3))
+        frame.search_var.set("不存在的文章")
+        frame._apply_search()
+        assert not frame._cards
+        frame._reset_filters()
+        frame._cards[0]["marks"]["read"].invoke()
+        frame._fill(digest)
+        assert frame._state(0) == "read", "刷新摘要不能丢失标记"
+        before = dict(frame._states)
+        with patch.object(store, "set_article_state", side_effect=OSError("只读目录")):
+            frame._mark(0, "unread")
+        assert frame._states == before
+        assert "标记保存失败" in frame.status.cget("text")
+        frame.status.config(text="摘要已缓存 · 阅读标记仅保存在本机")
+        for geometry in ("900x620", "1180x800", "1500x900"):
+            root.geometry(geometry)
+            root.update()
+            assert frame.vbar.winfo_ismapped()
+            assert frame.vbar.winfo_width() >= frame.vbar.winfo_reqwidth()
+            assert frame.vbar.winfo_rootx() >= frame.canvas.winfo_rootx() + frame.canvas.winfo_width()
+            assert frame.vbar.winfo_rootx() + frame.vbar.winfo_width() <= root.winfo_rootx() + root.winfo_width()
+            for card in frame._cards.values():
+                left = card["frame"].winfo_rootx()
+                right = left + card["frame"].winfo_width()
+                assert left >= frame.canvas.winfo_rootx()
+                assert right <= frame.canvas.winfo_rootx() + frame.canvas.winfo_width()
+                assert card["open"].winfo_width() >= card["open"].winfo_reqwidth()
+                assert card["marks"]["uninterested"].winfo_rootx() + card["marks"]["uninterested"].winfo_width() < card["open"].winfo_rootx()
+                for label in card["labels"]:
+                    assert label.winfo_reqwidth() <= card["frame"].winfo_width()
+            assert frame.search_entry.winfo_width() >= frame.search_entry.winfo_reqwidth()
+        frame.canvas.tk.call(frame.vbar.cget("command"), "moveto", .4)
+        root.update()
+        assert .38 < frame.canvas.yview()[0] < .42
+        assert abs(frame.vbar.get()[0] - frame.canvas.yview()[0]) < .01
+        frame.on_wheel(SimpleNamespace(delta=-120))
+        assert frame.canvas.yview()[0] > .4
+        frame.canvas.yview_moveto(1)
+        assert frame.canvas.yview()[1] > .999
+        frame.search_var.set("小说")
+        frame._apply_search()
+        frame._select_filter("unread")
+        frame.canvas.yview_moveto(.4)
+        previous = frame.canvas.yview()[0]
+        frame.destroy()
+        with patch.object(gen, "digest_incomplete", return_value=False):
+            frame = DigestFrame(root, app, meta)
+        frame.pack(fill="both", expand=True)
+        root.update()
+        time.sleep(.05)
+        root.update()
+        assert frame.search_var.get() == "小说" and frame._filter == "unread"
+        assert abs(frame.canvas.yview()[0] - previous) < .02, f"返回目录应恢复滚动位置：{previous} -> {frame.canvas.yview()[0]}"
+        assert frame._state(0) == "read" and frame._state(1) == "uninterested"
+        # 可选本地预览，用样例摘要截图，不读取用户数据。
+        if os.environ.get("KANDU_CAPTURE_DIGEST"):
+            from pathlib import Path
+            from PIL import ImageGrab
+            frame._reset_filters()
+            root.geometry("1180x900+40+40")
+            root.update()
+            root.lift()
+            time.sleep(.3)
+            root.update()
+            target = Path(__file__).resolve().parents[1] / "dist" / "digest-preview.png"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            x, y = root.winfo_rootx(), root.winfo_rooty()
+            ImageGrab.grab((x, y, x + root.winfo_width(), y + root.winfo_height())).save(target)
+        assert not errors, f"界面回调异常：{errors}"
+    finally:
+        root.destroy()
+
+
 def main():
     only = set(sys.argv[1:])
     if os.path.exists(SANDBOX):

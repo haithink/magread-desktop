@@ -389,6 +389,49 @@ def save_digest(digest: dict):
     _json_write(_cache_dir(digest["bookId"]) / "digest.json", digest)
 
 
+ARTICLE_STATES = ("unread", "read", "uninterested")
+
+
+def _article_states_file(book_id: str) -> Path:
+    # 阅读记录属于用户数据，独立于可重新生成的摘要/正文缓存。
+    return cfgmod.app_dir() / "article_states" / f"{sanitize_id(book_id)}.json"
+
+
+def load_article_states(book_id: str) -> dict:
+    """返回文章索引到手动阅读状态的映射；未记录的文章默认为未读。"""
+    data = _json_read(_article_states_file(book_id))
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items()
+            if k.isdecimal() and v in ARTICLE_STATES}
+
+
+def set_article_state(book_id: str, article_index: int, state: str) -> dict:
+    """原子保存单篇文章的标记，保留本刊其他文章的记录。"""
+    if state not in ARTICLE_STATES:
+        raise ValueError(f"未知阅读状态：{state}")
+    if type(article_index) is not int or article_index < 0:
+        raise ValueError("文章索引必须是非负整数")
+    import os
+    import tempfile
+
+    states = load_article_states(book_id)
+    states[str(article_index)] = state
+    target = _article_states_file(book_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".tmp",
+                                         dir=target.parent, delete=False) as f:
+            temp_path = Path(f.name)
+            json.dump(states, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, target)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+    return states
+
+
 def has_digest(book_id: str) -> bool:
     return (_cache_dir(book_id) / "digest.json").exists()
 
@@ -486,13 +529,14 @@ def add_book(src: str, books_dir: str):
 
 
 def remove_book(book_id: str):
-    """从书库移除：删除登记、书库内文件副本与全部缓存/封面。"""
+    """从书库移除：删除登记、书库内文件副本、缓存/封面与阅读标记。"""
     entries = [e for e in load_library() if e.get("id") != book_id]
     save_library(entries)
     settings = cfgmod.load_settings()
     for f in Path(cfgmod.books_dir(settings)).glob(f"{book_id}.*"):
         f.unlink(missing_ok=True)
     purge_book_cache(book_id)
+    _article_states_file(book_id).unlink(missing_ok=True)
 
 
 def get_book(book_id: str):

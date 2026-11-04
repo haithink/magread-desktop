@@ -1,4 +1,4 @@
-"""目录页：每篇文章中英文标题 + 中文摘要（卡片式，摘要自动换行）。"""
+"""文章摘要浏览：手动阅读标记、状态筛选和本地搜索。"""
 import tkinter as tk
 from tkinter import ttk
 
@@ -8,55 +8,117 @@ from kandu import core_gen as gen
 from kandu import core_config as cfgmod
 
 FAMILY = "Microsoft YaHei UI"
+PAPER = "#f3f4ef"
+GREEN = "#1b4b43"
+INK = "#263e38"
+MUTED = "#738079"
+STATES = {
+    "unread": ("未读", "#536a9a", "#edf1f9"),
+    "read": ("已读", "#32745c", "#e9f3ed"),
+    "uninterested": ("不感兴趣", "#84796d", "#f2eee8"),
+}
 _RUNNING = set()
 
 
 class DigestFrame(tk.Frame):
     def __init__(self, parent, app, meta):
-        super().__init__(parent, bg="white")
+        super().__init__(parent, bg=PAPER)
         self.app = app
         self.meta = meta
         self.generating = False
-        self._summary_labels = []
+        self._articles = []
+        self._text_labels = []
+        self._cards = {}
+        self._states = store.load_article_states(meta["id"])
+        self._search_after = None
+        self._restore_after = None
+        if not hasattr(app, "_digest_views"):
+            app._digest_views = {}
+        view = app._digest_views.get(meta["id"], {})
+        self._filter = view.get("filter", "all")
+        if self._filter not in ("all", *STATES):
+            self._filter = "all"
+        self.search_var = tk.StringVar(self, value=view.get("search", ""))
 
-        bar = tk.Frame(self, bg="#1b4b43")
+        bar = tk.Frame(self, bg=GREEN, padx=20, pady=12)
         bar.pack(fill="x")
-        ttk.Button(bar, text="← 返回", command=self.app.show_library).pack(side="left", padx=10, pady=6)
-        tk.Label(bar, text=meta["fileName"], bg="#1b4b43", fg="white",
-                 font=(FAMILY, 12, "bold")).pack(side="left", padx=6)
-        self.gen_btn = ttk.Button(bar, text="补全/刷新摘要", command=self.generate)
-        self.gen_btn.pack(side="right", padx=10, pady=6)
+        bar.columnconfigure(1, weight=1)
+        self._button(bar, "← 书库", self.app.show_library,
+                     bg=GREEN, fg="#e1ece5").grid(row=0, column=0, padx=(0, 18))
+        tk.Label(bar, text=meta["fileName"], bg=GREEN, fg="white", width=1,
+                 font=(FAMILY, 11, "bold"), anchor="w").grid(row=0, column=1, sticky="ew")
+        actions = tk.Frame(bar, bg=GREEN)
+        actions.grid(row=0, column=2, padx=(12, 0))
         # 本次生成使用的 LLM（默认 ★ 优先）
         names = cfgmod.llm_names(self.app.settings)
         if len(names) > 1:
-            tk.Label(bar, text="使用", bg="#1b4b43", fg="#cde8e1").pack(side="right", padx=(6, 2))
-            self.llm_choice = ttk.Combobox(bar, values=names, state="readonly", width=16)
+            self.llm_choice = ttk.Combobox(actions, values=names, state="readonly", width=14)
             self.llm_choice.set(cfgmod.default_llm_name(self.app.settings))
-            self.llm_choice.pack(side="right", padx=4)
+            self.llm_choice.pack(side="left", padx=(0, 12))
+        self.gen_btn = self._button(actions, "补全摘要", self.generate, bg="#dfece3", fg=GREEN)
+        self.gen_btn.pack(side="left")
 
-        self.progress_row = tk.Frame(self, bg="white")
-        self.status = tk.Label(self.progress_row, text="", bg="white", fg="#446")
-        self.status.pack(side="left", padx=14, pady=4)
-        self.bar = ttk.Progressbar(self.progress_row, mode="determinate", length=320)
-        self.bar.pack(side="left", padx=8, pady=4)
-        self.progress_row.pack(fill="x")
+        heading = tk.Frame(self, bg=PAPER, padx=32, pady=20)
+        heading.pack(fill="x")
+        title_row = tk.Frame(heading, bg=PAPER)
+        title_row.pack(fill="x")
+        tk.Label(title_row, text="文章摘要", bg=PAPER, fg=INK,
+                 font=(FAMILY, 23, "bold")).pack(side="left")
+        self.overview = tk.Label(title_row, text="", bg=PAPER, fg=GREEN, font=(FAMILY, 10))
+        self.overview.pack(side="right", pady=(12, 0))
+        tk.Label(heading, text="先浏览，再选一篇慢慢读。阅读状态由你手动标记，自动保存。",
+                 bg=PAPER, fg=MUTED, font=(FAMILY, 10), anchor="w").pack(fill="x", pady=(4, 0))
 
-        # 卡片式滚动列表（Treeview 不支持换行，弃用）
-        body = tk.Frame(self, bg="white")
+        controls = tk.Frame(self, bg=PAPER, padx=32)
+        controls.pack(fill="x")
+        controls.columnconfigure(0, weight=1)
+        filters = tk.Frame(controls, bg=PAPER)
+        filters.grid(row=0, column=0, sticky="w")
+        self.filter_buttons = {}
+        for key, label in [("all", "全部"), *[(s, v[0]) for s, v in STATES.items()]]:
+            button = self._button(filters, label, lambda s=key: self._select_filter(s))
+            button.pack(side="left", padx=(0, 6))
+            self.filter_buttons[key] = button
+        search_box = tk.Frame(controls, bg="white", highlightthickness=1,
+                              highlightbackground="#d9dfd7", padx=8, pady=6)
+        search_box.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        tk.Label(search_box, text="搜索", bg="white", fg=MUTED, font=(FAMILY, 9)).pack(side="left", padx=(0, 8))
+        self.search_entry = tk.Entry(search_box, textvariable=self.search_var, width=20,
+                                     relief="flat", bg="white", fg=INK, font=(FAMILY, 10))
+        self.search_entry.pack(side="left")
+        self.search_entry.bind("<Escape>", lambda e: self._reset_filters())
+        self._button(search_box, "×", lambda: self.search_var.set(""), padx=3, pady=0).pack(side="left")
+        self.result_label = tk.Label(controls, text="", bg=PAPER, fg=MUTED, font=(FAMILY, 9), anchor="w")
+        self.result_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 8))
+
+        self.progress_row = tk.Frame(self, bg=PAPER, padx=32, pady=8)
+        self.progress_row.pack(side="bottom", fill="x")
+        self.progress_row.columnconfigure(0, weight=1)
+        self.status = tk.Label(self.progress_row, text="", bg=PAPER, fg=MUTED,
+                               font=(FAMILY, 9), anchor="w", justify="left", wraplength=800)
+        self.status.grid(row=0, column=0, sticky="ew")
+        self.bar = ttk.Progressbar(self.progress_row, mode="determinate", length=160)
+        self.bar.grid(row=0, column=1, padx=(12, 0))
+        self.bar.grid_remove()
+
+        body = tk.Frame(self, bg=PAPER)
         body.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(body, bg="white", highlightthickness=0, bd=0)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(body, bg=PAPER, highlightthickness=0, bd=0, yscrollincrement=24)
         self.vbar = ttk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
-        self.inner = tk.Frame(self.canvas, bg="white")
-        self.inner.bind("<Configure>",
-                        lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner = tk.Frame(self.canvas, bg=PAPER)
+        self.inner.bind("<Configure>", lambda e: self._update_scrollregion())
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="n")
         self.canvas.configure(yscrollcommand=self.vbar.set)
-        self.canvas.pack(side="left", fill="both", expand=True, padx=(16, 0), pady=(4, 8))
-        self.vbar.pack(side="right", fill="y")
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vbar.grid(row=0, column=1, sticky="ns", pady=(0, 8))
         self.canvas.bind("<Configure>", self._on_canvas_resize)
+        self.search_var.trace_add("write", self._queue_search)
 
         digest = store.load_digest(meta["id"])
         if digest is None:
+            self._render()
             self.generate()
         else:
             self._fill(digest)
@@ -64,28 +126,94 @@ class DigestFrame(tk.Frame):
                 self.status.config(text="检测到摘要不完整，自动续传缺失批次…")
                 self.generate()
             else:
-                self.status.config(text="已加载缓存摘要（点右上角可重新生成）")
+                self.status.config(text="摘要已缓存 · 阅读标记仅保存在本机")
+        self._restore_after = self.after(30, lambda: self._restore_scroll(view.get("scroll", 0)))
 
     # ---- 布局 ----
+    @staticmethod
+    def _button(parent, text, command, bg="white", fg=INK, padx=12, pady=6):
+        return tk.Button(parent, text=text, command=command, bg=bg, fg=fg,
+                         activebackground="#e3ebe3", activeforeground=GREEN,
+                         relief="flat", bd=0, highlightthickness=0, cursor="hand2",
+                         font=(FAMILY, 10), padx=padx, pady=pady)
+
+    def _update_scrollregion(self):
+        self.canvas.configure(scrollregion=(0, 0, self.canvas.winfo_width(), self.inner.winfo_reqheight()))
+
     def _on_canvas_resize(self, e):
-        self.canvas.itemconfigure(self._win, width=e.width)
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        w = max(e.width - 40, 320)
-        for lbl in self._summary_labels:
-            try:
-                lbl.configure(wraplength=w)
-            except tk.TclError:
-                pass
+        self._layout_content(e.width)
+
+    def _layout_content(self, available):
+        width = max(240, min(available - 48, 1024))
+        self.canvas.coords(self._win, available / 2, 0)
+        self.canvas.itemconfigure(self._win, width=width)
+        for lbl in self._text_labels:
+            lbl.configure(wraplength=width - 56)
+        self.status.configure(wraplength=max(200, available - 260))
+        self._update_scrollregion()
+
+    def _restore_scroll(self, fraction):
+        self._restore_after = None
+        # 标题和摘要换行会改变列表高度，先完成布局再按比例恢复位置。
+        self.canvas.update_idletasks()
+        self._update_scrollregion()
+        self.canvas.yview_moveto(fraction)
+
+    def _remember_view(self):
+        self.app._digest_views[self.meta["id"]] = {
+            "filter": self._filter, "search": self.search_var.get(),
+            "scroll": self.canvas.yview()[0],
+        }
+
+    def destroy(self):
+        self._remember_view()
+        for pending in (self._search_after, self._restore_after):
+            if pending:
+                self.after_cancel(pending)
+        super().destroy()
 
     def on_wheel(self, e):
         try:
             if self.winfo_exists() and self.canvas.winfo_exists():
-                self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+                if e.delta:
+                    self.canvas.yview_scroll(-max(1, abs(e.delta) // 120) * (1 if e.delta > 0 else -1) * 3, "units")
         except tk.TclError:
             pass
 
     def _open(self, index):
+        self._remember_view()
         self.app.open_reader(self.meta, index)
+
+    def _state(self, index):
+        return self._states.get(str(index), "unread")
+
+    def _mark(self, index, state):
+        try:
+            self._states = store.set_article_state(self.meta["id"], index, state)
+        except (OSError, ValueError) as e:
+            self.status.config(text=f"标记保存失败：{e}")
+            return
+        self._render(keep_scroll=True)
+
+    def _select_filter(self, state):
+        self._filter = state
+        self._render()
+
+    def _queue_search(self, *_):
+        if self._search_after:
+            self.after_cancel(self._search_after)
+        self._search_after = self.after(160, self._apply_search)
+
+    def _apply_search(self):
+        if self._search_after:
+            self.after_cancel(self._search_after)
+        self._search_after = None
+        self._render()
+
+    def _reset_filters(self):
+        self._filter = "all"
+        self.search_var.set("")
+        self._render()
 
     # ---- 生成 ----
     def generate(self):
@@ -107,6 +235,7 @@ class DigestFrame(tk.Frame):
         _RUNNING.add(self.meta["id"])
         self.gen_btn.config(state="disabled")
         self.bar.config(value=0)
+        self.bar.grid()
         self.status.config(text="解析刊物正文…")
         self.app.post(self._worker, dict(cfg))
 
@@ -141,6 +270,7 @@ class DigestFrame(tk.Frame):
         self.generating = False
         _RUNNING.discard(self.meta["id"])
         self.gen_btn.config(state="normal")
+        self.bar.grid_remove()
         fb = digest.get("failedBatches") or 0
         if fb:
             censor = "（部分内容触发模型安全过滤）" if digest.get("censorHint") else ""
@@ -154,6 +284,7 @@ class DigestFrame(tk.Frame):
         self.generating = False
         _RUNNING.discard(self.meta["id"])
         self.gen_btn.config(state="normal")
+        self.bar.grid_remove()
         digest = store.load_digest(self.meta["id"])
         if digest:
             self._fill(digest)
@@ -163,30 +294,86 @@ class DigestFrame(tk.Frame):
 
     # ---- 渲染 ----
     def _fill(self, digest):
+        self._articles = digest["articles"]
+        self._render(keep_scroll=True)
+
+    def _render(self, keep_scroll=False):
+        scroll = self.canvas.yview()[0] if keep_scroll else 0
         for w in self.inner.winfo_children():
             w.destroy()
-        self._summary_labels.clear()
-        for a in digest["articles"]:
-            card = tk.Frame(self.inner, bg="white", bd=1, relief="solid")
-            card.pack(fill="x", padx=8, pady=5)
-            en = tk.Label(card, text=f"{a.get('index', 0) + 1}. {a.get('titleEn', '')}", bg="white", fg="#1b4b43",
-                          font=(FAMILY, 11, "bold"), anchor="w", justify="left", wraplength=980)
-            en.pack(fill="x", padx=12, pady=(8, 0))
-            widgets = [card, en]
-            if a.get("titleZh", "").strip():
-                zh = tk.Label(card, text=a["titleZh"], bg="white", fg="#7fa829",
-                              font=(FAMILY, 10), anchor="w", justify="left", wraplength=980)
-                zh.pack(fill="x", padx=12, pady=(2, 0))
-                widgets.append(zh)
-            if a.get("summaryZh", "").strip():
-                sm = tk.Label(card, text=a["summaryZh"], bg="white", fg="#4a5568",
-                              font=(FAMILY, 10), anchor="w", justify="left", wraplength=980)
-                sm.pack(fill="x", padx=12, pady=(4, 10))
-                widgets.append(sm)
-                self._summary_labels.append(sm)
-            for w in widgets:
-                w.bind("<Button-1>", lambda e, i=a["index"]: self._open(i))
-                w.bind("<Enter>", lambda e, c=card: c.configure(bg="#eef6f2"))
-                w.bind("<Leave>", lambda e, c=card: c.configure(bg="white"))
+        self._text_labels.clear()
+        self._cards.clear()
+        self._counts = {s: sum(self._state(a["index"]) == s for a in self._articles) for s in STATES}
+        total = len(self._articles)
+        for key, button in self.filter_buttons.items():
+            label = "全部" if key == "all" else STATES[key][0]
+            count = total if key == "all" else self._counts[key]
+            button.config(text=f"{label}  {count}", bg=GREEN if key == self._filter else "#e7ebe4",
+                          fg="white" if key == self._filter else MUTED)
+        self.overview.config(text=f"{total} 篇文章   /   已读 {self._counts['read']} 篇")
+        query = self.search_var.get().strip().casefold()
+        self._visible_articles = [a for a in self._articles
+                                  if (self._filter == "all" or self._state(a["index"]) == self._filter)
+                                  and all(term in " ".join(str(a.get(k, "")) for k in
+                                          ("titleEn", "titleZh", "summaryZh")).casefold()
+                                          for term in query.split())]
+        self.result_label.config(text=f"显示 {len(self._visible_articles)} / {total} 篇" +
+                                 (f" · 搜索：{self.search_var.get().strip()}" if query else ""))
+        for article in self._visible_articles:
+            self._make_card(article)
+        if not self._visible_articles:
+            empty = tk.Frame(self.inner, bg=PAPER, pady=56)
+            empty.pack(fill="x")
+            tk.Label(empty, text="暂时没有匹配的文章", bg=PAPER, fg=INK,
+                     font=(FAMILY, 15, "bold")).pack()
+            tk.Label(empty, text="试试其他状态，或换一个搜索词。", bg=PAPER,
+                     fg=MUTED, font=(FAMILY, 10)).pack(pady=(10, 18))
+            self._button(empty, "查看全部文章", self._reset_filters, bg=GREEN, fg="white").pack()
+        self._layout_content(self.canvas.winfo_width())
         self.canvas.update_idletasks()
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._update_scrollregion()
+        self.canvas.yview_moveto(scroll)
+
+    def _make_card(self, article):
+        index = article["index"]
+        state = self._state(index)
+        label, color, tint = STATES[state]
+        card = tk.Frame(self.inner, bg="white", highlightthickness=1,
+                        highlightbackground="#dce3da", padx=24, pady=18)
+        card.pack(fill="x", pady=(2, 14))
+        meta_row = tk.Frame(card, bg="white")
+        meta_row.pack(fill="x", pady=(0, 10))
+        tk.Label(meta_row, text=f"ARTICLE  {index + 1:02d}", bg="white", fg=MUTED,
+                 font=(FAMILY, 9)).pack(side="left")
+        tk.Label(meta_row, text=f"  {label}  ", bg=tint, fg=color,
+                 font=(FAMILY, 9), pady=3).pack(side="right")
+        text_widgets = []
+        for key, font, fg, padding in [
+            ("titleEn", ("Georgia", 17, "bold"), INK, (0, 6)),
+            ("titleZh", (FAMILY, 11, "bold"), "#526a5c", (0, 12)),
+            ("summaryZh", (FAMILY, 11), "#56615d", (0, 16)),
+        ]:
+            text = article.get(key, "").strip()
+            if not text:
+                continue
+            widget = tk.Label(card, text=text, bg="white", fg=fg, font=font,
+                              anchor="w", justify="left", wraplength=940, cursor="hand2")
+            widget.pack(fill="x", pady=padding)
+            widget.bind("<Button-1>", lambda e, i=index: self._open(i))
+            text_widgets.append(widget)
+        self._text_labels.extend(text_widgets)
+        tk.Frame(card, bg="#edf0ea", height=1).pack(fill="x", pady=(0, 12))
+        footer = tk.Frame(card, bg="white")
+        footer.pack(fill="x")
+        tk.Label(footer, text="标记为", bg="white", fg=MUTED,
+                 font=(FAMILY, 9)).pack(side="left", padx=(0, 8))
+        buttons = {}
+        for key, (name, fg, bg) in STATES.items():
+            button = self._button(footer, name, lambda i=index, s=key: self._mark(i, s),
+                                  bg=bg if state == key else "white",
+                                  fg=fg if state == key else MUTED, padx=10, pady=5)
+            button.pack(side="left", padx=(0, 4))
+            buttons[key] = button
+        open_button = self._button(footer, "阅读全文  →", lambda i=index: self._open(i), bg=GREEN, fg="white")
+        open_button.pack(side="right")
+        self._cards[index] = {"frame": card, "marks": buttons, "open": open_button, "labels": text_widgets}
