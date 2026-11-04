@@ -569,12 +569,16 @@ class ReaderFrame(tk.Frame):
         ttk.Button(bar, text="A-", width=3, command=lambda: apply_size(-1)).pack(side="right", padx=(2, 8), pady=3)
         ttk.Button(bar, text="A+", width=3, command=lambda: apply_size(1)).pack(side="right", padx=2, pady=3)
 
-        txt = tk.Text(win, wrap="word", bd=0, padx=20, pady=14,
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        txt = tk.Text(body, wrap="word", bd=0, padx=20, pady=14,
                       font=(FAMILY, size))
-        vbar = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        vbar = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=vbar.set)
-        txt.pack(side="left", fill="both", expand=True)
-        vbar.pack(side="right", fill="y")
+        txt.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
         _config_tags(txt, size)
         return win, txt, bar
 

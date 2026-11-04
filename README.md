@@ -25,6 +25,8 @@
 
 数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache）
 
+v0.5.3 修复生词表、句解和查词弹窗在窗口较窄时滚动条被挤出的问题，支持拖动滚动条和鼠标滚轮。
+
 ### 生词表生成（v0.5.2）
 
 - 默认词汇水平为 CET-4。用本地词表排除已掌握词，用 ECDICT 还原词形、批量补充音标；

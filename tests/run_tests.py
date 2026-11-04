@@ -461,6 +461,61 @@ def test_ui_startup():
         app.destroy()
 
 
+@case("生词表弹窗滚动条、拖动和滚轮")
+def test_vocab_sheet_scroll():
+    import tkinter as tk
+    from tkinter import ttk
+    from types import SimpleNamespace
+    from kandu.ui_reader import ReaderFrame, _render_vocab
+
+    app = tk.Tk()
+    app.withdraw()
+    holder = tk.Frame(app)
+    holder.app = SimpleNamespace(settings={"sheetFontSize": 11}, save_settings=lambda: None)
+    win, txt, toolbar = ReaderFrame._make_sheet(holder, "生词表测试", "长文章")
+    try:
+        _render_vocab(txt, {"paragraphs": [{"index": 0, "startWords": "Long article", "entries": [
+            {"word": f"word{i}", "sense": "本文释义", "inText": "Some source context", "root": "词根说明"}
+            for i in range(265)
+        ]}]}, None)
+
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+
+        scrollbar = next(w for w in descendants(win) if isinstance(w, ttk.Scrollbar))
+        for width, height in [(860, 800), (520, 400), (1200, 900)]:
+            win.geometry(f"{width}x{height}")
+            app.update()
+            assert scrollbar.winfo_ismapped(), f"{width}x{height} 下滚动条被挤出窗口"
+            assert scrollbar.winfo_width() >= scrollbar.winfo_reqwidth()
+            assert scrollbar.winfo_rootx() + scrollbar.winfo_width() <= win.winfo_rootx() + win.winfo_width()
+            assert scrollbar.winfo_rootx() >= txt.winfo_rootx() + txt.winfo_width()
+            assert txt.yview()[1] < 1, "长生词表应超出可视区域"
+            txt.tk.call(scrollbar.cget("command"), "moveto", .5)
+            app.update()
+            assert .45 < txt.yview()[0] < .55, "拖动滚动条应滚动文本"
+            assert abs(scrollbar.get()[0] - txt.yview()[0]) < .01
+            txt.yview_moveto(0)
+            txt.event_generate("<MouseWheel>", delta=-120)
+            app.update()
+            assert txt.yview()[0] > 0, "只读生词表应能使用鼠标滚轮"
+            txt.yview_moveto(1)
+            app.update()
+            assert txt.yview()[1] > .999, f"应能滚到最后一个词条：{txt.yview()}"
+            txt.yview_moveto(0)
+        before = int(txt.cget("font").split()[-1])
+        plus = next(w for w in toolbar.winfo_children() if isinstance(w, ttk.Button) and w.cget("text") == "A+")
+        plus.invoke()
+        app.update()
+        assert int(txt.cget("font").split()[-1]) == before + 1
+        assert scrollbar.winfo_ismapped(), "放大字体后滚动条仍应可见"
+    finally:
+        win.destroy()
+        app.destroy()
+
+
 def main():
     only = set(sys.argv[1:])
     if os.path.exists(SANDBOX):
