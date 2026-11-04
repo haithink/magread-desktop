@@ -272,7 +272,14 @@ class ReaderFrame(tk.Frame):
         failed = vocab.get("failedChunks") or 0
         hint = "（部分内容可能触发模型安全过滤）" if vocab.get("censorHint") else ""
         if failed:
-            self.status.config(text=f"生词表部分完成：{failed} 块失败{hint}。点「补缺生词表」自动轮换其他 LLM 重试")
+            errors = vocab.get("chunkErrors") or {}
+            detail = next((items[-1].get("error", "") for items in errors.values() if items), "")
+            reason = f"；原因：{detail[:100]}" if detail else ""
+            self.status.config(text=f"生词表部分完成：{failed} 块待补缺{hint}{reason}。可再次点「补缺生词表」")
+            for key, items in errors.items():
+                for item in items:
+                    self.app._log_error(f"生词表 [{self.meta['id']} / {self.article['index']} / 段落 {key}] "
+                                        f"{item.get('llm', '?')}: {item.get('error', '')}")
         else:
             elapsed = (vocab.get("generationStats") or {}).get("elapsedMs")
             timing = f"，{elapsed / 1000:.1f} 秒" if elapsed is not None else ""

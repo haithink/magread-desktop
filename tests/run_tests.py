@@ -207,11 +207,81 @@ def test_vocab_incomplete():
     ]):
         with patch.object(llm, "chat", return_value=J.dumps(response)):
             result = gen.generate_vocab(dict(META, id=f"T_BAD_{case_id}"), art, "cet4", {"name": "bad"})
-        assert result["processedParagraphs"] == []
+        assert result["processedParagraphs"] == ([-1] if case_id == 1 else [])
         assert result["failedChunks"] == 1
-    with patch.object(llm, "chat", side_effect=AssertionError("不应再次尝试已失败的配置")):
+    with patch.object(llm, "chat", side_effect=llm.LlmError("暂时不可用")) as chat:
         result = gen.generate_vocab(dict(META, id="T_BAD_0"), art, "cet4", {"name": "bad"})
-    assert result["failedChunks"] == 1, "无可用配置时仍需显示未完成"
+    assert chat.call_count == 1, "显式补缺应允许重试过去失败的同名配置"
+    assert result["failedChunks"] == 1
+    assert result["chunkErrors"]["-1,0,1"][0]["error"] == "暂时不可用"
+
+
+@case("生词串段自动归位与连字符定位")
+def test_vocab_misplaced():
+    units = [(0, "This is a sprawling science-fiction novel."),
+             (1, "Its prophetic pages discuss modernity.")]
+    response = {"paragraphs": [
+        {"index": 0, "entries": [["science fiction", "n.", "科幻", "", True, ""],
+                                 ["prophetic", "adj.", "预言的", "", False, ""]]},
+        {"index": 1, "entries": [["prophetic", "adj.", "预言的", "", False, ""]]},
+    ]}
+    sections = gen._vocab_sections(response, units, {})
+    assert [e["word"] for e in sections[0]["entries"]] == ["science fiction"]
+    assert [e["word"] for e in sections[1]["entries"]] == ["prophetic"]
+    assert "science-fiction" in sections[0]["entries"][0]["inText"]
+    response["paragraphs"][0]["entries"].append(["inventedword", "n.", "不存在", "", False, ""])
+    try:
+        gen._vocab_sections(response, units, {})
+    except gen.VocabValidationError as error:
+        assert set(error.sections) == {1}
+        assert 0 in error.errors
+    else:
+        raise AssertionError("原文中完全不存在的词不能误标完成")
+
+
+@case("生词部分成功保存、缩小补缺与失败渠道重试")
+def test_vocab_partial_retry():
+    art = {"index": 0, "title": "Novel", "paragraphs": ["A prophetic novel.", "A sprawling story."]}
+    meta = dict(META, id="T_PARTIAL_RETRY")
+    calls = []
+    cfg = {"name": "same", "model": "deepseek-flash"}
+    def first(config, system, user, **kwargs):
+        calls.append(user)
+        assert config["thinkingMode"] == "disabled"
+        return J.dumps({"paragraphs": [{"index": -1, "entries": []},
+            {"index": 0, "entries": [["prophetic", "adj.", "预言的", "", False, ""]]}]})
+    with patch.object(llm, "chat", first):
+        v = gen.generate_vocab(meta, art, "cet4", cfg)
+    assert v["processedParagraphs"] == [-1, 0]
+    assert v["chunkFailures"] == {"1": ["same"]}
+    assert v["chunkErrors"]["1"]
+    assert "thinkingMode" not in cfg, "任务参数不能改写用户配置"
+    def retry(config, system, user, **kwargs):
+        calls.append(user)
+        assert re.findall(r"### 段落 (-?\d+)", user) == ["1"]
+        return J.dumps({"paragraphs": [{"index": 1, "entries": [["sprawling", "adj.", "庞杂的", "", False, ""]]}]})
+    with patch.object(llm, "chat", retry):
+        v = gen.generate_vocab(meta, art, "cet4", cfg)
+    assert len(calls) == 2
+    assert v["processedParagraphs"] == [-1, 0, 1]
+    assert not v["chunkErrors"] and not v["chunkFailures"] and not v["failedChunks"]
+    meta = dict(META, id="T_PARTIAL_ROTATE")
+    def rotated(config, system, user, **kwargs):
+        return first(config, system, user, **kwargs) if config["name"] == "same" else retry(config, system, user, **kwargs)
+    with patch.object(llm, "chat", rotated):
+        v = gen.generate_vocab(meta, art, "cet4", cfg, llm_rotation=[{"name": "backup"}])
+    assert v["processedParagraphs"] == [-1, 0, 1]
+    assert not v["failedChunks"]
+
+
+@case("生词截断 JSON 不可修补为完成")
+def test_vocab_strict_json():
+    art = {"index": 0, "title": "Title", "paragraphs": ["A prophetic novel."]}
+    broken = '{"paragraphs":[{"index":-1,"entries":[]},{"index":0,"entries":[]}'
+    with patch.object(llm, "chat", return_value=broken):
+        v = gen.generate_vocab(dict(META, id="T_STRICT_JSON"), art, "cet4", {"name": "mock"})
+    assert v["processedParagraphs"] == []
+    assert v["failedChunks"] == 1
 
 
 @case("生词最多两路并发与逐块落盘")
@@ -282,6 +352,9 @@ def test_llm_json_response():
         def iter_lines(self, **kwargs):
             yield self.text.encode("utf-8")
     cfg = {"name": "test", "baseUrl": "http://local.test", "apiKey": "test", "model": "test"}
+    assert "thinking" not in llm._body(cfg, "s", "u", 2048, .3, True)
+    for provider in ["openai", "anthropic"]:
+        assert llm._body(dict(cfg, provider=provider, thinkingMode="disabled"), "s", "u", 2048, .3, True)["thinking"] == {"type": "disabled"}
     body = {"choices": [{"message": {"content": "结果", "reasoning_content": "thought"}, "finish_reason": "stop"}]}
     for headers in [{"Content-Type": "application/json"}, {}]:
         with patch.object(llm.requests, "post", return_value=Response(body, headers)) as post:
@@ -314,8 +387,9 @@ def test_llm_stream():
     class Response:
         status_code = 200
         headers = {"Content-Type": "text/event-stream"}
-        def __init__(self, frames):
+        def __init__(self, frames, done=True):
             self.frames = frames
+            self.done = done
         def __enter__(self):
             return self
         def __exit__(self, *args):
@@ -323,7 +397,8 @@ def test_llm_stream():
         def iter_lines(self, **kwargs):
             for frame in self.frames:
                 yield ('data: ' + J.dumps(frame, ensure_ascii=False)).encode('utf-8')
-            yield b'data: [DONE]'
+            if self.done:
+                yield b'data: [DONE]'
     counts = []
     responses = [Response([
         {"choices": [{"delta": {"reasoning_content": "thought"}, "finish_reason": "length"}]},
@@ -336,6 +411,25 @@ def test_llm_stream():
         assert post.call_count == 2, "推理烧光额度应直接扩容，无需重复非流式请求"
         assert [c.kwargs["json"]["max_tokens"] for c in post.call_args_list] == [2048, 4096]
     assert counts[-1] == 4 and 2 in counts, counts
+    with patch.object(llm.requests, "post", return_value=Response([
+        {"choices": [{"delta": {"content": '{"paragraphs":[]}'}}]},
+    ], done=False)) as post:
+        try:
+            llm.chat(cfg, "s", "u", require_complete=True)
+        except llm.LlmError as error:
+            assert "中断" in str(error)
+        else:
+            raise AssertionError("没有结束标记的流式响应不能视为成功")
+        assert post.call_count == 1
+    with patch.object(llm.requests, "post", return_value=Response([
+        {"error": {"message": "upstream temporary failure"}},
+    ])):
+        try:
+            llm.chat(cfg, "s", "u")
+        except llm.LlmError as error:
+            assert "upstream temporary failure" in str(error)
+        else:
+            raise AssertionError("OpenAI 流中的 error 事件不能被忽略")
 
 
 @case("JSON 修补")

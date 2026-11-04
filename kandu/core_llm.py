@@ -51,6 +51,9 @@ def _body(cfg, system, user, max_tokens, temperature, stream):
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    # 由调用任务显式选择，避免简单词汇任务耗尽预算仍只有推理内容。
+    if cfg.get("thinkingMode") in ("enabled", "disabled"):
+        b["thinking"] = {"type": cfg["thinkingMode"]}
     if stream:
         b["stream"] = True
     if cfg.get("provider") == "anthropic":
@@ -131,6 +134,7 @@ def _stream_once(cfg, system, user, max_tokens, temperature, state):
                 state.saw_reasoning = True
             return
         unframed = []
+        saw_sse, ended = False, False
         for raw in resp.iter_lines(chunk_size=1024):
             if isinstance(raw, bytes):
                 # 网关可能不标 charset，requests 默认按 latin-1 解码会产出 mojibake
@@ -144,22 +148,32 @@ def _stream_once(cfg, system, user, max_tokens, temperature, state):
                     unframed.append(line)
                 continue
             data = line[5:].strip()
+            saw_sse = True
             if data == "[DONE]":
+                ended = True
                 break
             try:
                 obj = json.loads(data)
             except Exception:
                 continue
             state.saw_response = True
+            if obj.get("error"):
+                raise LlmError(f"接口报错：{json.dumps(obj['error'], ensure_ascii=False)[:200]}")
             if cfg.get("provider") == "anthropic":
                 t = obj.get("type")
                 if t == "content_block_delta":
                     txt = (obj.get("delta") or {}).get("text")
                     if txt:
                         state.append(txt)
+                    if (obj.get("delta") or {}).get("thinking"):
+                        state.saw_reasoning = True
                 elif t == "message_delta":
                     if (obj.get("delta") or {}).get("stop_reason") == "max_tokens":
                         state.length_cut = True
+                    if (obj.get("delta") or {}).get("stop_reason"):
+                        ended = True
+                elif t == "message_stop":
+                    ended = True
                 elif t == "error":
                     raise LlmError(f"接口报错：{json.dumps(obj.get('error'), ensure_ascii=False)[:200]}")
             else:
@@ -174,6 +188,10 @@ def _stream_once(cfg, system, user, max_tokens, temperature, state):
                         state.saw_reasoning = True
                     if ch.get("finish_reason") == "length":
                         state.length_cut = True
+                    if ch.get("finish_reason"):
+                        ended = True
+        if saw_sse and not ended:
+            raise LlmError("流式响应提前中断，未收到结束标记，请重试此块")
         if not state.saw_response and unframed:
             # 兼容不带 Content-Type 的普通 JSON 响应。
             body = "\n".join(unframed)
@@ -267,6 +285,9 @@ def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None, req
             raise
         except Exception as e:  # 流式不被支持/网络错误 → 退回非流式
             stream_err = e
+
+        if stream_err and state.saw_response:
+            raise LlmError(f"流式响应接收中断：{stream_err}")
 
         content = state.text.strip()
         if not content and not state.saw_response:

@@ -143,6 +143,14 @@ class GenError(Exception):
     pass
 
 
+class VocabValidationError(GenError):
+    """保留响应中已通过校验的段落，仅补未完成部分。"""
+    def __init__(self, sections, errors):
+        self.sections = sections
+        self.errors = errors
+        super().__init__("；".join(f"段落 {i}: {text}" for i, text in errors.items())[:500])
+
+
 def _chat_retry(cfg, system, user, max_tokens, on_chars=None, attempts=2):
     last = None
     for i in range(attempts):
@@ -363,12 +371,14 @@ def _is_censor(text: str) -> bool:
 def _vocab_context(word, text, lexicon):
     """从正文找词条的真实短语，省去模型重复抄写原文和段首。"""
     text = re.sub(r"\s+", " ", text.replace("’", "'")).strip()
-    tokens = list(_TOKEN.finditer(text))
+    # 连字符/空格是排版差异，如 science-fiction 与 science fiction。
+    context_token = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+    tokens = list(context_token.finditer(text))
     exact = re.search(r"(?<![A-Za-z])" + re.escape(word) + r"(?![A-Za-z])", text, re.IGNORECASE)
     if exact:
         start, end = exact.span()
     else:
-        wanted = [m.group().lower() for m in _TOKEN.finditer(word)]
+        wanted = [m.group().lower() for m in context_token.finditer(word.replace("’", "'"))]
         match = next((i for i in range(len(tokens) - len(wanted) + 1) if wanted and all(
             w in lemma_forms(tokens[i + j].group().lower()) or
             w == (lexicon.get(tokens[i + j].group().lower()) or {}).get("lemma")
@@ -384,12 +394,13 @@ def _vocab_context(word, text, lexicon):
 def _vocab_sections(obj, chunk, lexicon):
     """展开紧凑结果；缺段/坏结构不得标成完成，兼容旧对象格式响应。"""
     expected = dict(chunk)
-    sections = {}
+    sections, errors, relocated = {}, {}, []
     rows = obj.get("paragraphs")
     if not isinstance(rows, list):
         raise GenError("生词表缺少 paragraphs 数组")
     if -1 in expected and "titleEntries" in obj and not any(p.get("index") == -1 for p in rows if isinstance(p, dict)):
         rows = rows + [{"index": -1, "entries": obj["titleEntries"]}]
+    seen_indices = set()
     for row in rows:
         if not isinstance(row, dict):
             raise GenError("生词表段落结构无效")
@@ -397,8 +408,13 @@ def _vocab_sections(obj, chunk, lexicon):
             idx = int(row["index"])
         except (KeyError, TypeError, ValueError):
             raise GenError("生词表缺少有效段落编号")
-        if idx not in expected or idx in sections or not isinstance(row.get("entries"), list):
-            raise GenError("生词表段落编号或词条结构无效")
+        if idx not in expected:
+            continue
+        if idx in seen_indices or not isinstance(row.get("entries"), list):
+            errors[idx] = "生词表段落重复或词条结构无效"
+            sections.pop(idx, None)
+            continue
+        seen_indices.add(idx)
         entries, seen = [], set()
         for raw in row["entries"]:
             if isinstance(raw, list) and len(raw) == 6:
@@ -408,18 +424,35 @@ def _vocab_sections(obj, chunk, lexicon):
                        for k, value in raw.items()}
             if not isinstance(raw, dict) or not all(isinstance(raw.get(k, ""), str)
                                                   for k in ("word", "pos", "sense", "root", "phonetic", "inText")):
-                raise GenError("生词表词条结构无效")
+                errors[idx] = "生词表词条结构无效"
+                continue
             if not raw.get("word", "").strip() or not raw.get("sense", "").strip():
-                raise GenError("生词表缺少词语或本文释义")
+                errors[idx] = "生词表缺少词语或本文释义"
+                continue
             entry = _parse_entry(raw, seen)
             if entry:
                 entry["inText"] = _vocab_context(entry["word"], expected[idx], lexicon)
                 if not entry["inText"]:
-                    raise GenError("生词表词条无法在对应段落定位：" + entry["word"])
+                    matches = [(i, _vocab_context(entry["word"], text, lexicon))
+                               for i, text in expected.items() if i != idx]
+                    matches = [(i, context) for i, context in matches if context]
+                    if len(matches) == 1:
+                        target, entry["inText"] = matches[0]
+                        relocated.append((target, entry))
+                        continue
+                    errors[idx] = "生词无法在原文唯一定位：" + entry["word"]
+                    continue
                 entries.append(entry)
-        sections[idx] = {"index": idx, "startWords": expected[idx][:30], "entries": entries}
-    if set(sections) != set(expected):
-        raise GenError("生词表结果缺段，保留待补缺")
+        if idx not in errors:
+            sections[idx] = {"index": idx, "startWords": expected[idx][:30], "entries": entries}
+    for idx, entry in relocated:
+        if idx in sections and all((e["word"], e["sense"]) != (entry["word"], entry["sense"])
+                                   for e in sections[idx]["entries"]):
+            sections[idx]["entries"].append(entry)
+    for idx in expected.keys() - sections.keys():
+        errors.setdefault(idx, "模型未返回完整段落，保留待补缺")
+    if errors:
+        raise VocabValidationError(sections, errors)
     return sections
 
 
@@ -467,11 +500,14 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
     pending = []
     for chunk in chunks:
         tried = set.intersection(*(tried_by_index.get(idx, set()) for idx, _ in chunk))
-        pending.append((chunk, [c for c in rotation if c.get("name") not in tried]))
+        # 显式点击补缺就是重试授权。优先新渠道，过去失败的配置也不能永久封锁。
+        pending.append((chunk, [c for c in rotation if c.get("name") not in tried]
+                              + [c for c in rotation if c.get("name") in tried]))
 
     merged_sections = {p["index"]: p for p in existing.get("paragraphs", [])}
     merged_title = list(existing.get("titleEntries", []))
     merged_idioms = list(existing.get("idioms", []))
+    chunk_errors = dict(existing.get("chunkErrors", {}))
     completed = failed_chunks = 0
     censor_hit = False
     lock = threading.Lock()
@@ -482,11 +518,8 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
 
     def run_chunk(chunk, configs):
         key = ",".join(str(idx) for idx, _ in chunk)
-        local_words = {w for idx, _ in chunk for w in cand[idx] if (lexicon.get(w) or {}).get("phonetic")}
-        user = prompts.vocab_user(article["title"], -1, chunk, cand, local_words)
-        candidate_count = sum(len(cand[idx]) for idx, _ in chunk)
-        budget = min(8192, max(2048, 512 + candidate_count * 110))
-        failures, censor = [], False
+        remaining, collected = list(chunk), {}
+        failures, details, censor = [], [], False
 
         def chars_received(n):
             with lock:
@@ -495,28 +528,50 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                     on_chars(sum(received.values()))
 
         for config in configs:
+            if not remaining:
+                break
             name = config.get("name", "?")
+            local_words = {w for idx, _ in remaining for w in cand[idx] if (lexicon.get(w) or {}).get("phonetic")}
+            user = prompts.vocab_user(article["title"], -1, remaining, cand, local_words)
+            candidate_count = sum(len(cand[idx]) for idx, _ in remaining)
+            budget = min(8192, max(2048, 512 + candidate_count * 110))
+            request_cfg = dict(config)
+            if "deepseek" in (config.get("model") or "").lower():
+                request_cfg["thinkingMode"] = "disabled"
             with lock:
                 stats["requests"] += 1
                 stats["inputChars"] += len(system) + len(user)
                 if on_progress:
                     on_progress(completed, len(chunks), name)
             try:
-                raw = llm.chat(config, system, user, max_tokens=budget, on_delta=chars_received, require_complete=True)
+                raw = llm.chat(request_cfg, system, user, max_tokens=budget, on_delta=chars_received, require_complete=True)
                 with lock:
                     stats["outputChars"] += len(raw)
-                result = _vocab_sections(_parse_json(raw, want_array=False), chunk, lexicon)
-                return key, result, failures, censor
+                import json
+                # 不把修补后的半截 JSON 当作完整生词结果。
+                result = _vocab_sections(json.loads(_extract_json(raw)), remaining, lexicon)
+                collected.update(result)
+                remaining = []
+            except VocabValidationError as error:
+                collected.update(error.sections)
+                remaining = [(i, text) for i, text in remaining if i not in collected]
+                failures.append(name)
+                details.append({"llm": name, "error": str(error)})
             except Exception as error:
                 failures.append(name)
                 censor |= _is_censor(str(error))
-        return key, None, failures, censor
+                message = str(error)
+                if config.get("apiKey"):
+                    message = message.replace(config["apiKey"], "[redacted]")
+                details.append({"llm": name, "error": message[:500]})
+        return key, collected, failures, censor, remaining, details
 
     def save():
         draft = {"level": level, "articleIndex": article["index"], "titleEntries": merged_title,
                  "paragraphs": sorted(merged_sections.values(), key=lambda p: p["index"]),
                  "idioms": list({i["word"].lower(): i for i in merged_idioms}.values()),
                  "processedParagraphs": sorted(processed), "chunkFailures": chunk_failures,
+                 "chunkErrors": chunk_errors,
                  "failedChunks": failed_chunks, "censorHint": censor_hit,
                  "generationStats": dict(stats, elapsedMs=round((time.perf_counter() - started) * 1000))}
         result = vocab_normalize(draft, article)
@@ -528,11 +583,9 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
     with ThreadPoolExecutor(max_workers=stats["workers"]) as pool:
         futures = [pool.submit(run_chunk, chunk, configs) for chunk, configs in pending]
         for future in as_completed(futures):
-            key, sections, failures, censor = future.result()
+            key, sections, failures, censor, remaining, details = future.result()
             censor_hit |= censor
-            if failures:
-                chunk_failures[key] = list(dict.fromkeys(chunk_failures.get(key, []) + failures))
-            if sections is not None:
+            if sections:
                 entries = [e for section in sections.values() for e in section["entries"]]
                 # 原形/音标查询用一条 SQLite 连接，本地数据优先，未收录词保留模型音标。
                 phonetics = core_dict.lookup_many([e["word"] for e in entries])
@@ -551,8 +604,16 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                 processed.update(sections)
                 chunk_failures = {k: v for k, v in chunk_failures.items()
                                   if not all(int(i) in processed for i in k.split(","))}
-            else:
+                chunk_errors = {k: v for k, v in chunk_errors.items()
+                                if not all(int(i) in processed for i in k.split(","))}
+            if remaining:
                 failed_chunks += 1
+                remaining_key = ",".join(str(i) for i, _ in remaining)
+                # 切掉已完成段落，失败记录只描述真正仍需补缺的部分。
+                chunk_failures.pop(key, None)
+                chunk_errors.pop(key, None)
+                chunk_failures[remaining_key] = list(dict.fromkeys(failures))
+                chunk_errors[remaining_key] = details
             with lock:
                 completed += 1
                 if on_progress:
