@@ -1,6 +1,8 @@
 """生成编排：摘要 / 逐段生词表 / 句解（移植 GenService + VocabFilter + VocabNormalizer + Sentences）。"""
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import core_config as cfgmod
 from . import core_llm as llm
@@ -100,17 +102,21 @@ def lemma_forms(word: str):
         forms.append(w[:-3] + "y")
     if w.endswith("ed"):
         forms += [w[:-1], w[:-2]]
+        if len(w) > 4 and w[-3] == w[-4]:
+            forms.append(w[:-3])
         if w.endswith("ied"):
             forms.append(w[:-3] + "y")
     if w.endswith("ing"):
         forms += [w[:-3], w[:-3] + "e"]
+        if len(w) > 5 and w[-4] == w[-5]:
+            forms.append(w[:-4])
         if w.endswith("ying"):
             forms.append(w[:-4] + "ie")
     return list(dict.fromkeys(forms))
 
 
-def candidates(paragraph_texts, dict_set):
-    """疑似超纲候选词（原形小写，保持出现顺序，上限 50）。"""
+def candidates(paragraph_texts, dict_set, lexicon=None):
+    """本地排除已掌握词及其变形；词典原形优先，避免把 business 等词截坏。"""
     out = []
     seen = set()
     for text in paragraph_texts:
@@ -121,12 +127,13 @@ def candidates(paragraph_texts, dict_set):
             forms = lemma_forms(raw)
             if any(f in dict_set for f in forms):
                 continue
-            base = min(forms, key=len)
+            hit = (lexicon or {}).get(raw.lower()) or {}
+            base = hit.get("lemma") or hit.get("word") or raw.lower()
+            if base in dict_set or base in ALWAYS_KNOWN:
+                continue
             if base not in seen:
                 seen.add(base)
                 out.append(base)
-                if len(out) >= 50:
-                    return out
     return out
 
 
@@ -353,171 +360,205 @@ def _is_censor(text: str) -> bool:
     return any(k in t for k in keys)
 
 
-def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, llm_rotation=None):
-    """生成一篇文章的生词表：本地粗筛候选 → 分块 LLM 确认 → 规范化落盘。
+def _vocab_context(word, text, lexicon):
+    """从正文找词条的真实短语，省去模型重复抄写原文和段首。"""
+    text = re.sub(r"\s+", " ", text.replace("’", "'")).strip()
+    tokens = list(_TOKEN.finditer(text))
+    exact = re.search(r"(?<![A-Za-z])" + re.escape(word) + r"(?![A-Za-z])", text, re.IGNORECASE)
+    if exact:
+        start, end = exact.span()
+    else:
+        wanted = [m.group().lower() for m in _TOKEN.finditer(word)]
+        match = next((i for i in range(len(tokens) - len(wanted) + 1) if wanted and all(
+            w in lemma_forms(tokens[i + j].group().lower()) or
+            w == (lexicon.get(tokens[i + j].group().lower()) or {}).get("lemma")
+            for j, w in enumerate(wanted))), None)
+        if match is None:
+            return ""
+        start, end = tokens[match].start(), tokens[match + len(wanted) - 1].end()
+    first = next((i for i, m in enumerate(tokens) if m.end() > start), 0)
+    last = next((i for i, m in enumerate(tokens) if m.end() >= end), first)
+    return text[tokens[max(0, first - 3)].start():tokens[min(len(tokens) - 1, last + 3)].end()] if tokens else ""
 
-    支持续传与 LLM 轮换：已成功块自动跳过；失败块记录试用过的 LLM，
-    重试时自动轮换到「没用过的」配置；全部配置都失败的块才放弃
-    （不再重复烧 token）。"""
-    dict_set = cfgmod.wordset(level)
-    label = level_label(level)
 
+def _vocab_sections(obj, chunk, lexicon):
+    """展开紧凑结果；缺段/坏结构不得标成完成，兼容旧对象格式响应。"""
+    expected = dict(chunk)
+    sections = {}
+    rows = obj.get("paragraphs")
+    if not isinstance(rows, list):
+        raise GenError("生词表缺少 paragraphs 数组")
+    if -1 in expected and "titleEntries" in obj and not any(p.get("index") == -1 for p in rows if isinstance(p, dict)):
+        rows = rows + [{"index": -1, "entries": obj["titleEntries"]}]
+    for row in rows:
+        if not isinstance(row, dict):
+            raise GenError("生词表段落结构无效")
+        try:
+            idx = int(row["index"])
+        except (KeyError, TypeError, ValueError):
+            raise GenError("生词表缺少有效段落编号")
+        if idx not in expected or idx in sections or not isinstance(row.get("entries"), list):
+            raise GenError("生词表段落编号或词条结构无效")
+        entries, seen = [], set()
+        for raw in row["entries"]:
+            if isinstance(raw, list) and len(raw) == 6:
+                raw = dict(zip(("word", "pos", "sense", "root", "term", "phonetic"), raw))
+            if isinstance(raw, dict):
+                raw = {k: ("" if value is None and k in {"pos", "root", "phonetic", "inText"} else value)
+                       for k, value in raw.items()}
+            if not isinstance(raw, dict) or not all(isinstance(raw.get(k, ""), str)
+                                                  for k in ("word", "pos", "sense", "root", "phonetic", "inText")):
+                raise GenError("生词表词条结构无效")
+            if not raw.get("word", "").strip() or not raw.get("sense", "").strip():
+                raise GenError("生词表缺少词语或本文释义")
+            entry = _parse_entry(raw, seen)
+            if entry:
+                entry["inText"] = _vocab_context(entry["word"], expected[idx], lexicon)
+                if not entry["inText"]:
+                    raise GenError("生词表词条无法在对应段落定位：" + entry["word"])
+                entries.append(entry)
+        sections[idx] = {"index": idx, "startWords": expected[idx][:30], "entries": entries}
+    if set(sections) != set(expected):
+        raise GenError("生词表结果缺段，保留待补缺")
+    return sections
+
+
+def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, llm_rotation=None, max_workers=2):
+    """本地筛词/音标 + 紧凑语境释义；最多两个请求并行，主线程逐块落盘。"""
+    started = time.perf_counter()
     existing = store.load_vocab(meta["id"], article["index"], level) or {}
     processed = set(existing.get("processedParagraphs", []))
-    chunk_failures = dict(existing.get("chunkFailures", {}))
-    merged_sections = {p["index"]: p for p in existing.get("paragraphs", [])}
-    merged_title = list(existing.get("titleEntries", []))
-    merged_idioms = list(existing.get("idioms", []))
-    seen = set()
+    units = [(-1, article["title"]), *enumerate(article["paragraphs"])]
+    units = [(idx, text) for idx, text in units if idx not in processed]
+    if not units:
+        return vocab_normalize(existing, article)
 
-    # LLM 轮换序列：传入的默认配置优先，其余配置按设置顺序跟上
+    from . import core_dict
+    cfgmod.ensure_wordlists()
+    dict_set = cfgmod.wordset(level)
+    core_dict.ensure_db(background=False)
+    words = [m.group().lower() for _, text in units for m in _TOKEN.finditer(text.replace("’", "'"))]
+    lexicon = core_dict.lookup_many(words)
+    bases = [hit["lemma"] for hit in lexicon.values() if hit.get("lemma")]
+    lexicon.update(core_dict.lookup_many(bases))
+    cand = {idx: candidates([text.replace("’", "'")], dict_set, lexicon) for idx, text in units}
+
     rotation = [dict(cfg)]
     for p in llm_rotation or []:
         if all(p.get("name") != r.get("name") for r in rotation):
             rotation.append(dict(p))
+    chunk_failures = {k: list(v) for k, v in existing.get("chunkFailures", {}).items()}
+    tried_by_index = {}
+    for key, names in chunk_failures.items():
+        for idx in map(int, key.split(",")):
+            tried_by_index.setdefault(idx, set()).update(names)
 
-    units = [(-1, article["title"])]
-    for i, p in enumerate(article["paragraphs"]):
-        units.append((i, p))
-
-    cand = {}
-    if dict_set:
-        for idx, text in units:
-            cand[idx] = [] if idx == -1 else candidates([text], dict_set)
-
-    chunks = []
-    current = []
-    chars = 0
+    chunks, current, chars = [], [], 0
     for idx, text in units:
-        if idx == -1:
-            chunks.append([(-1, text)])
-            continue
-        if chars + len(text) > 4500 and current:
+        # 标题随首个正文块处理，不再为标题单独发请求。
+        if chars + len(text) > 4500 and current and any(i >= 0 for i, _ in current):
             chunks.append(current)
-            current = []
-            chars = 0
+            current, chars = [], 0
         current.append((idx, text))
         chars += len(text)
     if current:
         chunks.append(current)
 
-    def chunk_key(chunk):
-        return ",".join(str(idx) for idx, _ in sorted(chunk))
-
-    # 续传：块内所有单元都已处理过则跳过
-    def chunk_done(chunk):
-        return all(idx in processed for idx, _ in chunk)
-
-    # 待处理块及其「未试用过」的 LLM 序列；全部 LLM 都试过的块直接放弃
     pending = []
     for chunk in chunks:
-        if chunk_done(chunk):
-            continue
-        key = chunk_key(chunk)
-        tried = set(chunk_failures.get(key, []))
-        llms = [c for c in rotation if c.get("name") not in tried]
-        pending.append((chunk, llms))
-    pending = [(c, ls) for c, ls in pending if ls]
+        tried = set.intersection(*(tried_by_index.get(idx, set()) for idx, _ in chunk))
+        pending.append((chunk, [c for c in rotation if c.get("name") not in tried]))
 
-    total_units = sum(max(1, len(ls)) for _, ls in pending)
-    done_units = 0
-    failed_chunks = 0
+    merged_sections = {p["index"]: p for p in existing.get("paragraphs", [])}
+    merged_title = list(existing.get("titleEntries", []))
+    merged_idioms = list(existing.get("idioms", []))
+    completed = failed_chunks = 0
     censor_hit = False
+    lock = threading.Lock()
+    received = {}
+    stats = {"chunks": len(chunks), "requests": 0, "inputChars": 0, "outputChars": 0,
+             "workers": min(max(1, max_workers), 2, len(chunks))}
+    system = prompts.vocab_system(level_label(level))
 
-    for chunk, llms_to_try in pending:
-        key = chunk_key(chunk)
-        chunk_ok = False
-        for lcfg in llms_to_try:
-            lname = lcfg.get("name", "?")
-            if on_progress:
-                on_progress(done_units, total_units, lname)
-            if on_chars:
-                on_chars(0)
-            user = prompts.vocab_user(article["title"], -1, chunk, cand)
-            obj = None
+    def run_chunk(chunk, configs):
+        key = ",".join(str(idx) for idx, _ in chunk)
+        local_words = {w for idx, _ in chunk for w in cand[idx] if (lexicon.get(w) or {}).get("phonetic")}
+        user = prompts.vocab_user(article["title"], -1, chunk, cand, local_words)
+        candidate_count = sum(len(cand[idx]) for idx, _ in chunk)
+        budget = min(8192, max(2048, 512 + candidate_count * 110))
+        failures, censor = [], False
+
+        def chars_received(n):
+            with lock:
+                received[key] = max(received.get(key, 0), n)
+                if on_chars:
+                    on_chars(sum(received.values()))
+
+        for config in configs:
+            name = config.get("name", "?")
+            with lock:
+                stats["requests"] += 1
+                stats["inputChars"] += len(system) + len(user)
+                if on_progress:
+                    on_progress(completed, len(chunks), name)
             try:
-                raw = llm.chat(lcfg, prompts.vocab_system(label), user, max_tokens=16000, on_delta=on_chars)
-                obj = _parse_json(raw, want_array=False)
-            except Exception as e:
-                msg = str(e)
-                chunk_failures.setdefault(key, []).append(lname)
-                if _is_censor(msg):
-                    censor_hit = True
-                done_units += 1
-                continue
+                raw = llm.chat(config, system, user, max_tokens=budget, on_delta=chars_received, require_complete=True)
+                with lock:
+                    stats["outputChars"] += len(raw)
+                result = _vocab_sections(_parse_json(raw, want_array=False), chunk, lexicon)
+                return key, result, failures, censor
+            except Exception as error:
+                failures.append(name)
+                censor |= _is_censor(str(error))
+        return key, None, failures, censor
 
-            for p in obj.get("paragraphs", []):
-                if not isinstance(p, dict):
-                    continue
-                try:
-                    idx = int(p.get("index"))
-                except Exception:
-                    continue
-                entries = [_parse_entry(e, seen) for e in p.get("entries", [])]
-                entries = [e for e in entries if e]
-                if idx < 0:
-                    by_word = {x["word"]: x for x in merged_title}
-                    for e in entries:
-                        by_word[e["word"]] = e
-                    merged_title = list(by_word.values())
-                    continue
-                start_words = (p.get("startWords") or "").strip() or (
-                    article["paragraphs"][idx][:30] if 0 <= idx < len(article["paragraphs"]) else ""
-                )
-                merged_sections[idx] = {"index": idx, "startWords": start_words, "entries": entries}
-            for e in obj.get("titleEntries", []):
-                entry = _parse_entry(e, seen)
-                if entry:
-                    by_word = {x["word"]: x for x in merged_title}
-                    by_word[entry["word"]] = entry
-                    merged_title = list(by_word.values())
-            for io in obj.get("idioms", []):
-                if isinstance(io, dict) and (io.get("word") or "").strip():
-                    merged_idioms.append(
-                        {"word": io["word"], "common": io.get("common", ""), "inText": io.get("inText", "")}
-                    )
-            chunk_ok = True
-            done_units += 1
-            break  # 本块成功，无需轮换
-
-        if chunk_ok:
-            processed.update(idx for idx, _ in chunk)
-        else:
-            failed_chunks += 1
-
-        draft = {
-            "level": level,
-            "articleIndex": article["index"],
-            "titleEntries": merged_title,
-            "paragraphs": sorted(merged_sections.values(), key=lambda x: x["index"]),
-            "idioms": merged_idioms,
-            "processedParagraphs": sorted(processed),
-            "chunkFailures": chunk_failures,
-        }
+    def save():
+        draft = {"level": level, "articleIndex": article["index"], "titleEntries": merged_title,
+                 "paragraphs": sorted(merged_sections.values(), key=lambda p: p["index"]),
+                 "idioms": list({i["word"].lower(): i for i in merged_idioms}.values()),
+                 "processedParagraphs": sorted(processed), "chunkFailures": chunk_failures,
+                 "failedChunks": failed_chunks, "censorHint": censor_hit,
+                 "generationStats": dict(stats, elapsedMs=round((time.perf_counter() - started) * 1000))}
         result = vocab_normalize(draft, article)
-        all_entries = [e for p in result.get("paragraphs", []) for e in p.get("entries", [])]
-        all_entries += result.get("titleEntries", [])
-        backfill_phonetics(all_entries)
         store.save_vocab(meta["id"], result)
+        return result
 
-    draft = {
-        "level": level,
-        "articleIndex": article["index"],
-        "titleEntries": merged_title,
-        "paragraphs": sorted(merged_sections.values(), key=lambda x: x["index"]),
-        "idioms": list({i["word"].lower(): i for i in merged_idioms}.values()),
-        "processedParagraphs": sorted(processed),
-        "chunkFailures": chunk_failures,
-    }
-    if failed_chunks:
-        draft["failedChunks"] = failed_chunks
-        draft["censorHint"] = censor_hit
-    result = vocab_normalize(draft, article)
-    all_entries = [e for p in result.get("paragraphs", []) for e in p.get("entries", [])]
-    all_entries += result.get("titleEntries", [])
-    backfill_phonetics(all_entries)
-    store.save_vocab(meta["id"], result)
-    return result
+    if on_chars:
+        on_chars(0)
+    with ThreadPoolExecutor(max_workers=stats["workers"]) as pool:
+        futures = [pool.submit(run_chunk, chunk, configs) for chunk, configs in pending]
+        for future in as_completed(futures):
+            key, sections, failures, censor = future.result()
+            censor_hit |= censor
+            if failures:
+                chunk_failures[key] = list(dict.fromkeys(chunk_failures.get(key, []) + failures))
+            if sections is not None:
+                entries = [e for section in sections.values() for e in section["entries"]]
+                # 原形/音标查询用一条 SQLite 连接，本地数据优先，未收录词保留模型音标。
+                phonetics = core_dict.lookup_many([e["word"] for e in entries])
+                for entry in entries:
+                    if (phonetics.get(entry["word"]) or {}).get("phonetic"):
+                        entry["phonetic"] = phonetics[entry["word"]]["phonetic"]
+                    sense = entry["sense"]
+                    if sense.startswith("常见义") and "；本文义" in sense:
+                        common, contextual = sense[len("常见义"):].split("；本文义", 1)
+                        merged_idioms.append({"word": entry["word"], "common": common, "inText": contextual})
+                for idx, section in sections.items():
+                    if idx == -1:
+                        merged_title = section["entries"]
+                    else:
+                        merged_sections[idx] = section
+                processed.update(sections)
+                chunk_failures = {k: v for k, v in chunk_failures.items()
+                                  if not all(int(i) in processed for i in k.split(","))}
+            else:
+                failed_chunks += 1
+            with lock:
+                completed += 1
+                if on_progress:
+                    on_progress(completed, len(chunks), None)
+            save()
+    return save()
 
 
 def _parse_entry(el, seen):
@@ -552,8 +593,9 @@ def backfill_phonetics(entries):
         core_dict.ensure_db(background=False)
         if not core_dict.STATE.get("ready"):
             return False
+        records = core_dict.lookup_many([e.get("word", "") for e in missing])
         for e in missing:
-            r = core_dict.lookup(e.get("word", ""))
+            r = records.get(e.get("word", "").strip().lower())
             if r and (r.get("phonetic") or "").strip():
                 e["phonetic"] = r["phonetic"]
                 changed = True

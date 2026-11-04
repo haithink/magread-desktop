@@ -2,6 +2,7 @@
 推理模型额度自适应重试，cc-switch JSON 粘贴识别（移植 Android 版 LlmClient）。"""
 import json
 import re
+import time
 
 import requests
 
@@ -82,12 +83,24 @@ def _str(v):
 
 
 class _StreamState:
-    __slots__ = ("parts", "saw_reasoning", "length_cut")
+    __slots__ = ("parts", "saw_reasoning", "length_cut", "saw_response", "chars", "on_delta", "reported_at")
 
-    def __init__(self):
+    def __init__(self, on_delta=None):
         self.parts = []
         self.saw_reasoning = False
         self.length_cut = False
+        self.saw_response = False
+        self.chars = 0
+        self.on_delta = on_delta
+        self.reported_at = 0
+
+    def append(self, text):
+        self.parts.append(text)
+        self.chars += len(text)
+        now = time.monotonic()
+        if self.on_delta and now - self.reported_at >= 0.1:
+            self.on_delta(self.chars)
+            self.reported_at = now
 
     @property
     def text(self):
@@ -105,7 +118,20 @@ def _stream_once(cfg, system, user, max_tokens, temperature, state):
     ) as resp:
         if resp.status_code != 200:
             raise LlmError(f"HTTP {resp.status_code}（{endpoint(cfg)}）：{_first_line(resp.text)}")
-        for raw in resp.iter_lines(chunk_size=1):
+        if "json" in resp.headers.get("Content-Type", "").lower():
+            # 部分网关忽略 stream:true；直接使用本次 JSON，避免白等后再发一遍。
+            resp.encoding = "utf-8"
+            body = resp.text
+            state.saw_response = True
+            state.length_cut = _looks_truncated(body)
+            content = _parse_content(cfg, body)
+            if content:
+                state.append(content)
+            elif "reasoning_content" in body:
+                state.saw_reasoning = True
+            return
+        unframed = []
+        for raw in resp.iter_lines(chunk_size=1024):
             if isinstance(raw, bytes):
                 # 网关可能不标 charset，requests 默认按 latin-1 解码会产出 mojibake
                 line = raw.decode("utf-8", errors="replace")
@@ -114,6 +140,8 @@ def _stream_once(cfg, system, user, max_tokens, temperature, state):
             if not line or line.startswith(":"):
                 continue
             if not line.startswith("data:"):
+                if not state.saw_response:
+                    unframed.append(line)
                 continue
             data = line[5:].strip()
             if data == "[DONE]":
@@ -122,12 +150,13 @@ def _stream_once(cfg, system, user, max_tokens, temperature, state):
                 obj = json.loads(data)
             except Exception:
                 continue
+            state.saw_response = True
             if cfg.get("provider") == "anthropic":
                 t = obj.get("type")
                 if t == "content_block_delta":
                     txt = (obj.get("delta") or {}).get("text")
                     if txt:
-                        state.parts.append(txt)
+                        state.append(txt)
                 elif t == "message_delta":
                     if (obj.get("delta") or {}).get("stop_reason") == "max_tokens":
                         state.length_cut = True
@@ -140,11 +169,25 @@ def _stream_once(cfg, system, user, max_tokens, temperature, state):
                     delta = ch.get("delta") or {}
                     c = delta.get("content")
                     if c:
-                        state.parts.append(c)
+                        state.append(c)
                     if "reasoning_content" in delta:
                         state.saw_reasoning = True
                     if ch.get("finish_reason") == "length":
                         state.length_cut = True
+        if not state.saw_response and unframed:
+            # 兼容不带 Content-Type 的普通 JSON 响应。
+            body = "\n".join(unframed)
+            try:
+                json.loads(body)
+            except ValueError:
+                return
+            state.saw_response = True
+            state.length_cut = _looks_truncated(body)
+            content = _parse_content(cfg, body)
+            if content:
+                state.append(content)
+            elif "reasoning_content" in body:
+                state.saw_reasoning = True
 
 
 def _parse_content(cfg, body: str):
@@ -186,11 +229,12 @@ def _strip_think(text: str) -> str:
 
 
 def _looks_truncated(body: str) -> bool:
-    return (
-        "reasoning_content" in body
-        or '"finish_reason":"length"' in body
-        or '"finish_reason": "length"' in body
-    )
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(obj, dict) and (obj.get("stop_reason") == "max_tokens" or any(
+        ch.get("finish_reason") == "length" for ch in (obj.get("choices") or []) if isinstance(ch, dict)))
 
 
 def _is_budget_reject(text: str) -> bool:
@@ -202,30 +246,30 @@ def _is_budget_reject(text: str) -> bool:
     return any(k in t for k in keys)
 
 
-def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None) -> str:
+def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None, require_complete=False) -> str:
     """发一次对话。流式优先。自适应：
     - 推理模型烧额度/被 length 截断 → 额度加倍重试（上限 32768）
-    - 网关拒绝 max_tokens（超限）→ 额度减半重试（下限 4096）"""
+    - 网关拒绝 max_tokens（超限）→ 额度减半重试（下限 256）"""
     if not is_complete(cfg):
         raise LlmError("大模型配置不完整，请先在设置中填写 URL / API Key / 模型名")
 
     budget = max_tokens
     last_err = ""
     for attempt in range(4):
-        state = _StreamState()
+        state = _StreamState(on_delta)
         stream_err = None
         try:
             _stream_once(cfg, system, user, budget, temperature, state)
         except LlmError as e:
             if _is_budget_reject(str(e)) and attempt < 3:
-                budget = max(4096, budget // 2)
+                budget = max(256, budget // 2)
                 continue
             raise
         except Exception as e:  # 流式不被支持/网络错误 → 退回非流式
             stream_err = e
 
         content = state.text.strip()
-        if not content:
+        if not content and not state.saw_response:
             # 流式失败、或网关无视 stream:true 直接回普通 JSON（200 但无 data: 行）→ 退回非流式
             try:
                 resp = requests.post(
@@ -239,7 +283,7 @@ def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None) -> 
             if resp.status_code != 200:
                 err_text = f"HTTP {resp.status_code}（{endpoint(cfg)}）：{_first_line(resp.text)}"
                 if _is_budget_reject(resp.text) and attempt < 3:
-                    budget = max(4096, budget // 2)
+                    budget = max(256, budget // 2)
                     continue
                 raise LlmError(err_text)
             resp.encoding = "utf-8"
@@ -248,7 +292,7 @@ def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None) -> 
                 state.length_cut = True
 
         if on_delta:
-            on_delta(len(state.text))
+            on_delta(len(content))
 
         if content and not state.length_cut:
             return _strip_think(content)
@@ -260,6 +304,8 @@ def chat(cfg, system, user, max_tokens=4000, temperature=0.3, on_delta=None) -> 
             continue
         if content:
             # 重试后仍截断：返回截断文本，上层 JSON 修补兜底
+            if require_complete:
+                raise LlmError("模型输出仍被长度截断，保留此块待补缺，请换模型重试")
             return _strip_think(content)
         last_err = "reasoning" if burned else f"{stream_err}"
         raise LlmError(

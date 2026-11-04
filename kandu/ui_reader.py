@@ -102,6 +102,7 @@ class ReaderFrame(tk.Frame):
 
     # ---------- 数据加载 ----------
     def _load_worker(self):
+        core_dict.prewarm()
         content = store.ensure_content(self.meta)
         self.app.emit("content_loaded", (content, self.article_index))
 
@@ -255,7 +256,7 @@ class ReaderFrame(tk.Frame):
 
     def on_vocab_progress(self, p):
         llm = p.get("llm")
-        self.status.config(text=f"生词表生成中… 第 {p['done']}/{p['total']} 块"
+        self.status.config(text=f"生词表生成中… 已完成 {p['done']}/{p['total']} 块"
                                 + (f" · {llm}" if llm else ""))
 
     def on_vocab_chars(self, n):
@@ -273,7 +274,9 @@ class ReaderFrame(tk.Frame):
         if failed:
             self.status.config(text=f"生词表部分完成：{failed} 块失败{hint}。点「补缺生词表」自动轮换其他 LLM 重试")
         else:
-            self.status.config(text=f"生词表完成（{self._total_words()} 词，已缓存）")
+            elapsed = (vocab.get("generationStats") or {}).get("elapsedMs")
+            timing = f"，{elapsed / 1000:.1f} 秒" if elapsed is not None else ""
+            self.status.config(text=f"生词表完成（{self._total_words()} 词{timing}，已缓存）")
         self._show_full_vocab()
 
     def on_vocab_error(self, msg):

@@ -26,40 +26,30 @@ def digest_user(book_name: str, items) -> str:
 
 def vocab_system(level_label: str) -> str:
     return (
-        "你是英语外刊精读助教。学生的词汇量基准是「" + level_label + "」："
-        "四级及更常用的词一律不算生词，不要收录；只收录超纲词、专业术语、熟词僻义（常见词的非常用义项）。"
-        "专有名词（人名/地名/机构名）不收录。缩略语如 IMF、NATO 收录为术语。"
-        "每个词条给出：word（原形，小写）、phonetic（美式音标，没有把握就留空串）、"
-        "pos（词性，如 n. / v. / adj.）、sense（中文释义，取「本文语境下的义项」，不超过 25 字；"
-        "熟词僻义须写明「常见义 X；本文义 Y」）、inText（该词在原文中出现的短语，含前后 2～4 个词，不超过 40 字符）、"
-        "root（词根词缀拆解或词源线索，如「im- 不 + penetr 穿入 + -able」，不超过 40 字；没有词根故事的给空串，不强加）、"
-        "term（是否术语，布尔）。务必控制总输出长度，宁可精简也不要截断。"
-        "只输出 JSON 对象，格式："
-        '{"paragraphs":[{"index":段落编号,"startWords":"该段开头前几个单词","entries":[{...}]}],'
-        '"titleEntries":[标题生词，格式同 entries],'
-        '"idioms":[{"word":"熟词僻义词","common":"常见义","inText":"本文义"}]}'
-        "没有生词的段落也要有对应元素，entries 为空数组。不要输出 JSON 以外的任何文字，不要展示思考过程。"
+        "你是英语外刊精读助教。学生已掌握「" + level_label + "」。"
+        "本地已按词表筛出候选词。请排除人名、地名、机构名和常用词，"
+        "保留超纲词与术语（含缩略语），并结合正文补充漏掉的词组和熟词僻义。"
+        "每段独立收词，同词在不同段落可重复；只输出本次给出的段落，编号原样保留，-1 为标题。"
+        '只输出紧凑 JSON：{"paragraphs":[{"index":0,"entries":'
+        '[["原形小写","词性","本文中文义项","词根词源",false,"音标"]]}]}。'
+        "词条数组固定为以上六列，术语列为布尔值。释义≤25字，熟词僻义写「常见义X；本文义Y」；"
+        "词根词源≤25字，无可靠依据留空。已提供本地音标的词，音标列填空串；"
+        "其他词尽量给美式音标。无生词的段落返回空 entries。"
+        "不输出 startWords、inText、titleEntries、idioms 或额外解释，这些由本地程序处理。不要展示思考过程。"
     )
 
 
-def vocab_user(title: str, title_index: int, units, candidates) -> str:
-    """units: [(index, text)]; candidates: {index: [words]}"""
-    out = [f"以下是文章《{title[:80]}》的标题和逐段文本。段落编号是全文统一编号。"]
-    out.append("输出 JSON 里 paragraphs 的 index 必须原样使用我给出的段落编号，绝不要自行重新计数。")
-    out.append("startWords 直接摘取该段开头的连续几个单词。")
-    out.append("")
-    out.append(f"### 标题（段落编号 {title_index}）")
-    out.append(title)
+def vocab_user(title: str, title_index: int, units, candidates, local_phonetics=()) -> str:
+    """只附本块候选词；正文保留全文，供判断熟词僻义与语境。"""
+    out = [f"文章标题：{title[:80]}。以下为本次待处理段落（-1 表示标题）："]
     for index, text in units:
         out.append("")
         out.append(f"### 段落 {index}")
-        out.append(text[:3500])
-    out.append("")
-    out.append("提示：以下是我按四级词表初步筛出的候选超纲词，供参考；请自行判断增删（尤其注意熟词僻义不在此列）：")
-    for index, words in candidates.items():
-        if not words:
-            continue
-        out.append(f"段落 {index}：{', '.join(words)}")
+        out.append(text)
+        words = candidates.get(index, [])
+        out.append("本地候选：" + (", ".join(words) if words else "无；仍需检查熟词僻义和词组"))
+    if local_phonetics:
+        out.append("这些词已有本地音标，勿重复生成：" + ", ".join(sorted(local_phonetics)))
     return "\n".join(out)
 
 

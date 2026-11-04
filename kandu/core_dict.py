@@ -98,23 +98,38 @@ def _query_one(con, word: str):
 
 def lookup(word: str):
     """查词：原形优先，其次常见变形。未就绪返回 None；未收录返回 {'word':…, 'miss': True}。"""
-    w = (word or "").strip().lower()
-    if not w:
-        return None
+    hit = lookup_many([word]).get((word or "").strip().lower())
+    if hit and not hit.get("miss"):
+        hit["lookedUp"] = word
+    return hit
+
+
+def lookup_many(words):
+    """一次连接批量查词，附带 ECDICT 的原形（exchange 中的 0 字段）。"""
     if not STATE["ready"]:
-        return None
+        return {}
+    words = list(dict.fromkeys(w.strip().lower() for w in words if w and w.strip()))
+    if not words:
+        return {}
     con = sqlite3.connect(str(_db_path()))
     try:
-        tried = []
-        for form in [w] + [f for f in lemma_forms(w) if f != w]:
-            if form in tried:
-                continue
-            tried.append(form)
-            hit = _query_one(con, form)
-            if hit:
-                hit["lookedUp"] = word
-                return hit
-        return {"word": word, "miss": True}
+        queried = {}
+        out = {}
+        for word in words:
+            for form in lemma_forms(word):
+                if form not in queried:
+                    queried[form] = _query_one(con, form)
+                hit = queried[form]
+                if hit:
+                    hit = dict(hit, lookedUp=word)
+                    lemma = next((v[2:] for v in (hit.get("exchange") or "").split("/")
+                                  if v.startswith("0:")), hit["word"])
+                    hit["lemma"] = lemma
+                    out[word] = hit
+                    break
+            else:
+                out[word] = {"word": word, "miss": True}
+        return out
     finally:
         con.close()
 
