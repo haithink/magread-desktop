@@ -516,6 +516,74 @@ def test_vocab_sheet_scroll():
         app.destroy()
 
 
+@case("阅读弹窗首次与重复打开均可切回正文")
+def test_reader_sheet_activation():
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_reader import ReaderFrame
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetWindow.restype = wintypes.HWND
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+
+    def hwnd(widget):
+        return user32.GetAncestor(widget.winfo_id(), 2)  # GA_ROOT：Tk 外层原生窗口
+
+    def above(front, back):
+        handle = hwnd(front)
+        while handle:
+            if handle == hwnd(back):
+                return True
+            handle = user32.GetWindow(handle, 2)  # GW_HWNDNEXT：从前往后检查堆叠
+        return False
+
+    root = tk.Tk()
+    root.geometry("800x600+40+40")
+    holder = tk.Frame(root)
+    holder.app = SimpleNamespace(settings={"sheetFontSize": 11}, save_settings=lambda: None)
+    body = tk.Text(root)
+    body.pack(fill="both", expand=True)
+    def pump():
+        for _ in range(10):
+            root.update()
+            time.sleep(.02)
+
+    try:
+        pump()
+        root.focus_force()
+        pump()
+        for attempt in range(3):
+            win, txt, _ = ReaderFrame._make_sheet(holder, "段落生词", "窗口切换测试")
+            win.geometry("560x440+160+110")
+            try:
+                pump()
+                assert user32.GetForegroundWindow() == hwnd(win), f"第 {attempt + 1} 次打开后弹窗未激活"
+                assert root.focus_get() == txt, "新弹窗应接收焦点，避免正文保持活动状态"
+                assert root.grab_current() is None and not win.transient()
+                assert not win.attributes("-topmost"), "阅读弹窗不能强制置顶"
+                assert above(win, root), "打开时弹窗应显示在正文前方"
+                # 使用 Windows 原生激活验证切换，避免移动用户鼠标导致桌面输入竞争。
+                assert user32.SetForegroundWindow(hwnd(root)), "无法激活正文窗口"
+                pump()
+                assert user32.GetForegroundWindow() == hwnd(root)
+                assert above(root, win), "点击正文后，生词窗口仍挡在正文前方"
+                assert win.winfo_ismapped(), "切回正文应保留弹窗，允许再次查看"
+            finally:
+                win.destroy()
+                pump()
+    finally:
+        root.destroy()
+
+
 @case("文章标记独立保存、缓存清理与写入失败")
 def test_article_states():
     bid = "T_STATES"

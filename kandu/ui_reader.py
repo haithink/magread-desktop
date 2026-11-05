@@ -670,6 +670,15 @@ class ReaderFrame(tk.Frame):
         txt.grid(row=0, column=0, sticky="nsew")
         vbar.grid(row=0, column=1, sticky="ns")
         _config_tags(txt, size)
+
+        def activate_on_map(event):
+            if event.widget is win:
+                win.unbind("<Map>", map_binding)
+                # Windows 首次显示可能只抬高窗口而未激活，正文仍为活动窗口时，
+                # 点击正文不会改变堆叠。映射后正常转移焦点，保持非模态切换。
+                win.after_idle(txt.focus_set)
+
+        map_binding = win.bind("<Map>", activate_on_map, add="+")
         return win, txt, bar
 
 
