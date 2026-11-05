@@ -412,24 +412,74 @@ def set_article_state(book_id: str, article_index: int, state: str) -> dict:
         raise ValueError(f"未知阅读状态：{state}")
     if type(article_index) is not int or article_index < 0:
         raise ValueError("文章索引必须是非负整数")
+    states = load_article_states(book_id)
+    states[str(article_index)] = state
+    _atomic_json_write(_article_states_file(book_id), states)
+    return states
+
+
+def _atomic_json_write(target: Path, data):
     import os
     import tempfile
 
-    states = load_article_states(book_id)
-    states[str(article_index)] = state
-    target = _article_states_file(book_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".tmp",
                                          dir=target.parent, delete=False) as f:
             temp_path = Path(f.name)
-            json.dump(states, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(temp_path, target)
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
-    return states
+
+
+def _reading_history_file(book_id: str) -> Path:
+    return cfgmod.app_dir() / "reading_history" / f"{sanitize_id(book_id)}.json"
+
+
+def _reading_record(data):
+    """只接受可恢复的阅读位置，损坏的单条记录不影响其他文章。"""
+    import math
+
+    if not isinstance(data, dict) or not isinstance(data.get("title"), str) or not data["title"]:
+        return None
+    numeric = ("paragraphIndex", "paragraphOffset", "paragraphCount", "wordCount", "lastReadAt")
+    if any(type(data.get(k)) is not int or data[k] < 0 for k in numeric):
+        return None
+    progress = data.get("progress")
+    if type(progress) not in (int, float) or not math.isfinite(progress) or not 0 <= progress <= 1:
+        return None
+    if any(not isinstance(data.get(k, ""), str) for k in ("titleZh", "paragraphStart")):
+        return None
+    return {**{k: data[k] for k in numeric}, "title": data["title"],
+            "titleZh": data.get("titleZh", ""), "paragraphStart": data.get("paragraphStart", ""),
+            "progress": progress, "atStart": data.get("atStart") is True,
+            "atEnd": data.get("atEnd") is True}
+
+
+def load_reading_history(book_id: str) -> dict:
+    """阅读历史与位置独立于内容缓存和手动已读标记。"""
+    data = _json_read(_reading_history_file(book_id))
+    if not isinstance(data, dict):
+        return {}
+    return {key: record for key, value in data.items()
+            if key.isdecimal() and (record := _reading_record(value)) is not None}
+
+
+def save_reading_progress(book_id: str, article_index: int, progress: dict) -> dict:
+    import time
+
+    if type(article_index) is not int or article_index < 0:
+        raise ValueError("文章索引必须是非负整数")
+    record = _reading_record(dict(progress, lastReadAt=int(time.time() * 1000)))
+    if record is None:
+        raise ValueError("阅读位置无效")
+    history = load_reading_history(book_id)
+    history[str(article_index)] = record
+    _atomic_json_write(_reading_history_file(book_id), history)
+    return record
 
 
 def has_digest(book_id: str) -> bool:
@@ -537,6 +587,7 @@ def remove_book(book_id: str):
         f.unlink(missing_ok=True)
     purge_book_cache(book_id)
     _article_states_file(book_id).unlink(missing_ok=True)
+    _reading_history_file(book_id).unlink(missing_ok=True)
 
 
 def get_book(book_id: str):

@@ -264,7 +264,7 @@ class LibraryFrame(tk.Frame):
         if not messagebox.askyesno(
                 "移出书库",
                 f"将「{meta['fileName']}」移出书库？\n\n"
-                "会删除：书库中的文件副本、摘要、生词表与句解缓存、阅读标记。\n"
+                "会删除：书库中的文件副本、摘要、生词表与句解缓存、阅读标记和阅读位置。\n"
                 "不影响你磁盘上其他位置的文件。",
                 parent=self):
             return

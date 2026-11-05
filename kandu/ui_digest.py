@@ -37,6 +37,9 @@ class DigestFrame(tk.Frame):
         self._viewport_after = None
         self._heights_after = None
         self._states = store.load_article_states(meta["id"])
+        self._reading_history = store.load_reading_history(meta["id"])
+        self._recent_signature = None
+        self.recent_buttons = {}
         self._search_after = None
         self._restore_after = None
         if not hasattr(app, "_digest_views"):
@@ -76,7 +79,10 @@ class DigestFrame(tk.Frame):
         tk.Label(heading, text="先浏览，再选一篇慢慢读。阅读状态由你手动标记，自动保存。",
                  bg=PAPER, fg=MUTED, font=(FAMILY, 10), anchor="w").pack(fill="x", pady=(4, 0))
 
+        self.recent_section = tk.Frame(self, bg="#e9f0e5", padx=16, pady=10,
+                                        highlightthickness=1, highlightbackground="#dce5d5")
         controls = tk.Frame(self, bg=PAPER, padx=32)
+        self._controls = controls
         controls.pack(fill="x")
         controls.columnconfigure(0, weight=1)
         filters = tk.Frame(controls, bg=PAPER)
@@ -122,6 +128,7 @@ class DigestFrame(tk.Frame):
 
         digest = store.load_digest(meta["id"])
         if digest is None:
+            self._render_recent()
             self._render()
             self.generate()
         else:
@@ -246,6 +253,51 @@ class DigestFrame(tk.Frame):
     def _open(self, index):
         self._remember_view()
         self.app.open_reader(self.meta, index)
+
+    def _render_recent(self):
+        """固定在筛选列表上方，最近文章不受搜索和手动阅读状态影响。"""
+        articles = {a["index"]: a for a in self._articles}
+        recent = sorted(((int(key), record) for key, record in self._reading_history.items()
+                         if not articles or int(key) in articles),
+                        key=lambda item: item[1]["lastReadAt"], reverse=True)[:3]
+        signature = [(index, record, self._article_signature(articles.get(index, {})))
+                     for index, record in recent]
+        if signature == self._recent_signature:
+            return
+        self._recent_signature = signature
+        for child in self.recent_section.winfo_children():
+            child.destroy()
+        self.recent_buttons = {}
+        if not recent:
+            self.recent_section.pack_forget()
+            return
+        self.recent_section.pack(fill="x", padx=32, pady=(0, 14), before=self._controls)
+        heading = tk.Frame(self.recent_section, bg="#e9f0e5")
+        heading.pack(fill="x", pady=(0, 5))
+        tk.Label(heading, text="最近阅读", bg="#e9f0e5", fg=GREEN,
+                 font=(FAMILY, 10, "bold")).pack(side="left")
+        tk.Label(heading, text="自动记住阅读位置", bg="#e9f0e5", fg=MUTED,
+                 font=(FAMILY, 9)).pack(side="right")
+        for rank, (index, record) in enumerate(recent):
+            article = articles.get(index, {})
+            title = article.get("titleZh") or record.get("titleZh") or article.get("titleEn") or record["title"]
+            row = tk.Frame(self.recent_section, bg="#e9f0e5")
+            row.pack(fill="x", pady=2)
+            row.columnconfigure(0, weight=1)
+            label = tk.Label(row, text=title, bg="#e9f0e5", fg=INK, anchor="w", width=1,
+                             font=(FAMILY, 10, "bold" if rank == 0 else "normal"), cursor="hand2")
+            label.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+            label.bind("<Button-1>", lambda e, i=index: self._open(i))
+            count = record["paragraphCount"]
+            location = (f"第 {min(record['paragraphIndex'] + 1, count)} / {count} 段 · {round(record['progress'] * 100)}%"
+                        if count and not record["atStart"] else "文章开头")
+            tk.Label(row, text=location, bg="#e9f0e5", fg=MUTED,
+                     font=(FAMILY, 9)).grid(row=0, column=1, padx=(0, 12))
+            button = self._button(row, "继续阅读 →", lambda i=index: self._open(i),
+                                  bg=GREEN if rank == 0 else "#dce7d7", fg="white" if rank == 0 else GREEN,
+                                  padx=10, pady=4)
+            button.grid(row=0, column=2)
+            self.recent_buttons[index] = button
 
     def _state(self, index):
         return self._states.get(str(index), "unread")
@@ -393,6 +445,7 @@ class DigestFrame(tk.Frame):
     # ---- 渲染 ----
     def _fill(self, digest):
         self._articles = digest["articles"]
+        self._render_recent()
         signatures = {a["index"]: self._article_signature(a) for a in self._articles}
         # 摘要生成后只替换内容改变或已删除的卡片，筛选/搜索不使缓存失效。
         for index, card in list(self._card_cache.items()):

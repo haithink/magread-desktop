@@ -65,6 +65,14 @@ class ReaderFrame(tk.Frame):
         self._sheets = {}
         self.article_digest = {}
         self._progress_fraction = 0
+        self._article_word_count = 0
+        self._paragraph_char_offsets = []
+        self._body_char_count = 0
+        self._position_ready = False
+        self._position_after = None
+        self._restore_position_after = None
+        self._saved_position = None
+        self._resume_position = None
 
         bar = tk.Frame(self, bg=GREEN, padx=20, pady=12)
         bar.pack(fill="x")
@@ -105,11 +113,13 @@ class ReaderFrame(tk.Frame):
         self.status = tk.Label(footer, text="正文加载中…", bg=PAPER, fg=MUTED,
                                anchor="w", justify="left", font=(FAMILY, 9), wraplength=700)
         self.status.grid(row=0, column=0, sticky="ew")
+        self.word_count_label = tk.Label(footer, text="全文 — 词", bg=PAPER, fg=MUTED, font=(FAMILY, 9))
+        self.word_count_label.grid(row=0, column=1, padx=(12, 16))
         self.progress_label = tk.Label(footer, text="阅读进度  0%", bg=PAPER, fg=GREEN, font=(FAMILY, 9))
-        self.progress_label.grid(row=0, column=1, padx=(12, 18))
+        self.progress_label.grid(row=0, column=2, padx=(0, 18))
         self.top_btn = self._button(footer, "回到开头 ↑", lambda: self.text.yview_moveto(0),
                                     bg=PAPER, fg=MUTED, pady=2)
-        self.top_btn.grid(row=0, column=2)
+        self.top_btn.grid(row=0, column=3)
         self.progress_track = tk.Canvas(self, height=2, bg="#e1e7dc", bd=0, highlightthickness=0)
         self.progress_track.pack(side="bottom", fill="x", padx=28, pady=(8, 0))
         self._progress_line = self.progress_track.create_rectangle(0, 0, 0, 2, fill=GREEN, outline="")
@@ -156,7 +166,7 @@ class ReaderFrame(tk.Frame):
     def _layout_page(self, event):
         margin = max(24, (event.width - 920) // 2)
         self.page.grid_configure(padx=margin)
-        self.status.configure(wraplength=max(240, event.width - 320))
+        self.status.configure(wraplength=max(160, event.width - 540))
 
     def _on_text_scroll(self, first, last):
         self.vbar.set(first, last)
@@ -165,12 +175,89 @@ class ReaderFrame(tk.Frame):
         self._progress_fraction = max(0, min(1, first / travel)) if travel > .001 else 1
         if self.article is None:
             self._progress_fraction = 0
+        elif self._position_ready:
+            self._progress_fraction = self._capture_reading_position()["progress"]
         self.progress_label.configure(text=f"阅读进度  {round(self._progress_fraction * 100)}%")
         self._draw_progress()
+        if self._position_ready:
+            if self._position_after is not None:
+                self.after_cancel(self._position_after)
+            self._position_after = self.after(700, self.save_reading_position)
 
     def _draw_progress(self):
         self.progress_track.coords(self._progress_line, 0, 0,
                                    self.progress_track.winfo_width() * self._progress_fraction, 2)
+
+    # ---------- 阅读位置（段落与段内字符锚点，不依赖字号和窗口宽度） ----------
+    def _capture_reading_position(self):
+        if self.article is None or not self._position_ready:
+            return None
+        first, last = self.text.yview()
+        top = self.text.index("@0,0")
+        paragraph = self._para_at(top)
+        if paragraph is None:
+            paragraph = next((i for i in range(len(self.article["paragraphs"]))
+                              if self.text.compare(top, "<", self._para_range(i)[1])), 0)
+        ranges = self._para_range(paragraph)
+        offset = len(self.text.get(ranges[0], top)) if ranges and self.text.compare(top, ">", ranges[0]) else 0
+        at_end = last >= .99999 and first > 0
+        # Tk 长段落使用估算行高，yview 比例会随换行缓存变化；用正文字符锚点计算进度。
+        consumed = (self._paragraph_char_offsets[paragraph] + offset) if ranges else 0
+        progress = consumed / max(1, self._body_char_count)
+        return {"title": self.article["title"], "titleZh": self.article_digest.get("titleZh", ""),
+                "paragraphIndex": paragraph, "paragraphOffset": offset,
+                "paragraphStart": self.article["paragraphs"][paragraph][:160] if ranges else "",
+                "paragraphCount": len(self.article["paragraphs"]), "wordCount": self._article_word_count,
+                "progress": 1 if at_end else max(0, min(1, progress)),
+                "atStart": first == 0, "atEnd": at_end}
+
+    def save_reading_position(self):
+        if self._position_after is not None:
+            self.after_cancel(self._position_after)
+            self._position_after = None
+        position = self._capture_reading_position()
+        if position is None or position == self._saved_position:
+            return
+        try:
+            store.save_reading_progress(self.meta["id"], self.article_index, position)
+            self._saved_position = position
+        except (OSError, ValueError) as error:
+            self.status.configure(text=f"阅读位置保存失败：{error}")
+
+    def _restore_reading_position(self):
+        self._restore_position_after = None
+        self.text.update_idletasks()
+        record = self._resume_position
+        restored = False
+        if record and record["title"] == self.article["title"] and not record["atStart"]:
+            paragraphs = self.article["paragraphs"]
+            if paragraphs:
+                paragraph = min(record["paragraphIndex"], len(paragraphs) - 1)
+                anchor = record["paragraphStart"]
+                if anchor and not paragraphs[paragraph].startswith(anchor):
+                    paragraph = next((i for i, text in enumerate(paragraphs) if text.startswith(anchor)), paragraph)
+                same_paragraph = paragraphs[paragraph].startswith(anchor) if anchor else True
+                offset = min(record["paragraphOffset"], len(paragraphs[paragraph])) if same_paragraph else 0
+                if record["atEnd"]:
+                    self.text.yview_moveto(1)
+                else:
+                    self.text.yview(f"{self._para_range(paragraph)[0]}+{offset}c")
+                self.text.update_idletasks()
+                self.status.configure(text=f"已回到上次阅读位置 · 第 {paragraph + 1} / {len(paragraphs)} 段")
+                restored = True
+        if not restored:
+            self.text.yview_moveto(0)
+        self._position_ready = True
+        self._on_text_scroll(*self.text.yview())
+        self.save_reading_position()
+
+    def destroy(self):
+        self.save_reading_position()
+        for pending in (self._position_after, self._restore_position_after):
+            if pending is not None:
+                self.after_cancel(pending)
+        self._position_ready = False
+        super().destroy()
 
     # ---------- 数据加载 ----------
     def _load_worker(self):
@@ -185,12 +272,21 @@ class ReaderFrame(tk.Frame):
             self.status.config(text=f"找不到文章 #{article_index}")
             return
         self.article = art
+        self._paragraph_char_offsets = []
+        self._body_char_count = 0
+        for paragraph in art["paragraphs"]:
+            self._paragraph_char_offsets.append(self._body_char_count)
+            self._body_char_count += len(paragraph) + 1
+        self._article_word_count = len(re.findall(r"[A-Za-z]+(?:[’'-][A-Za-z]+)*", " ".join(art["paragraphs"])))
+        self.word_count_label.configure(text=f"全文 {self._article_word_count:,} 词")
+        self._resume_position = store.load_reading_history(self.meta["id"]).get(str(article_index))
         digest = store.load_digest(self.meta["id"]) or {}
         self.article_digest = next((a for a in digest.get("articles", []) if a["index"] == article_index), {})
         cached = store.load_vocab(self.meta["id"], article_index, self.app.settings["vocabLevel"])
         if cached:
             self.vocab = gen.vocab_normalize(cached, art)
         self._rebuild(keep_scroll=False)
+        self._restore_position_after = self.after_idle(self._restore_reading_position)
 
     # ---------- 渲染 ----------
     def _font_size(self):
@@ -251,7 +347,7 @@ class ReaderFrame(tk.Frame):
         subtitle = self.article_digest.get("titleZh", "").strip()
         if subtitle:
             self.text.insert("end", subtitle + "\n", "t_subtitle")
-        words = len(re.findall(r"[A-Za-z]+(?:[’'-][A-Za-z]+)*", " ".join(self.article["paragraphs"])))
+        words = self._article_word_count
         minutes = max(1, (words + 219) // 220)
         self.text.insert("end", f"{words:,} 词   ·   约 {minutes} 分钟   ·   {len(self.article['paragraphs'])} 段\n", "t_hint")
         for i, para in enumerate(self.article["paragraphs"]):

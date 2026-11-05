@@ -214,6 +214,10 @@ class App(tk.Tk):
         SettingsDialog(self, on_saved=on_saved)
 
     def open_digest(self, meta):
+        # 先落盘再构建摘要页，确保顶部最近阅读显示刚刚离开的文章与最新位置。
+        save_position = getattr(self.current, "save_reading_position", None)
+        if save_position is not None:
+            save_position()
         # 记录最近阅读（书库页顶部展示）
         rec = [x for x in (self.settings.get("recentBooks") or []) if x != meta["id"]]
         rec.insert(0, meta["id"])
