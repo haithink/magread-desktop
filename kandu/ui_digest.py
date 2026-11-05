@@ -27,8 +27,15 @@ class DigestFrame(tk.Frame):
         self.meta = meta
         self.generating = False
         self._articles = []
-        self._text_labels = []
         self._cards = {}
+        self._card_cache = {}
+        self._empty = None
+        self._empty_item = None
+        self._content_width = 1024
+        self._scroll_height = 1
+        self._mapped_cards = set()
+        self._viewport_after = None
+        self._heights_after = None
         self._states = store.load_article_states(meta["id"])
         self._search_after = None
         self._restore_after = None
@@ -107,10 +114,7 @@ class DigestFrame(tk.Frame):
         body.columnconfigure(0, weight=1)
         self.canvas = tk.Canvas(body, bg=PAPER, highlightthickness=0, bd=0, yscrollincrement=24)
         self.vbar = ttk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
-        self.inner = tk.Frame(self.canvas, bg=PAPER)
-        self.inner.bind("<Configure>", lambda e: self._update_scrollregion())
-        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="n")
-        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.canvas.configure(yscrollcommand=self._on_scroll)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.vbar.grid(row=0, column=1, sticky="ns", pady=(0, 8))
         self.canvas.bind("<Configure>", self._on_canvas_resize)
@@ -138,19 +142,77 @@ class DigestFrame(tk.Frame):
                          font=(FAMILY, 10), padx=padx, pady=pady)
 
     def _update_scrollregion(self):
-        self.canvas.configure(scrollregion=(0, 0, self.canvas.winfo_width(), self.inner.winfo_reqheight()))
+        self.canvas.configure(scrollregion=(0, 0, self.canvas.winfo_width(), self._scroll_height))
 
     def _on_canvas_resize(self, e):
         self._layout_content(e.width)
 
     def _layout_content(self, available):
+        if available <= 1:
+            return
         width = max(240, min(available - 48, 1024))
-        self.canvas.coords(self._win, available / 2, 0)
-        self.canvas.itemconfigure(self._win, width=width)
-        for lbl in self._text_labels:
-            lbl.configure(wraplength=width - 56)
+        self._content_width = width
+        for card in self._cards.values():
+            self._fit_card(card)
+        if self._empty_item is not None:
+            self.canvas.coords(self._empty_item, available / 2, 0)
+            self.canvas.itemconfigure(self._empty_item, width=width)
         self.status.configure(wraplength=max(200, available - 260))
+        self._queue_heights()
         self._update_scrollregion()
+
+    def _fit_card(self, card):
+        # 隐藏卡片在重新显示时才适配宽度；未变宽时不重复触发文字排版。
+        if card["width"] != self._content_width:
+            for label in card["labels"]:
+                label.configure(wraplength=self._content_width - 56)
+            card["width"] = self._content_width
+            self.canvas.itemconfigure(card["item"], width=self._content_width)
+
+    def _queue_heights(self):
+        if self._heights_after is None:
+            self._heights_after = self.after_idle(self._update_card_positions)
+
+    def _update_card_positions(self):
+        self._heights_after = None
+        y = 2
+        x = (self.canvas.winfo_width() - self._content_width) / 2
+        for card in self._cards.values():
+            height = card["frame"].winfo_reqheight()
+            card["y"], card["height"] = y, height
+            self.canvas.coords(card["item"], x, y)
+            y += height + 16
+        self._scroll_height = y if self._cards else (self._empty.winfo_reqheight() if self._empty else 1)
+        self._update_scrollregion()
+        self._queue_viewport()
+
+    def _on_scroll(self, first, last):
+        self.vbar.set(first, last)
+        self._queue_viewport()
+
+    def _queue_viewport(self):
+        if self._viewport_after is None:
+            self._viewport_after = self.after_idle(self._sync_viewport)
+
+    def _sync_viewport(self):
+        self._viewport_after = None
+        if self._heights_after is not None:
+            self._queue_viewport()
+            return
+        # 只映射视口及其附近的卡片，以逻辑高度保持完整滚动范围。
+        # 每张卡片直接嵌入 Canvas，避免重绘一个数万像素高的列表 Frame。
+        top = self.canvas.canvasy(0)
+        height = self.canvas.winfo_height()
+        wanted = {index for index, card in self._cards.items()
+                  if card["y"] + card["height"] >= top - height / 2
+                  and card["y"] <= top + height * 1.5}
+        for index in self._mapped_cards - wanted:
+            card = self._card_cache.get(index)
+            if card is not None:
+                self.canvas.itemconfigure(card["item"], state="hidden")
+        for index in wanted - self._mapped_cards:
+            self.canvas.itemconfigure(self._cards[index]["item"], state="normal")
+        self._mapped_cards = wanted
 
     def _restore_scroll(self, fraction):
         self._restore_after = None
@@ -167,7 +229,8 @@ class DigestFrame(tk.Frame):
 
     def destroy(self):
         self._remember_view()
-        for pending in (self._search_after, self._restore_after):
+        for pending in (self._search_after, self._restore_after,
+                        self._viewport_after, self._heights_after):
             if pending:
                 self.after_cancel(pending)
         super().destroy()
@@ -196,38 +259,43 @@ class DigestFrame(tk.Frame):
             self.status.config(text=f"标记保存失败：{e}")
             return
         self._update_counts()
-        card = self._cards.get(index)
+        card = self._card_cache.get(index)
         if card is None:
             return
-        if self._filter == "all" or self._filter == state:
-            label, color, tint = STATES[state]
-            card["badge"].config(text=f"  {label}  ", fg=color, bg=tint)
-            for key, button in card["marks"].items():
-                _, fg, bg = STATES[key]
-                button.config(bg=bg if key == state else "white",
-                              fg=fg if key == state else MUTED)
-        else:
-            # 只移除不再符合筛选的卡片。保留其他控件，避免整页重建和闪烁。
+        self._update_card_state(card, state)
+        if index in self._cards and self._filter not in ("all", state):
+            # 只隐藏不再符合筛选的卡片，切回其他筛选时继续复用。
             top = self.canvas.canvasy(0)
-            anchor = next((c["frame"] for i, c in self._cards.items() if i != index
-                           and c["frame"].winfo_y() + c["frame"].winfo_height() > top), None)
-            offset = anchor.winfo_y() - top if anchor is not None else 0
-            self._text_labels = [w for w in self._text_labels if w not in card["labels"]]
-            card["frame"].destroy()
+            anchor = next((c for i, c in self._cards.items() if i != index
+                           and c["y"] + c["height"] > top), None)
+            offset = anchor["y"] - top if anchor is not None else 0
+            self.canvas.itemconfigure(card["item"], state="hidden")
+            self._mapped_cards.discard(index)
             del self._cards[index]
             self._visible_articles = [a for a in self._visible_articles if a["index"] != index]
             if not self._visible_articles:
                 self._show_empty()
             self._update_result_label()
+            self._queue_heights()
             self.canvas.update_idletasks()
-            self._update_scrollregion()
             if anchor is not None:
-                height = max(1, self.inner.winfo_reqheight())
-                self.canvas.yview_moveto(max(0, anchor.winfo_y() - offset) / height)
+                self.canvas.yview_moveto(max(0, anchor["y"] - offset) / max(1, self._scroll_height))
+            self._queue_viewport()
 
     def _select_filter(self, state):
+        if state == self._filter:
+            return
         self._filter = state
         self._render()
+
+    @staticmethod
+    def _update_card_state(card, state):
+        label, color, tint = STATES[state]
+        card["badge"].config(text=f"  {label}  ", fg=color, bg=tint)
+        for key, button in card["marks"].items():
+            _, fg, bg = STATES[key]
+            button.config(bg=bg if key == state else "white",
+                          fg=fg if key == state else MUTED)
 
     def _queue_search(self, *_):
         if self._search_after:
@@ -325,14 +393,23 @@ class DigestFrame(tk.Frame):
     # ---- 渲染 ----
     def _fill(self, digest):
         self._articles = digest["articles"]
+        signatures = {a["index"]: self._article_signature(a) for a in self._articles}
+        # 摘要生成后只替换内容改变或已删除的卡片，筛选/搜索不使缓存失效。
+        for index, card in list(self._card_cache.items()):
+            if signatures.get(index) != card["signature"]:
+                self.canvas.delete(card["item"])
+                card["frame"].destroy()
+                del self._card_cache[index]
+                self._cards.pop(index, None)
+                self._mapped_cards.discard(index)
         self._render(keep_scroll=True)
+
+    @staticmethod
+    def _article_signature(article):
+        return tuple(article.get(key, "") for key in ("titleEn", "titleZh", "summaryZh"))
 
     def _render(self, keep_scroll=False):
         scroll = self.canvas.yview()[0] if keep_scroll else 0
-        for w in self.inner.winfo_children():
-            w.destroy()
-        self._text_labels.clear()
-        self._cards.clear()
         self._update_counts()
         query = self.search_var.get().strip().casefold()
         self._visible_articles = [a for a in self._articles
@@ -341,14 +418,31 @@ class DigestFrame(tk.Frame):
                                           ("titleEn", "titleZh", "summaryZh")).casefold()
                                           for term in query.split())]
         self._update_result_label()
+        visible_ids = {a["index"] for a in self._visible_articles}
+        for index, card in self._cards.items():
+            if index not in visible_ids:
+                self.canvas.itemconfigure(card["item"], state="hidden")
+                self._mapped_cards.discard(index)
+        if self._empty is not None:
+            self.canvas.itemconfigure(self._empty_item, state="hidden")
+        cards = {}
         for article in self._visible_articles:
-            self._make_card(article)
+            index = article["index"]
+            card = self._card_cache.get(index)
+            if card is None:
+                card = self._make_card(article)
+            cards[index] = card
+        self._cards = cards
         if not self._visible_articles:
             self._show_empty()
+        if not keep_scroll:
+            self.canvas.yview_moveto(0)
         self._layout_content(self.canvas.winfo_width())
+        self._queue_heights()
         self.canvas.update_idletasks()
         self._update_scrollregion()
         self.canvas.yview_moveto(scroll)
+        self._queue_viewport()
 
     def _update_counts(self):
         self._counts = {s: sum(self._state(a["index"]) == s for a in self._articles) for s in STATES}
@@ -366,8 +460,13 @@ class DigestFrame(tk.Frame):
                                  (f" · 搜索：{query}" if query else ""))
 
     def _show_empty(self):
-        empty = tk.Frame(self.inner, bg=PAPER, pady=56)
-        empty.pack(fill="x")
+        if self._empty is not None:
+            self.canvas.itemconfigure(self._empty_item, state="normal")
+            return
+        empty = tk.Frame(self.canvas, bg=PAPER, pady=56)
+        self._empty = empty
+        self._empty_item = self.canvas.create_window(self.canvas.winfo_width() / 2, 0,
+                                                     window=empty, anchor="n", width=self._content_width)
         tk.Label(empty, text="暂时没有匹配的文章", bg=PAPER, fg=INK,
                  font=(FAMILY, 15, "bold")).pack()
         tk.Label(empty, text="试试其他状态，或换一个搜索词。", bg=PAPER,
@@ -378,9 +477,8 @@ class DigestFrame(tk.Frame):
         index = article["index"]
         state = self._state(index)
         label, color, tint = STATES[state]
-        card = tk.Frame(self.inner, bg="white", highlightthickness=1,
+        card = tk.Frame(self.canvas, bg="white", highlightthickness=1,
                         highlightbackground="#dce3da", padx=24, pady=18)
-        card.pack(fill="x", pady=(2, 14))
         meta_row = tk.Frame(card, bg="white")
         meta_row.pack(fill="x", pady=(0, 10))
         tk.Label(meta_row, text=f"ARTICLE  {index + 1:02d}", bg="white", fg=MUTED,
@@ -398,11 +496,10 @@ class DigestFrame(tk.Frame):
             if not text:
                 continue
             widget = tk.Label(card, text=text, bg="white", fg=fg, font=font,
-                              anchor="w", justify="left", wraplength=940, cursor="hand2")
+                              anchor="w", justify="left", wraplength=self._content_width - 56, cursor="hand2")
             widget.pack(fill="x", pady=padding)
             widget.bind("<Button-1>", lambda e, i=index: self._open(i))
             text_widgets.append(widget)
-        self._text_labels.extend(text_widgets)
         tk.Frame(card, bg="#edf0ea", height=1).pack(fill="x", pady=(0, 12))
         footer = tk.Frame(card, bg="white")
         footer.pack(fill="x")
@@ -417,5 +514,10 @@ class DigestFrame(tk.Frame):
             buttons[key] = button
         open_button = self._button(footer, "阅读全文  →", lambda i=index: self._open(i), bg=GREEN, fg="white")
         open_button.pack(side="right")
-        self._cards[index] = {"frame": card, "badge": badge, "marks": buttons,
-                              "open": open_button, "labels": text_widgets}
+        item = self.canvas.create_window(0, 0, window=card, anchor="nw",
+                                         width=self._content_width, state="hidden")
+        result = {"item": item, "y": 0, "height": 1, "frame": card, "badge": badge, "marks": buttons,
+                  "open": open_button, "labels": text_widgets,
+                  "width": self._content_width, "signature": self._article_signature(article)}
+        self._card_cache[index] = result
+        return result

@@ -635,7 +635,10 @@ def test_digest_browsing():
             assert frame.vbar.winfo_width() >= frame.vbar.winfo_reqwidth()
             assert frame.vbar.winfo_rootx() >= frame.canvas.winfo_rootx() + frame.canvas.winfo_width()
             assert frame.vbar.winfo_rootx() + frame.vbar.winfo_width() <= root.winfo_rootx() + root.winfo_width()
-            for card in frame._cards.values():
+            for index in frame._mapped_cards:
+                card = frame._cards[index]
+                if not card["frame"].winfo_ismapped():
+                    continue
                 left = card["frame"].winfo_rootx()
                 right = left + card["frame"].winfo_width()
                 assert left >= frame.canvas.winfo_rootx()
@@ -712,19 +715,12 @@ def test_digest_incremental_mark():
         root.update()
         time.sleep(.05)
         root.update()
-        # 对比上一版的保存 + 整页重建路径。包含布局/绘制，使用同一份沙箱数据。
-        full_times = []
-        for state in ("read", "unread", "read"):
-            start = time.perf_counter()
-            frame._states = store.set_article_state(meta["id"], 0, state)
-            frame._render(keep_scroll=True)
-            root.update()
-            full_times.append(time.perf_counter() - start)
+        frame._mark(0, "read")
         cards = dict(frame._cards)
         frame.canvas.yview_moveto(.35)
         root.update()
         scroll = frame.canvas.yview()
-        bounds = {i: (c["frame"].winfo_y(), c["frame"].winfo_height()) for i, c in cards.items()}
+        bounds = {i: (c["y"], c["height"]) for i, c in cards.items()}
         local_times = []
         with patch.object(frame, "_render", side_effect=AssertionError("标记不能重建整页")), \
              patch.object(frame, "_make_card", side_effect=AssertionError("标记不能创建卡片")):
@@ -734,40 +730,169 @@ def test_digest_incremental_mark():
                 root.update()
                 local_times.append(time.perf_counter() - start)
                 assert all(frame._cards[i] is c and c["frame"].winfo_exists() for i, c in cards.items())
-                assert bounds == {i: (c["frame"].winfo_y(), c["frame"].winfo_height()) for i, c in cards.items()}
+                assert bounds == {i: (c["y"], c["height"]) for i, c in cards.items()}
                 assert frame.canvas.yview() == scroll, "全部列表中标记不应改变滚动位置"
             assert "未读" in frame._cards[0]["badge"].cget("text")
             assert frame._counts == {"unread": 80, "read": 0, "uninterested": 0}
             with patch.object(store, "set_article_state", side_effect=AssertionError("重复标记无需写盘")):
                 frame._mark(0, "unread")
-        print(f"  80 articles, median incl. save/layout/paint: full={statistics.median(full_times)*1000:.1f}ms, "
-              f"local={statistics.median(local_times)*1000:.1f}ms")
-        # 在未读筛选中标记：仅删除当前卡片，保留其余控件和附近文章位置。
+        print(f"  80 articles, median mark incl. save/layout/paint: {statistics.median(local_times)*1000:.1f}ms")
+        # 在未读筛选中标记：仅隐藏当前卡片，保留其余控件和附近文章位置。
         frame._select_filter("unread")
         root.update()
         cards = dict(frame._cards)
         victim, following = 35, 36
-        height = frame.inner.winfo_reqheight()
-        frame.canvas.yview_moveto((cards[victim]["frame"].winfo_y() + 24) / height)
+        height = frame._scroll_height
+        frame.canvas.yview_moveto((cards[victim]["y"] + 24) / height)
         root.update()
-        relative_y = cards[following]["frame"].winfo_y() - frame.canvas.canvasy(0)
+        relative_y = cards[following]["y"] - frame.canvas.canvasy(0)
         with patch.object(frame, "_render", side_effect=AssertionError("筛选内标记不能重建整页")), \
              patch.object(frame, "_make_card", side_effect=AssertionError("筛选内标记不能创建卡片")):
             frame._mark(victim, "uninterested")
             root.update()
-            assert victim not in frame._cards and not cards[victim]["frame"].winfo_exists()
+            assert victim not in frame._cards and cards[victim]["frame"].winfo_exists()
+            assert frame.canvas.itemcget(cards[victim]["item"], "state") == "hidden"
             assert len(frame._visible_articles) == 79
             assert all(frame._cards[i] is c for i, c in cards.items() if i != victim)
-            assert abs(cards[following]["frame"].winfo_y() - frame.canvas.canvasy(0) - relative_y) <= 24
+            assert abs(cards[following]["y"] - frame.canvas.canvasy(0) - relative_y) <= 24
             assert frame._counts["uninterested"] == 1
             assert "显示 79 / 80" in frame.result_label.cget("text")
         frame._select_filter("uninterested")
         frame._mark(victim, "read")
         root.update()
         assert not frame._cards and not frame._visible_articles
-        assert frame.inner.winfo_children(), "最后一张卡片移除后应显示空态"
+        assert frame._empty.winfo_ismapped(), "最后一张卡片移除后应显示空态"
         assert frame.vbar.winfo_ismapped()
         assert not errors, errors
+    finally:
+        root.destroy()
+
+
+@case("摘要筛选搜索复用卡片、缓存失效与切换性能")
+def test_digest_filter_cache():
+    import statistics
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_digest import DigestFrame
+
+    meta = dict(META, id="T_DIGEST_FILTER_CACHE")
+    articles = [{"index": i, "titleEn": f"Article {i}: Nature and the future",
+                 "titleZh": f"第 {i + 1} 篇：自然与未来",
+                 "summaryZh": ("科技观察" if i % 2 else "自然观察") + "：探索社会、生活与技术的变化。" * 6}
+                for i in range(80)]
+    digest = {"bookId": meta["id"], "articles": articles}
+    store.save_digest(digest)
+    for i in range(0, 80, 4):
+        store.set_article_state(meta["id"], i, "read")
+    for i in range(1, 80, 4):
+        store.set_article_state(meta["id"], i, "uninterested")
+    root = tk.Tk()
+    root.geometry("1180x800")
+    errors = []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    app = SimpleNamespace(settings={}, show_library=lambda: None, open_reader=lambda *a: None)
+    try:
+        with patch.object(gen, "digest_incomplete", return_value=False):
+            frame = DigestFrame(root, app, meta)
+        frame.pack(fill="both", expand=True)
+        root.update()
+        time.sleep(.05)
+        root.update()
+        cache = dict(frame._card_cache)
+        snapshots = {i: (c["frame"], *c["labels"], *c["marks"].values(), c["open"])
+                     for i, c in cache.items()}
+        times = []
+        with patch.object(frame, "_make_card", side_effect=AssertionError("切换筛选/搜索不能重建卡片")):
+            for state in ("unread", "all", "read", "uninterested", "all", "unread", "all"):
+                start = time.perf_counter()
+                frame._select_filter(state)
+                root.update()
+                times.append(time.perf_counter() - start)
+                expected = [a["index"] for a in articles if state == "all" or frame._state(a["index"]) == state]
+                assert list(frame._cards) == expected
+                positions = [frame.canvas.coords(cache[i]["item"])[1] for i in expected]
+                assert all(a < b for a, b in zip(positions, positions[1:])), "筛选不能打乱文章顺序"
+                assert all(frame._card_cache[i] is card for i, card in cache.items())
+                assert all(w.winfo_exists() for widgets in snapshots.values() for w in widgets)
+                for i, card in cache.items():
+                    assert frame.canvas.itemcget(card["item"], "state") == ("normal" if i in frame._mapped_cards else "hidden")
+                    if card["frame"].winfo_ismapped():
+                        assert i in expected
+                assert len(frame._mapped_cards) < 10, "屏幕外卡片不应全部绘制"
+            # 重复点击当前筛选无需任何界面重排。
+            with patch.object(frame, "_render", side_effect=AssertionError("重复筛选无需重新渲染")):
+                frame._select_filter("all")
+            frame.search_var.set("科技观察")
+            frame._apply_search()
+            root.update()
+            assert list(frame._cards) == list(range(1, 80, 2))
+            frame._select_filter("unread")
+            root.update()
+            assert list(frame._cards) == list(range(3, 80, 4))
+            frame.search_var.set("没有匹配结果")
+            frame._apply_search()
+            root.update()
+            assert not frame._cards and frame._empty.winfo_ismapped()
+            empty = frame._empty
+            frame._select_filter("read")
+            assert frame._empty is empty, "空态也应复用"
+            frame._reset_filters()
+            root.update()
+            assert list(frame._cards) == list(range(80))
+            assert not empty.winfo_ismapped()
+            # 隐藏期间调整窗口大小，重新显示的卡片必须使用当前宽度。
+            frame._select_filter("read")
+            root.geometry("900x620")
+            root.update()
+            frame._select_filter("all")
+            root.update()
+            assert all(card["width"] == frame._content_width for card in cache.values())
+            assert all(int(label.cget("wraplength")) == frame._content_width - 56
+                       for card in cache.values() for label in card["labels"])
+            frame._select_filter("unread")
+            frame._mark(2, "read")
+            root.update()
+            assert 2 not in frame._cards and frame._card_cache[2] is cache[2]
+            frame._select_filter("all")
+            root.update()
+            assert frame._cards[2] is cache[2] and "已读" in cache[2]["badge"].cget("text")
+            for fraction in (0, .25, .5, .95, 1):
+                frame.canvas.yview_moveto(fraction)
+                root.update()
+                top = frame.canvas.canvasy(0)
+                bottom = top + frame.canvas.winfo_height()
+                assert 0 < len(frame._mapped_cards) < 10
+                for i, card in frame._cards.items():
+                    if card["y"] + card["height"] > top and card["y"] < bottom:
+                        assert i in frame._mapped_cards and card["frame"].winfo_ismapped(), "滚动不能出现空白文章"
+            assert frame.canvas.yview()[1] > .999 and cache[79]["frame"].winfo_ismapped()
+            for state in ("unread", "all", "read", "all", "uninterested", "all"):
+                frame._select_filter(state)  # 连续切换，中途不等待绘制
+            root.update()
+            assert list(frame._cards) == list(range(80))
+            assert 0 in frame._mapped_cards and frame._cards[0]["frame"].winfo_ismapped()
+            frame._fill(digest)
+            assert all(frame._cards[i] is c for i, c in cache.items()), "未改变的摘要不应使缓存失效"
+        print(f"  80 articles, cached filter median incl. layout/paint: {statistics.median(times)*1000:.1f}ms")
+        changed = [dict(a) for a in articles]
+        changed[3]["summaryZh"] = "更新后的文章摘要"
+        changed = changed[1:]  # 删除一篇，更新一篇
+        with patch.object(frame, "_make_card", wraps=frame._make_card) as make:
+            frame._fill({"bookId": meta["id"], "articles": changed})
+            root.update()
+            assert make.call_count == 1
+        assert 0 not in frame._card_cache and not cache[0]["frame"].winfo_exists()
+        assert not cache[3]["frame"].winfo_exists()
+        assert frame._cards[3] is not cache[3]
+        assert all(frame._cards[i] is cache[i] for i in range(1, 80) if i != 3)
+        assert any(w.cget("text") == "更新后的文章摘要" for w in frame._cards[3]["labels"])
+        with patch.object(frame, "_make_card", side_effect=AssertionError("文章重排序也应复用卡片")):
+            frame._fill({"bookId": meta["id"], "articles": list(reversed(changed))})
+            root.update()
+            assert list(frame._cards) == list(range(79, 0, -1))
+            positions = [frame.canvas.coords(card["item"])[1] for card in frame._cards.values()]
+            assert all(a < b for a, b in zip(positions, positions[1:]))
+        assert frame.vbar.winfo_ismapped() and not errors, errors
     finally:
         root.destroy()
 
