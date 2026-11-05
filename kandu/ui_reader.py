@@ -1,4 +1,5 @@
 """阅读页：正文渲染、双击句解、长按/选中解析、全篇与逐段生词表。"""
+import re
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -42,12 +43,17 @@ def _render_lookup(txt, word, result):
 
 
 FAMILY = "Microsoft YaHei UI"
-INK_PAPER = "#EAF2E5"  # 阅读页浅豆绿纸色
+READING_FAMILY = "Georgia"
+PAPER = "#f3f4ef"
+INK_PAPER = "#fffdf8"
+GREEN = "#1b4b43"
+INK = "#2d3e36"
+MUTED = "#79847c"
 
 
 class ReaderFrame(tk.Frame):
     def __init__(self, parent, app, meta, article_index):
-        super().__init__(parent, bg=INK_PAPER)
+        super().__init__(parent, bg=PAPER)
         self.app = app
         self.meta = meta
         self.article_index = article_index
@@ -57,37 +63,77 @@ class ReaderFrame(tk.Frame):
         self.analysis_busy = set()
         self._last_click = (None, None)
         self._sheets = {}
-        self._sheets = {}
+        self.article_digest = {}
+        self._progress_fraction = 0
 
-        bar = tk.Frame(self, bg="#1b4b43")
+        bar = tk.Frame(self, bg=GREEN, padx=20, pady=12)
         bar.pack(fill="x")
-        # 阅读页返回应回到该书的摘要页（书目页的返回才是回书架）
-        ttk.Button(bar, text="← 返回", command=lambda: self.app.open_digest(self.meta)).pack(side="left", padx=10, pady=6)
-        self.title_label = tk.Label(bar, text="加载中…", bg="#1b4b43", fg="white",
-                                    font=(FAMILY, 12, "bold"))
-        self.title_label.pack(side="left", padx=6)
-        self.vocab_btn = ttk.Button(bar, text="生成生词表", command=self._vocab_btn)
-        self.vocab_btn.pack(side="right", padx=10, pady=6)
-        ttk.Button(bar, text="A+", width=3, command=lambda: self._font(+1)).pack(side="right", padx=4, pady=6)
-        ttk.Button(bar, text="A-", width=3, command=lambda: self._font(-1)).pack(side="right", padx=4, pady=6)
+        bar.columnconfigure(1, weight=1)
+        self.back_btn = self._button(bar, "← 文章摘要", lambda: self.app.open_digest(self.meta),
+                                     bg=GREEN, fg="#e1ece5")
+        self.back_btn.grid(row=0, column=0, padx=(0, 18))
+        self.title_label = tk.Label(bar, text=meta["fileName"], bg=GREEN, fg="white",
+                                    font=(FAMILY, 11, "bold"), width=1, anchor="w")
+        self.title_label.grid(row=0, column=1, sticky="ew")
+        tk.Label(bar, text="刊读  /  READING", bg=GREEN, fg="#bcd2c5",
+                 font=(FAMILY, 9)).grid(row=0, column=2, padx=(18, 0))
 
-        self.status = tk.Label(self, text="", bg=INK_PAPER, fg="#5a6b5a", anchor="w")
-        self.status.pack(fill="x", padx=14, pady=(4, 0))
+        tools = tk.Frame(self, bg=PAPER, padx=28, pady=13)
+        tools.pack(fill="x")
+        tools.columnconfigure(1, weight=1)
+        tk.Label(tools, text="原文精读", bg=PAPER, fg=GREEN,
+                 font=(FAMILY, 11, "bold")).grid(row=0, column=0, padx=(0, 18))
+        tk.Label(tools, text="双击句子 · 句解    选中右键 · 查词 / 解析", bg=PAPER, fg=MUTED,
+                 font=(FAMILY, 9), anchor="w", width=1).grid(row=0, column=1, sticky="ew")
+        font_tools = tk.Frame(tools, bg="#e7ebe4", padx=3, pady=2)
+        font_tools.grid(row=0, column=2, padx=(14, 12))
+        self.font_down_btn = self._button(font_tools, "A−", lambda: self._font(-1),
+                                          bg="#e7ebe4", padx=8, pady=3)
+        self.font_down_btn.pack(side="left")
+        self.font_value = tk.Label(font_tools, text=str(self._font_size()), width=2,
+                                    bg="#e7ebe4", fg=MUTED, font=(FAMILY, 9))
+        self.font_value.pack(side="left", padx=2)
+        self.font_up_btn = self._button(font_tools, "A+", lambda: self._font(+1),
+                                        bg="#e7ebe4", padx=8, pady=3)
+        self.font_up_btn.pack(side="left")
+        self.vocab_btn = self._button(tools, "生成生词表", self._vocab_btn, bg=GREEN, fg="white")
+        self.vocab_btn.grid(row=0, column=3)
 
-        body = tk.Frame(self, bg=INK_PAPER)
+        footer = tk.Frame(self, bg=PAPER, padx=28, pady=10)
+        footer.pack(side="bottom", fill="x")
+        footer.columnconfigure(0, weight=1)
+        self.status = tk.Label(footer, text="正文加载中…", bg=PAPER, fg=MUTED,
+                               anchor="w", justify="left", font=(FAMILY, 9), wraplength=700)
+        self.status.grid(row=0, column=0, sticky="ew")
+        self.progress_label = tk.Label(footer, text="阅读进度  0%", bg=PAPER, fg=GREEN, font=(FAMILY, 9))
+        self.progress_label.grid(row=0, column=1, padx=(12, 18))
+        self.top_btn = self._button(footer, "回到开头 ↑", lambda: self.text.yview_moveto(0),
+                                    bg=PAPER, fg=MUTED, pady=2)
+        self.top_btn.grid(row=0, column=2)
+        self.progress_track = tk.Canvas(self, height=2, bg="#e1e7dc", bd=0, highlightthickness=0)
+        self.progress_track.pack(side="bottom", fill="x", padx=28, pady=(8, 0))
+        self._progress_line = self.progress_track.create_rectangle(0, 0, 0, 2, fill=GREEN, outline="")
+        self.progress_track.bind("<Configure>", lambda e: self._draw_progress())
+
+        body = tk.Frame(self, bg=PAPER)
         body.pack(fill="both", expand=True)
-        self.text = tk.Text(body, wrap="word", state="disabled", bg=INK_PAPER, bd=0,
-                            padx=28, pady=16, cursor="arrow",
-                            font=(FAMILY, int(self.app.settings.get("readerFontSize", 13))))
-        vbar = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
-        self.text.configure(yscrollcommand=vbar.set)
-        self.text.pack(side="left", fill="both", expand=True)
-        vbar.pack(side="right", fill="y")
-
-        self.text.tag_config("t_title", font=(FAMILY, 17, "bold"), spacing3=6)
-        self.text.tag_config("t_hint", foreground="#8a9", font=(FAMILY, 9))
-        self.text.tag_config("sel", background="#cfe3c8")
-        self.text.tag_config("t_badge", foreground="#5f8a17", font=(FAMILY, 9, "underline"))
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        self.page = tk.Frame(body, bg=INK_PAPER, highlightthickness=1, highlightbackground="#dfe5da")
+        self.page.grid(row=0, column=0, sticky="nsew", padx=24, pady=(2, 0))
+        self.page.rowconfigure(0, weight=1)
+        self.page.columnconfigure(0, weight=1)
+        self.text = tk.Text(self.page, wrap="word", state="disabled", bg=INK_PAPER, fg=INK,
+                            bd=0, highlightthickness=0, width=1, height=1, padx=44, pady=34,
+                            cursor="xterm", selectbackground="#dbe9db", selectforeground=INK,
+                            inactiveselectbackground="#e7ece3",
+                            font=(READING_FAMILY, self._font_size()))
+        self.vbar = ttk.Scrollbar(self.page, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=self._on_text_scroll)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        self.vbar.grid(row=0, column=1, sticky="ns", padx=(0, 5), pady=6)
+        body.bind("<Configure>", self._layout_page)
+        self._apply_typography()
         self.text.bind("<Double-Button-1>", self._on_double_click)
         self.text.bind("<Button-3>", self._on_right_click)
         self.text.bind("<Return>", lambda e: self._on_double_click(e))
@@ -99,6 +145,32 @@ class ReaderFrame(tk.Frame):
         self.menu.add_command(label="解析整段", command=self._analyze_whole_paragraph)
 
         self.app.post(self._load_worker)
+
+    @staticmethod
+    def _button(parent, text, command, bg=INK_PAPER, fg=INK, padx=12, pady=6):
+        return tk.Button(parent, text=text, command=command, bg=bg, fg=fg,
+                         activebackground="#dfe9df", activeforeground=GREEN,
+                         relief="flat", bd=0, highlightthickness=0, cursor="hand2",
+                         font=(FAMILY, 10), padx=padx, pady=pady)
+
+    def _layout_page(self, event):
+        margin = max(24, (event.width - 920) // 2)
+        self.page.grid_configure(padx=margin)
+        self.status.configure(wraplength=max(240, event.width - 320))
+
+    def _on_text_scroll(self, first, last):
+        self.vbar.set(first, last)
+        first, last = float(first), float(last)
+        travel = 1 - (last - first)
+        self._progress_fraction = max(0, min(1, first / travel)) if travel > .001 else 1
+        if self.article is None:
+            self._progress_fraction = 0
+        self.progress_label.configure(text=f"阅读进度  {round(self._progress_fraction * 100)}%")
+        self._draw_progress()
+
+    def _draw_progress(self):
+        self.progress_track.coords(self._progress_line, 0, 0,
+                                   self.progress_track.winfo_width() * self._progress_fraction, 2)
 
     # ---------- 数据加载 ----------
     def _load_worker(self):
@@ -113,7 +185,8 @@ class ReaderFrame(tk.Frame):
             self.status.config(text=f"找不到文章 #{article_index}")
             return
         self.article = art
-        self.title_label.config(text=f"{art['title'][:40]}  ·  {self.meta['fileName']}")
+        digest = store.load_digest(self.meta["id"]) or {}
+        self.article_digest = next((a for a in digest.get("articles", []) if a["index"] == article_index), {})
         cached = store.load_vocab(self.meta["id"], article_index, self.app.settings["vocabLevel"])
         if cached:
             self.vocab = gen.vocab_normalize(cached, art)
@@ -125,10 +198,31 @@ class ReaderFrame(tk.Frame):
 
     def _font(self, delta):
         size = max(11, min(26, self._font_size() + delta))
+        if size == self._font_size():
+            return
+        anchor = self.text.index("@0,0")
         self.app.settings["readerFontSize"] = size
         self.app.save_settings()
-        self.text.configure(font=(FAMILY, size))
-        self._rebuild(keep_scroll=True)
+        self._apply_typography()
+        self.text.update_idletasks()
+        self.text.yview(anchor)
+
+    def _apply_typography(self):
+        size = self._font_size()
+        self.text.configure(font=(READING_FAMILY, size))
+        self.text.tag_config("t_kicker", font=(FAMILY, 9), foreground=MUTED, spacing3=16)
+        self.text.tag_config("t_title", font=(READING_FAMILY, min(38, size + 12), "bold"),
+                             foreground=GREEN, spacing1=0, spacing2=4, spacing3=16)
+        self.text.tag_config("t_subtitle", font=(FAMILY, max(11, size - 1)),
+                             foreground="#617365", spacing2=4, spacing3=18)
+        self.text.tag_config("t_hint", font=(FAMILY, 9), foreground=MUTED, spacing3=30)
+        self.text.tag_config("t_body", foreground=INK, spacing1=0,
+                             spacing2=max(6, round(size * .45)), spacing3=max(20, size + 7))
+        self.text.tag_config("t_badge", foreground="#48755a", background="#edf3e9",
+                             font=(FAMILY, 9), spacing1=4, spacing3=8)
+        self.font_value.config(text=str(size))
+        self.font_down_btn.config(state="disabled" if size <= 11 else "normal")
+        self.font_up_btn.config(state="disabled" if size >= 26 else "normal")
 
     def _total_words(self):
         if not self.vocab:
@@ -149,28 +243,24 @@ class ReaderFrame(tk.Frame):
         if self.article is None:
             return
         frac = self.text.yview()[0] if keep_scroll else 0.0
-        size = self._font_size()
-        self.text.configure(state="normal", font=(FAMILY, size))
+        self.text.configure(state="normal")
         self.text.delete("1.0", "end")
-
-        self.text.tag_config("t_title", font=(FAMILY, size + 4, "bold"),
-                             foreground="#1b4b43", spacing1=6, spacing3=10)
-        self.text.tag_config("t_body", spacing1=2, spacing2=6, spacing3=14)
-        self.text.tag_config("t_hint", font=(FAMILY, 9), foreground="#8a9a94", spacing3=16)
-
+        self._apply_typography()
+        self.text.insert("end", f"ARTICLE  {self.article_index + 1:02d}   /   ENGLISH READING\n", "t_kicker")
         self.text.insert("end", self.article["title"] + "\n", "t_title")
-        self.text.insert(
-            "end",
-            "双击句子看句解 · 选中后右键解析 · 点段前「词」看本段生词\n",
-            "t_hint",
-        )
+        subtitle = self.article_digest.get("titleZh", "").strip()
+        if subtitle:
+            self.text.insert("end", subtitle + "\n", "t_subtitle")
+        words = len(re.findall(r"[A-Za-z]+(?:[’'-][A-Za-z]+)*", " ".join(self.article["paragraphs"])))
+        minutes = max(1, (words + 219) // 220)
+        self.text.insert("end", f"{words:,} 词   ·   约 {minutes} 分钟   ·   {len(self.article['paragraphs'])} 段\n", "t_hint")
         for i, para in enumerate(self.article["paragraphs"]):
             entries = self._entries_for(i)
             if entries:
-                self.text.insert("end", f"  [词 {len(entries)}] ", f"t_badge pv_{i}")
+                self.text.insert("end", f"  词 {len(entries)}  ·  本段生词  \n", ("t_badge", f"pv_{i}"))
                 self.text.tag_bind(f"pv_{i}", "<Button-1>",
                                    lambda e, k=i: self._show_para_vocab(k))
-            self.text.insert("end", para + "\n\n", f"t_body p_{i}")
+            self.text.insert("end", para + "\n", ("t_body", f"p_{i}"))
         self.text.configure(state="disabled")
         self.text.yview_moveto(frac)
 

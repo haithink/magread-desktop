@@ -897,6 +897,157 @@ def test_digest_filter_cache():
         root.destroy()
 
 
+@case("阅读页排版、字号与选区、滚动和阅读交互")
+def test_reader_layout():
+    import tkinter as tk
+    import tkinter.font as tkfont
+    from types import SimpleNamespace
+    from kandu.ui_reader import ReaderFrame, READING_FAMILY
+
+    meta = dict(META, id="T_READER_LAYOUT", fileName="wired_2026.10.02.epub")
+    title = "The Quiet Return of the Repair Shop: A Different Way to Think About the Things We Own"
+    paragraphs = [
+        "A small repair shop opens before sunrise. Its owner keeps a notebook beside the window, "
+        "recording the stories of objects that people are not ready to throw away. "
+        "The work is patient and precise, and each repair offers another way to think about the future."
+        for _ in range(48)
+    ]
+    article = {"index": 2, "title": title, "paragraphs": paragraphs}
+    store.save_digest({"bookId": meta["id"], "articles": [
+        {"index": 2, "titleEn": title, "titleZh": "修理铺正在悄悄回归：重新理解我们拥有的物品", "summaryZh": ""}
+    ]})
+    posts, saves, back, errors = [], [], [], []
+    app = SimpleNamespace(settings={"readerFontSize": 13, "vocabLevel": "cet4", "llms": []},
+                          save_settings=lambda: saves.append(True),
+                          open_digest=lambda m: back.append(m["id"]),
+                          post=lambda *args: posts.append(args))
+    root = tk.Tk()
+    root.geometry("1180x820+40+40")
+    root.title("刊读 · 阅读界面预览")
+    root.report_callback_exception = lambda *args: errors.append(args)
+    try:
+        frame = ReaderFrame(root, app, meta, 2)
+        frame.pack(fill="both", expand=True)
+        frame.on_content_loaded(({"articles": [article]}, 2))
+        root.update()
+        assert len(posts) == 1, "阅读页美化不应额外请求模型"
+        assert frame.text.cget("state") == "disabled"
+        assert tkfont.Font(root=root, font=frame.text.cget("font")).actual("family") == READING_FAMILY
+        assert title in frame.text.get("1.0", "end")
+        assert "修理铺正在悄悄回归" in frame.text.get("1.0", "end")
+        for i in (0, 10, 47):
+            ranges = frame._para_range(i)
+            assert frame.text.get(*ranges) == paragraphs[i] + "\n", "段落标签必须保留原文和定位"
+            assert frame._para_at(ranges[0]) == i
+        for geometry in ("900x620", "1180x820", "1600x1000"):
+            root.geometry(geometry)
+            root.update()
+            assert frame.page.winfo_width() <= 920
+            left = frame.page.winfo_rootx() - root.winfo_rootx()
+            right = root.winfo_rootx() + root.winfo_width() - frame.page.winfo_rootx() - frame.page.winfo_width()
+            assert abs(left - right) <= 2 and min(left, right) >= 24
+            assert frame.vbar.winfo_ismapped()
+            assert frame.vbar.winfo_width() >= frame.vbar.winfo_reqwidth()
+            assert frame.vbar.winfo_rootx() >= frame.text.winfo_rootx() + frame.text.winfo_width()
+            assert frame.vbar.winfo_rootx() + frame.vbar.winfo_width() <= frame.page.winfo_rootx() + frame.page.winfo_width()
+            for button in (frame.back_btn, frame.vocab_btn, frame.font_up_btn, frame.font_down_btn, frame.top_btn):
+                assert button.winfo_ismapped() and button.winfo_width() >= button.winfo_reqwidth()
+                assert root.winfo_rootx() <= button.winfo_rootx() < root.winfo_rootx() + root.winfo_width()
+            assert frame.text.yview()[1] < 1
+        # 真实滚轮和拖动必须同步更新进度；到底部显示 100%，但不改阅读标记。
+        frame.text.yview_moveto(0)
+        frame.text.event_generate("<MouseWheel>", delta=-120)
+        root.update()
+        assert frame.text.yview()[0] > 0
+        frame.text.tk.call(frame.vbar.cget("command"), "moveto", .5)
+        root.update()
+        assert frame._progress_fraction > .45
+        frame.text.yview_moveto(1)
+        root.update()
+        assert frame.text.yview()[1] > .999
+        assert frame.progress_label.cget("text").endswith("100%")
+        frame.top_btn.invoke()
+        root.update()
+        assert frame.text.yview()[0] == 0 and frame._progress_fraction == 0
+        assert store.load_article_states(meta["id"]) == {}
+        # 字号调整仅改样式：不重建文本，保留选区与所在段落。
+        frame.text.yview(frame._para_range(15)[0])
+        root.update()
+        anchor_para = frame._para_at(frame.text.index("@0,0"))
+        selected = frame._para_range(16)[0]
+        frame.text.tag_add("sel", selected, f"{selected}+20c")
+        selection = tuple(map(str, frame.text.tag_ranges("sel")))
+        text = frame.text.get("1.0", "end")
+        with patch.object(frame, "_rebuild", side_effect=AssertionError("字号或窗口变化不能重建正文")):
+            frame.font_up_btn.invoke()
+            root.update()
+            assert app.settings["readerFontSize"] == 14 and frame.font_value.cget("text") == "14"
+            assert frame.text.get("1.0", "end") == text
+            assert tuple(map(str, frame.text.tag_ranges("sel"))) == selection
+            assert frame._para_at(frame.text.index("@0,0")) == anchor_para
+            root.geometry("900x620")
+            root.update()
+            assert frame.text.get("1.0", "end") == text
+            frame._font(100)
+            assert app.settings["readerFontSize"] == 26 and frame.font_up_btn.cget("state") == "disabled"
+            frame._font(-100)
+            assert app.settings["readerFontSize"] == 11 and frame.font_down_btn.cget("state") == "disabled"
+            frame._font(2)
+        assert saves
+        root.geometry("1180x820")
+        frame.text.tag_remove("sel", "1.0", "end")
+        frame.text.see(frame._para_range(0)[0])
+        root.update()
+        index = frame.text.search("Its owner", frame._para_range(0)[0], stopindex=frame._para_range(0)[1])
+        frame.text.see(index)
+        root.update()
+        x, y, _, _ = frame.text.bbox(index)
+        with patch.object(frame, "_start_analysis") as analyze:
+            frame._on_double_click(SimpleNamespace(x=x + 2, y=y + 2))
+            assert analyze.call_count == 1 and analyze.call_args.args[0] == 0
+            assert "Its owner" in analyze.call_args.args[1]
+        frame.text.tag_add("sel", index, f"{index}+30c")
+        with patch.object(frame, "_start_analysis") as analyze:
+            frame._analyze_selection()
+            assert analyze.call_args.args == (0, frame.text.get(index, f"{index}+30c").strip())
+        # 段前生词链接与正文独立，不能污染原文的句子偏移。
+        frame.vocab = {"level": "cet4", "articleIndex": 2, "titleEntries": [], "idioms": [],
+                       "processedParagraphs": list(range(48)),
+                       "paragraphs": [{"index": 0, "entries": [{"word": "precise", "sense": "精确的"}]}]}
+        frame._rebuild(keep_scroll=False)
+        root.update()
+        assert frame.text.tag_ranges("pv_0")
+        assert frame.text.get(*frame._para_range(0)) == paragraphs[0] + "\n"
+        with patch.object(frame, "_show_full_vocab") as show:
+            frame.vocab_btn.invoke()
+            show.assert_called_once()
+        with patch.object(frame, "_show_para_vocab") as show:
+            badge = frame.text.tag_ranges("pv_0")[0]
+            frame.text.see(badge)
+            root.update()
+            x, y, _, _ = frame.text.bbox(badge)
+            frame.text.event_generate("<Motion>", x=x + 6, y=y + 6)
+            frame.text.event_generate("<Button-1>", x=x + 6, y=y + 6)
+            root.update()
+            show.assert_called_once_with(0)
+        if os.environ.get("KANDU_CAPTURE_READER"):
+            from pathlib import Path
+            from PIL import ImageGrab
+            frame.top_btn.invoke()
+            root.geometry("1180x900+40+40")
+            root.update()
+            root.lift()
+            time.sleep(.2)
+            x, y = root.winfo_rootx(), root.winfo_rooty()
+            target = Path(__file__).resolve().parents[1] / "dist" / "reader-preview.png"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            ImageGrab.grab((x, y, x + root.winfo_width(), y + root.winfo_height())).save(target)
+        frame.back_btn.invoke()
+        assert back == [meta["id"]] and not errors, errors
+    finally:
+        root.destroy()
+
+
 def main():
     only = set(sys.argv[1:])
     if os.path.exists(SANDBOX):
