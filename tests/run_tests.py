@@ -643,6 +643,84 @@ def test_vocab_sheet_scroll():
         app.destroy()
 
 
+@case("同段生词窗口复用、恢复、刷新与关闭重开")
+def test_vocab_sheet_reuse():
+    import tkinter as tk
+    from tkinter import ttk
+    from types import SimpleNamespace
+    from kandu.ui_reader import ReaderFrame
+
+    root = tk.Tk()
+    root.geometry("900x620")
+    app = SimpleNamespace(settings={"readerFontSize": 13, "sheetFontSize": 11,
+                                    "vocabLevel": "cet4", "llms": []},
+                          post=lambda *args: None, save_settings=lambda: None,
+                          open_digest=lambda *args: None)
+    meta = dict(META, id="T_VOCAB_REUSE")
+    article = {"index": 0, "title": "Repair stories", "paragraphs": ["Old objects.", "Useful skills."]}
+    errors = []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    try:
+        reader = ReaderFrame(root, app, meta, 0)
+        reader.pack(fill="both", expand=True)
+        reader.on_content_loaded(({"articles": [article]}, 0))
+        reader.vocab = {"level": "cet4", "articleIndex": 0, "paragraphs": [
+            {"index": 0, "entries": [{"word": f"word{i}", "sense": "示例释义"} for i in range(100)]},
+            {"index": 1, "entries": [{"word": "ingenuity", "sense": "巧思"}]}]}
+        root.update()
+        reader._show_para_vocab(0)
+        root.update()
+        win, txt, bar = reader._vocab_sheets[0]
+        win.geometry("520x400")
+        root.update()
+        txt.yview_moveto(.45)
+        root.update()
+        scroll_index = txt.index("@0,0")
+        for _ in range(4):
+            reader._show_para_vocab(0)
+            root.update()
+            assert reader._vocab_sheets[0][0] is win
+            assert len([w for w in reader.winfo_children() if isinstance(w, tk.Toplevel)]) == 1
+            assert txt.index("@0,0") == scroll_index, "重复查看应保留当前可见词条，不能跳到开头"
+        assert not win.attributes("-topmost") and root.grab_current() is None and not win.transient()
+        win.withdraw()
+        root.update()
+        reader._show_para_vocab(0)
+        root.update()
+        assert win.winfo_ismapped() and win.focus_lastfor() is txt, "应恢复已有窗口并聚焦词条"
+        reader.vocab["paragraphs"][0]["entries"][0].update(
+            sense="最新释义", senseSource="dictionary", contextPending=True)
+        for _ in range(3):
+            reader._show_para_vocab(0)
+            root.update()
+        assert "最新释义" in txt.get("1.0", "end"), "复用窗口应显示最新缓存词条"
+        enrich = lambda: [w for w in bar.winfo_children() if isinstance(w, ttk.Button)
+                          and str(w.cget("text")).startswith("补充本文释义")]
+        assert len(enrich()) == 1, "复用窗口不能重复添加补充释义按钮"
+        reader.vocab["paragraphs"][0]["entries"][0].pop("senseSource")
+        reader.vocab["paragraphs"][0]["entries"][0].pop("contextPending")
+        reader._show_para_vocab(0)
+        assert not enrich(), "补充释义完成后不能保留旧按钮"
+        reader._show_para_vocab(1)
+        reader._show_full_vocab()
+        root.update()
+        assert len(reader._vocab_sheets) == 3, "不同段落与全篇窗口应各自独立"
+        full = reader._vocab_sheets[None][0]
+        reader._show_full_vocab()
+        assert reader._vocab_sheets[None][0] is full
+        win.destroy()
+        assert 0 not in reader._vocab_sheets, "关闭窗口必须清理登记"
+        reader._show_para_vocab(0)
+        root.update()
+        replacement = reader._vocab_sheets[0][0]
+        assert replacement is not win and replacement.winfo_ismapped()
+        reader.destroy()
+        assert not reader._vocab_sheets, "离开文章时必须关闭窗口并清理登记"
+        assert not errors, errors
+    finally:
+        root.destroy()
+
+
 @case("阅读弹窗首次与重复打开均可切回正文")
 def test_reader_sheet_activation():
     if sys.platform != "win32":
@@ -924,6 +1002,48 @@ def test_digest_browsing():
             x, y = root.winfo_rootx(), root.winfo_rooty()
             ImageGrab.grab((x, y, x + root.winfo_width(), y + root.winfo_height())).save(target)
         assert not errors, f"界面回调异常：{errors}"
+    finally:
+        root.destroy()
+
+
+@case("摘要顶部紧凑布局与最近阅读入口")
+def test_digest_compact_header():
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_digest import DigestFrame
+
+    meta = dict(META, id="T_COMPACT_DIGEST")
+    digest = {"bookId": meta["id"], "articles": [
+        {"index": i, "titleEn": f"A story about repair {i}", "titleZh": f"修理铺的故事 {i}",
+         "summaryZh": "人们重新学习修理物品，让熟悉的街区再次焕发生机。"} for i in range(12)]}
+    store.save_digest(digest)
+    for i in range(3):
+        store.save_reading_progress(meta["id"], i, {
+            "title": digest["articles"][i]["titleEn"], "titleZh": digest["articles"][i]["titleZh"],
+            "paragraphIndex": i + 1, "paragraphOffset": 0, "paragraphStart": "People repair things.",
+            "paragraphCount": 30, "wordCount": 1200, "progress": (i + 1) / 30,
+            "atStart": False, "atEnd": False})
+    opened = []
+    app = SimpleNamespace(settings={"llms": []}, show_library=lambda: None,
+                          open_reader=lambda book, index: opened.append(index),
+                          post=lambda *args: (_ for _ in ()).throw(AssertionError("不能调用 LLM")))
+    root = tk.Tk()
+    try:
+        with patch.object(gen, "digest_incomplete", return_value=False):
+            frame = DigestFrame(root, app, meta)
+        frame.pack(fill="both", expand=True)
+        for geometry in ("900x620", "1180x800"):
+            root.geometry(geometry)
+            root.update()
+            top = frame.canvas.winfo_rooty() - frame.winfo_rooty()
+            assert top <= 285, f"三个最近阅读入口时顶部占用过多：{geometry}, {top}px"
+            assert frame.canvas.winfo_height() > root.winfo_height() / 2
+            assert len(frame.recent_buttons) == 3 and frame.recent_section.winfo_ismapped()
+            for button in frame.recent_buttons.values():
+                assert button.winfo_ismapped() and button.winfo_width() >= button.winfo_reqwidth()
+            print(f"  {geometry}: header {top}px, article viewport {frame.canvas.winfo_height()}px")
+        frame.recent_buttons[1].invoke()
+        assert opened == [1]
     finally:
         root.destroy()
 

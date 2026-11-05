@@ -50,7 +50,7 @@ class DigestFrame(tk.Frame):
             self._filter = "all"
         self.search_var = tk.StringVar(self, value=view.get("search", ""))
 
-        bar = tk.Frame(self, bg=GREEN, padx=20, pady=12)
+        bar = tk.Frame(self, bg=GREEN, padx=20, pady=8)
         bar.pack(fill="x")
         bar.columnconfigure(1, weight=1)
         self._button(bar, "← 书库", self.app.show_library,
@@ -68,18 +68,16 @@ class DigestFrame(tk.Frame):
         self.gen_btn = self._button(actions, "补全摘要", self.generate, bg="#dfece3", fg=GREEN)
         self.gen_btn.pack(side="left")
 
-        heading = tk.Frame(self, bg=PAPER, padx=32, pady=20)
+        heading = tk.Frame(self, bg=PAPER, padx=32, pady=6)
         heading.pack(fill="x")
         title_row = tk.Frame(heading, bg=PAPER)
         title_row.pack(fill="x")
         tk.Label(title_row, text="文章摘要", bg=PAPER, fg=INK,
-                 font=(FAMILY, 23, "bold")).pack(side="left")
+                 font=(FAMILY, 14, "bold")).pack(side="left")
         self.overview = tk.Label(title_row, text="", bg=PAPER, fg=GREEN, font=(FAMILY, 10))
-        self.overview.pack(side="right", pady=(12, 0))
-        tk.Label(heading, text="先浏览，再选一篇慢慢读。阅读状态由你手动标记，自动保存。",
-                 bg=PAPER, fg=MUTED, font=(FAMILY, 10), anchor="w").pack(fill="x", pady=(4, 0))
+        self.overview.pack(side="right")
 
-        self.recent_section = tk.Frame(self, bg="#e9f0e5", padx=16, pady=10,
+        self.recent_section = tk.Frame(self, bg="#e9f0e5", padx=12, pady=4,
                                         highlightthickness=1, highlightbackground="#dce5d5")
         controls = tk.Frame(self, bg=PAPER, padx=32)
         self._controls = controls
@@ -89,11 +87,11 @@ class DigestFrame(tk.Frame):
         filters.grid(row=0, column=0, sticky="w")
         self.filter_buttons = {}
         for key, label in [("all", "全部"), *[(s, v[0]) for s, v in STATES.items()]]:
-            button = self._button(filters, label, lambda s=key: self._select_filter(s))
+            button = self._button(filters, label, lambda s=key: self._select_filter(s), pady=4)
             button.pack(side="left", padx=(0, 6))
             self.filter_buttons[key] = button
         search_box = tk.Frame(controls, bg="white", highlightthickness=1,
-                              highlightbackground="#d9dfd7", padx=8, pady=6)
+                              highlightbackground="#d9dfd7", padx=8, pady=4)
         search_box.grid(row=0, column=1, sticky="e", padx=(12, 0))
         tk.Label(search_box, text="搜索", bg="white", fg=MUTED, font=(FAMILY, 9)).pack(side="left", padx=(0, 8))
         self.search_entry = tk.Entry(search_box, textvariable=self.search_var, width=20,
@@ -102,7 +100,7 @@ class DigestFrame(tk.Frame):
         self.search_entry.bind("<Escape>", lambda e: self._reset_filters())
         self._button(search_box, "×", lambda: self.search_var.set(""), padx=3, pady=0).pack(side="left")
         self.result_label = tk.Label(controls, text="", bg=PAPER, fg=MUTED, font=(FAMILY, 9), anchor="w")
-        self.result_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 8))
+        self.result_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 4))
 
         self.progress_row = tk.Frame(self, bg=PAPER, padx=32, pady=8)
         self.progress_row.pack(side="bottom", fill="x")
@@ -271,18 +269,16 @@ class DigestFrame(tk.Frame):
         if not recent:
             self.recent_section.pack_forget()
             return
-        self.recent_section.pack(fill="x", padx=32, pady=(0, 14), before=self._controls)
-        heading = tk.Frame(self.recent_section, bg="#e9f0e5")
-        heading.pack(fill="x", pady=(0, 5))
-        tk.Label(heading, text="最近阅读", bg="#e9f0e5", fg=GREEN,
-                 font=(FAMILY, 10, "bold")).pack(side="left")
-        tk.Label(heading, text="自动记住阅读位置", bg="#e9f0e5", fg=MUTED,
-                 font=(FAMILY, 9)).pack(side="right")
+        self.recent_section.pack(fill="x", padx=32, pady=(0, 8), before=self._controls)
+        tk.Label(self.recent_section, text="最近阅读", bg="#e9f0e5", fg=GREEN,
+                 font=(FAMILY, 9, "bold")).pack(side="left", anchor="n", padx=(0, 12), pady=4)
+        rows = tk.Frame(self.recent_section, bg="#e9f0e5")
+        rows.pack(side="left", fill="x", expand=True)
         for rank, (index, record) in enumerate(recent):
             article = articles.get(index, {})
             title = article.get("titleZh") or record.get("titleZh") or article.get("titleEn") or record["title"]
-            row = tk.Frame(self.recent_section, bg="#e9f0e5")
-            row.pack(fill="x", pady=2)
+            row = tk.Frame(rows, bg="#e9f0e5")
+            row.pack(fill="x", pady=1)
             row.columnconfigure(0, weight=1)
             label = tk.Label(row, text=title, bg="#e9f0e5", fg=INK, anchor="w", width=1,
                              font=(FAMILY, 10, "bold" if rank == 0 else "normal"), cursor="hand2")
@@ -295,7 +291,8 @@ class DigestFrame(tk.Frame):
                      font=(FAMILY, 9)).grid(row=0, column=1, padx=(0, 12))
             button = self._button(row, "继续阅读 →", lambda i=index: self._open(i),
                                   bg=GREEN if rank == 0 else "#dce7d7", fg="white" if rank == 0 else GREEN,
-                                  padx=10, pady=4)
+                                  padx=10, pady=1)
+            button.configure(font=(FAMILY, 9))
             button.grid(row=0, column=2)
             self.recent_buttons[index] = button
 

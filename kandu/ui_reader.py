@@ -63,6 +63,7 @@ class ReaderFrame(tk.Frame):
         self.analysis_busy = set()
         self._last_click = (None, None)
         self._sheets = {}
+        self._vocab_sheets = {}
         self.article_digest = {}
         self._progress_fraction = 0
         self._article_word_count = 0
@@ -739,15 +740,40 @@ class ReaderFrame(tk.Frame):
         self._render_vocab_sheet(f"本篇生词表（{label}，{self._total_words()} 词）", only_para=None)
 
     def _render_vocab_sheet(self, title, only_para):
-        win, txt, bar = self._make_sheet(title, self.article["title"][:36])
+        entry = self._vocab_sheets.get(only_para)
+        if entry and entry[0].winfo_exists():
+            win, txt, bar = entry
+            position = txt.index("@0,0")
+            win.title(f"{title} — {self.article['title'][:36]}")
+            bar.winfo_children()[0].configure(text=title)
+            if win._enrich_button is not None:
+                win._enrich_button.destroy()
+        else:
+            win, txt, bar = self._make_sheet(title, self.article["title"][:36])
+            self._vocab_sheets[only_para] = (win, txt, bar)
+            position = "1.0"
+
+            def forget(event):
+                if event.widget is win and self._vocab_sheets.get(only_para, (None,))[0] is win:
+                    self._vocab_sheets.pop(only_para, None)
+
+            win.bind("<Destroy>", forget, add="+")
+        win._enrich_button = None
         _render_vocab(txt, self.vocab, only_para)
+        txt.update_idletasks()
+        txt.yview(position)
         pending = gen.vocab_context_pending(self.vocab)
         if pending:
             def enrich():
                 self.generate_vocab(enrich=True)
                 if self.vocab_running:
                     win.destroy()
-            ttk.Button(bar, text=f"补充本文释义（{pending} 词）", command=enrich).pack(side="right", padx=8, pady=3)
+            win._enrich_button = ttk.Button(bar, text=f"补充本文释义（{pending} 词）", command=enrich)
+            win._enrich_button.pack(side="right", padx=8, pady=3)
+        if entry and entry[0] is win:
+            win.deiconify()
+            win.lift()
+            txt.focus_set()
 
     # ---------- 公共弹层 ----------
     def _make_sheet(self, title, subtitle):
