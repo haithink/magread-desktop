@@ -27,7 +27,9 @@ def digest_user(book_name: str, items) -> str:
 def vocab_system(level_label: str) -> str:
     return (
         "你是英语外刊精读助教。学生已掌握「" + level_label + "」。"
-        "本地已按词表筛出候选词。请排除人名、地名、机构名和常用词，"
+        "本地已按学生掌握的词表筛出候选词，不可再按自己的常用程度或主观难度删词。"
+        "标注为必须收录的词均为已核对的普通超纲词，必须逐词给出本文义，不可漏掉。"
+        "其他候选可排除人名、地名、机构名，"
         "保留超纲词与术语（含缩略语），并结合正文补充漏掉的词组和熟词僻义。"
         "每段独立收词，同词在不同段落可重复；只输出本次给出的段落，编号原样保留，-1 为标题。"
         "词条必须出现在对应段落，不能串段；每个输入段落都必须返回，包括没有生词的段落。"
@@ -40,7 +42,7 @@ def vocab_system(level_label: str) -> str:
     )
 
 
-def vocab_user(title: str, title_index: int, units, candidates, local_phonetics=()) -> str:
+def vocab_user(title: str, title_index: int, units, candidates, local_phonetics=(), required=None) -> str:
     """只附本块候选词；正文保留全文，供判断熟词僻义与语境。"""
     out = [f"文章标题：{title[:80]}。以下为本次待处理段落（-1 表示标题）："]
     for index, text in units:
@@ -49,6 +51,8 @@ def vocab_user(title: str, title_index: int, units, candidates, local_phonetics=
         out.append(text)
         words = candidates.get(index, [])
         out.append("本地候选：" + (", ".join(words) if words else "无；仍需检查熟词僻义和词组"))
+        if required and required.get(index):
+            out.append("必须收录（逐词给出本文义，不可遗漏）：" + ", ".join(required[index]))
     if local_phonetics:
         out.append("这些词已有本地音标，勿重复生成：" + ", ".join(sorted(local_phonetics)))
     return "\n".join(out)

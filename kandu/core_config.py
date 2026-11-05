@@ -148,13 +148,20 @@ def wordset(level: str) -> set:
     if not fname:
         return set()
     f = _sub("vocab") / fname
-    if not f.exists():
-        return set()
     out = set()
-    for line in f.read_text(encoding="utf-8").splitlines():
-        w = line.split("\t", 1)[0].strip().lower()
-        if w:
-            out.add(w)
+    sources = [f]
+    if level == "cet4":
+        try:
+            # 补全旧词表缺少的基础/中学/四级词；读取随应用更新的资源，保留用户原词表。
+            sources.append(asset_path("cet4_known_supplement.txt"))
+        except FileNotFoundError:
+            pass
+    for source in sources:
+        if source.exists():
+            for line in source.read_text(encoding="utf-8").splitlines():
+                w = line.split("\t", 1)[0].strip().lower()
+                if w:
+                    out.add(w)
     return out
 
 

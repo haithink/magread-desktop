@@ -88,6 +88,21 @@ ALWAYS_KNOWN = {
     "org", "pdf", "epub", "app", "vs",
 }
 
+# 基础语法变形和功能词兜底；完整已知词范围由内置补充词表维护。
+BASIC_KNOWN = set("""
+the a an this that these those here there where when why how what which who whom whose
+i me my mine myself you your yours yourself yourselves he him his himself she her hers herself
+it its itself we us our ours ourselves they them their theirs themselves
+be am is are was were been being have has had having do does did done doing
+will would shall should can could may might must ought need
+and or but if so because although though unless while than as whether
+not no yes all any some every each both either neither other another such own same only also very
+to of in on at by for from with without about into onto upon over under above below between through
+up down out off away back again together before after since until during against within
+one two three four five six seven eight nine ten eleven twelve twenty hundred thousand first second third
+said says saying told taken took went gone came got gotten gave given made knew known saw seen thought
+""".split())
+
 
 def lemma_forms(word: str):
     w = word.lower()
@@ -122,19 +137,117 @@ def candidates(paragraph_texts, dict_set, lexicon=None):
     for text in paragraph_texts:
         for m in _TOKEN.finditer(text):
             raw = m.group(0).strip("'-")
-            if len(raw) < 3 or raw.lower() in ALWAYS_KNOWN:
-                continue
-            forms = lemma_forms(raw)
-            if any(f in dict_set for f in forms):
+            if len(raw) < 3 or raw.lower() in ALWAYS_KNOWN or raw.lower() in BASIC_KNOWN or raw.lower() in dict_set:
                 continue
             hit = (lexicon or {}).get(raw.lower()) or {}
             base = hit.get("lemma") or hit.get("word") or raw.lower()
-            if base in dict_set or base in ALWAYS_KNOWN:
+            if base in dict_set or base in ALWAYS_KNOWN or base in BASIC_KNOWN:
+                continue
+            # 词典已识别的独立单词不能再因盲目去掉 s/ed/ing 而被误判已掌握。
+            if (not hit or hit.get("miss")) and any(f in dict_set for f in lemma_forms(raw)):
                 continue
             if base not in seen:
                 seen.add(base)
                 out.append(base)
     return out
+
+
+VOCAB_COVERAGE_VERSION = 1
+
+
+def _vocab_lexicon(units):
+    from . import core_dict
+
+    words = [m.group().strip("'-").lower() for _, text in units
+             for m in _TOKEN.finditer(text.replace("’", "'"))]
+    lexicon = core_dict.lookup_many(words)
+    lexicon.update(core_dict.lookup_many([hit["lemma"] for hit in lexicon.values() if hit.get("lemma")]))
+    return lexicon
+
+
+def _required_candidates(text, candidate_words, lexicon):
+    """可确认的普通超纲词必须保留；专名/缩略词/未收录词仍交给语境判断。"""
+    required = {}
+    for word in candidate_words:
+        hit = lexicon.get(word) or {}
+        translation = hit.get("translation", "")
+        if not translation or re.search(r"人名|地名|姓氏|城市名|男子名|女子名", translation):
+            continue
+        required[word] = hit
+    ordinary = set()
+    for match in _TOKEN.finditer(text.replace("’", "'")):
+        raw = match.group().strip("'-")
+        hit = lexicon.get(raw.lower()) or {}
+        base = hit.get("lemma") or hit.get("word") or raw.lower()
+        if base not in required:
+            continue
+        prefix = text[:match.start()].rstrip(" \t\r\n\"'“‘(")
+        sentence_start = not prefix or re.search(r"[.!?][\"')\]]*$", prefix)
+        # 只有大写出现的普通名词也可能是人名/公司名（Musk / Amazon）。
+        # 保留给模型判断；句首形容词如 Candid 仍须核对收录。
+        noun_only = re.match(r"^n\.", required[base].get("translation", "").strip())
+        if raw.islower() or (sentence_start and not noun_only and raw[:1].isupper() and raw[1:].islower()):
+            ordinary.add(base)
+    return {word: hit for word, hit in required.items() if word in ordinary}
+
+
+def _merge_vocab_entries(existing, generated):
+    """补词/补义只替换同词，保留原有模型释义、词组和手动添加的词。"""
+    merged = {entry["word"]: dict(entry) for entry in existing}
+    for entry in generated:
+        merged[entry["word"]] = dict(entry)
+    return list(merged.values())
+
+
+def _backfill_vocab_section(section, text, required, lexicon):
+    section = dict(section, entries=[dict(entry) for entry in section["entries"]])
+    present = {entry["word"] for entry in section["entries"]}
+    for word, hit in required.items():
+        if word in present:
+            continue
+        context = _vocab_context(word, text, lexicon)
+        if context:
+            section["entries"].append({"word": word, "phonetic": hit.get("phonetic", ""),
+                "pos": hit.get("pos", ""), "sense": hit["translation"].replace("\\n", "；").replace("\n", "；"),
+                "root": "", "term": False, "inText": context,
+                "senseSource": "dictionary", "contextPending": True})
+    return section
+
+
+def vocab_context_pending(vocab):
+    return sum(bool(entry.get("contextPending")) for entry in vocab.get("titleEntries", [])) + sum(
+        bool(entry.get("contextPending")) for section in vocab.get("paragraphs", []) for entry in section["entries"])
+
+
+def audit_vocab_coverage(vocab, article, level):
+    """离线补齐旧缓存遗漏，不调用模型，也不把尚未生成的段落标成完成。"""
+    from . import core_dict
+
+    if vocab.get("coverageVersion") == VOCAB_COVERAGE_VERSION:
+        return vocab
+    core_dict.ensure_db(background=False)
+    if not core_dict.STATE["ready"]:
+        return vocab
+    cfgmod.ensure_wordlists()
+    known = cfgmod.wordset(level)
+    vocab = vocab_normalize(vocab, article)
+    processed = set(vocab.get("processedParagraphs", []))
+    units = [(i, text) for i, text in [(-1, article["title"]), *enumerate(article["paragraphs"])] if i in processed]
+    lexicon = _vocab_lexicon(units)
+    sections = {p["index"]: p for p in vocab.get("paragraphs", [])}
+    result = dict(vocab)
+    for idx, text in units:
+        required = _required_candidates(text, candidates([text], known, lexicon), lexicon)
+        section = {"index": idx, "startWords": text[:30], "entries": result.get("titleEntries", [])} if idx == -1 else (
+            sections.get(idx) or {"index": idx, "startWords": text[:30], "entries": []})
+        section = _backfill_vocab_section(section, text, required, lexicon)
+        if idx == -1:
+            result["titleEntries"] = section["entries"]
+        else:
+            sections[idx] = section
+    result["paragraphs"] = sorted(sections.values(), key=lambda p: p["index"])
+    result["coverageVersion"] = VOCAB_COVERAGE_VERSION
+    return vocab_normalize(result, article)
 
 
 # ---------------- 生成任务 ----------------
@@ -456,13 +569,23 @@ def _vocab_sections(obj, chunk, lexicon):
     return sections
 
 
-def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, llm_rotation=None, max_workers=2):
+def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, llm_rotation=None, max_workers=2,
+                   enrich=False):
     """本地筛词/音标 + 紧凑语境释义；最多两个请求并行，主线程逐块落盘。"""
     started = time.perf_counter()
     existing = store.load_vocab(meta["id"], article["index"], level) or {}
+    if existing:
+        audited = audit_vocab_coverage(existing, article, level)
+        if audited != existing:
+            store.save_vocab(meta["id"], audited)
+        existing = audited
     processed = set(existing.get("processedParagraphs", []))
+    old_sections = {p["index"]: p for p in existing.get("paragraphs", [])}
+    old_sections[-1] = {"entries": existing.get("titleEntries", [])}
+    pending_words = {idx: [e["word"] for e in section["entries"] if e.get("contextPending")]
+                     for idx, section in old_sections.items()}
     units = [(-1, article["title"]), *enumerate(article["paragraphs"])]
-    units = [(idx, text) for idx, text in units if idx not in processed]
+    units = [(idx, text) for idx, text in units if idx not in processed or (enrich and pending_words.get(idx))]
     if not units:
         return vocab_normalize(existing, article)
 
@@ -470,11 +593,12 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
     cfgmod.ensure_wordlists()
     dict_set = cfgmod.wordset(level)
     core_dict.ensure_db(background=False)
-    words = [m.group().lower() for _, text in units for m in _TOKEN.finditer(text.replace("’", "'"))]
-    lexicon = core_dict.lookup_many(words)
-    bases = [hit["lemma"] for hit in lexicon.values() if hit.get("lemma")]
-    lexicon.update(core_dict.lookup_many(bases))
+    lexicon = _vocab_lexicon(units)
     cand = {idx: candidates([text.replace("’", "'")], dict_set, lexicon) for idx, text in units}
+    for idx in cand:
+        if enrich and idx in processed:
+            cand[idx] = pending_words[idx]
+    required = {idx: _required_candidates(text, cand[idx], lexicon) for idx, text in units}
 
     rotation = [dict(cfg)]
     for p in llm_rotation or []:
@@ -532,7 +656,7 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                 break
             name = config.get("name", "?")
             local_words = {w for idx, _ in remaining for w in cand[idx] if (lexicon.get(w) or {}).get("phonetic")}
-            user = prompts.vocab_user(article["title"], -1, remaining, cand, local_words)
+            user = prompts.vocab_user(article["title"], -1, remaining, cand, local_words, required)
             candidate_count = sum(len(cand[idx]) for idx, _ in remaining)
             budget = min(8192, max(2048, 512 + candidate_count * 110))
             request_cfg = dict(config)
@@ -574,6 +698,8 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                  "chunkErrors": chunk_errors,
                  "failedChunks": failed_chunks, "censorHint": censor_hit,
                  "generationStats": dict(stats, elapsedMs=round((time.perf_counter() - started) * 1000))}
+        if core_dict.STATE["ready"]:
+            draft["coverageVersion"] = VOCAB_COVERAGE_VERSION
         result = vocab_normalize(draft, article)
         store.save_vocab(meta["id"], result)
         return result
@@ -586,6 +712,9 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
             key, sections, failures, censor, remaining, details = future.result()
             censor_hit |= censor
             if sections:
+                for idx, section in sections.items():
+                    section["entries"] = _merge_vocab_entries(old_sections.get(idx, {}).get("entries", []), section["entries"])
+                    sections[idx] = _backfill_vocab_section(section, dict(units)[idx], required[idx], lexicon)
                 entries = [e for section in sections.values() for e in section["entries"]]
                 # 原形/音标查询用一条 SQLite 连接，本地数据优先，未收录词保留模型音标。
                 phonetics = core_dict.lookup_many([e["word"] for e in entries])

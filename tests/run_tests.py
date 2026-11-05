@@ -140,7 +140,7 @@ def test_vocab_compact():
     assert words == ["business", "researcher"], words
     assert gen.candidates(["business"], set()) == ["business"], "不能用最短猜测词形把单词截坏"
 
-    art = {"index": 0, "title": "A phenomenon", "paragraphs": [
+    art = {"index": 0, "title": "A candid look at a phenomenon", "paragraphs": [
         "The researchers investigated the phenomenon at the bank of the river.",
         "The phenomenon shaped interest rates and yielded further observations.",
     ]}
@@ -170,7 +170,134 @@ def test_vocab_compact():
     for p in result["paragraphs"]:
         assert all(e["inText"] in art["paragraphs"][p["index"]] for e in p["entries"])
     assert result["idioms"][0] == {"word": "bank", "common": "银行", "inText": "河岸"}
-    assert result["paragraphs"][1]["entries"][-1]["word"] == "interest rate"
+    assert any(e["word"] == "interest rate" for e in result["paragraphs"][1]["entries"])
+
+
+@case("超纲漏词覆盖、专名区分、词形误筛与离线兜底")
+def test_vocab_coverage():
+    core_dict.ensure_db(background=False)
+    cfgmod.ensure_wordlists()
+    known = cfgmod.wordset("cet4")
+    assert {"space", "system", "technology", "internet", "story", "the"} <= known
+    assert "candid" not in known and "shameless" not in known
+    text = "Candid remarks helped. The response was candid and shameless. Candid supplied data to Goodhart and NASA."
+    units = [(0, text)]
+    lexicon = gen._vocab_lexicon(units)
+    candidates = gen.candidates([text], known, lexicon)
+    assert "candid" in candidates and "shameless" in candidates
+    assert not gen.candidates(["The story was about a woman and her children this year."], known,
+        gen._vocab_lexicon([(0, "The story was about a woman and her children this year.")])), "基础词表缺项不能变成批量生词"
+    required = gen._required_candidates(text, candidates, lexicon)
+    assert "candid" in required and "shameless" in required
+    assert "goodhart" not in required and "nasa" not in required
+    assert "candid" not in gen._required_candidates("Data from Candid arrived.", ["candid"], lexicon), "机构名场景不应强制按普通词补齐"
+    assert "candid" in gen._required_candidates("He paused. Candid comments followed.", ["candid"], lexicon)
+    assert "new" in gen.lemma_forms("news")
+    assert gen.candidates(["news"], {"new"}, core_dict.lookup_many(["news"])) == ["news"], "独立词不能被猜测词形误筛"
+
+    art = {"index": 0, "title": "A story", "paragraphs": [
+        "The response was candid and shameless.", "Candid remarks helped."]}
+    calls = []
+    def omitted(config, system, user, **kwargs):
+        calls.append(user)
+        assert "不可再按自己的常用程度" in system and "必须收录" in user
+        return J.dumps({"paragraphs": [{"index": int(i), "entries": []}
+            for i in re.findall(r"### 段落 (-?\d+)", user)]})
+    meta = dict(META, id="T_COVERAGE")
+    with patch.object(llm, "chat", omitted):
+        vocab = gen.generate_vocab(meta, art, "cet4", {"name": "test"})
+    assert len(calls) == 1, "漏词兜底不应自动增加模型调用"
+    assert vocab["processedParagraphs"] == [-1, 0, 1] and not vocab["failedChunks"]
+    assert gen.vocab_context_pending(vocab) >= 3
+    for section in vocab["paragraphs"]:
+        candid = next(e for e in section["entries"] if e["word"] == "candid")
+        assert candid["senseSource"] == "dictionary" and candid["contextPending"]
+        assert "坦白" in candid["sense"] and candid["phonetic"] and not candid["root"]
+        assert candid["inText"] in art["paragraphs"][section["index"]]
+    with patch.object(llm, "chat", side_effect=AssertionError("打开完整缓存不能重新调用模型")):
+        cached = gen.generate_vocab(meta, art, "cet4", {"name": "test"})
+    assert cached == vocab
+    # “补充本文释义”只处理待补词所在段落，原有词条照常保留。
+    def enrich(config, system, user, **kwargs):
+        assert "### 段落 -1" not in user
+        return J.dumps({"paragraphs": [
+            {"index": 0, "entries": [["candid", "adj.", "坦率直言的", "", False, ""],
+                                     ["shameless", "adj.", "不知羞耻的", "", False, ""]]},
+            {"index": 1, "entries": [["candid", "adj.", "坦率的", "", False, ""]]}]})
+    with patch.object(llm, "chat", enrich):
+        filled = gen.generate_vocab(meta, art, "cet4", {"name": "test"}, enrich=True)
+    assert gen.vocab_context_pending(filled) == 0, [(p["index"], e["word"]) for p in filled["paragraphs"] for e in p["entries"] if e.get("contextPending")]
+    assert all(not e.get("senseSource") for p in filled["paragraphs"] for e in p["entries"])
+    # 语境释义依然遗漏时不能丢掉词典兜底，也不能误标语境义已补齐。
+    store.save_vocab(meta["id"], vocab)
+    with patch.object(llm, "chat", omitted):
+        still_pending = gen.generate_vocab(meta, art, "cet4", {"name": "test"}, enrich=True)
+    assert gen.vocab_context_pending(still_pending) == gen.vocab_context_pending(vocab)
+
+
+@case("旧词表加载自动补漏与生词弹窗的释义来源标注")
+def test_vocab_coverage_ui():
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_reader import ReaderFrame
+
+    meta = dict(META, id="T_COVERAGE_UI")
+    art = {"index": 0, "title": "A story", "paragraphs": ["The reply was candid."]}
+    store.save_vocab(meta["id"], {"level": "cet4", "articleIndex": 0, "titleEntries": [],
+        "paragraphs": [], "processedParagraphs": [-1, 0], "idioms": []})
+    root = tk.Tk()
+    posts, events, errors = [], [], []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    app = SimpleNamespace(settings={"readerFontSize": 13, "sheetFontSize": 11, "vocabLevel": "cet4", "llms": []},
+                          post=lambda *args: posts.append(args), emit=lambda *args: events.append(args),
+                          open_digest=lambda *args: None, save_settings=lambda: None)
+    try:
+        frame = ReaderFrame(root, app, meta, 0)
+        frame.pack(fill="both", expand=True)
+        with patch.object(store, "ensure_content", return_value={"articles": [art]}), patch.object(llm, "chat",
+                side_effect=AssertionError("旧缓存补漏不能调用模型")):
+            frame._load_worker()
+        assert events[0][0] == "content_loaded"
+        assert gen.vocab_context_pending(store.load_vocab(meta["id"], 0, "cet4")) == 1
+        frame.on_content_loaded(events[0][1])
+        root.update()
+        frame._show_para_vocab(0)
+        root.update()
+        win = next(w for w in frame.winfo_children() if isinstance(w, tk.Toplevel))
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        txt = next(w for w in descendants(win) if isinstance(w, tk.Text))
+        assert "词典释义（待补充本文含义）" in txt.get("1.0", "end")
+        button = next(w for w in descendants(win) if w.winfo_class() == "TButton"
+                      and "补充本文释义" in str(w.cget("text")))
+        with patch.object(frame, "generate_vocab", side_effect=lambda **kw: setattr(frame, "vocab_running", True)) as generate:
+            button.invoke()
+            generate.assert_called_once_with(enrich=True)
+        assert not win.winfo_exists() and not errors, errors
+    finally:
+        root.destroy()
+
+
+@case("旧词表离线补漏、保留既有词条且不误标失败段完成")
+def test_vocab_cached_coverage():
+    art = {"index": 0, "title": "A story", "paragraphs": [
+        "The bank was candid.", "The bank was open.", "An opaque wall."]}
+    existing = {"articleIndex": 0, "level": "cet4", "titleEntries": [], "idioms": [],
+        "paragraphs": [{"index": 0, "startWords": "The bank was candid.", "entries": [
+            {"word": "bank", "sense": "河岸", "root": "原有说明", "inText": "The bank was candid"}]}],
+        "processedParagraphs": [-1, 0, 1], "chunkFailures": {"2": ["test"]}}
+    original = J.loads(J.dumps(existing))
+    with patch.object(llm, "chat", side_effect=AssertionError("旧缓存补漏必须离线")):
+        audited = gen.audit_vocab_coverage(existing, art, "cet4")
+        assert audited == gen.audit_vocab_coverage(audited, art, "cet4"), "重复打开必须幂等"
+    assert existing == original, "审核不能原地修改正在显示的词表"
+    assert audited["processedParagraphs"] == [-1, 0, 1] and audited["chunkFailures"] == {"2": ["test"]}
+    assert all(p["index"] != 2 for p in audited["paragraphs"]), "未生成的段落不能由离线兜底误报已完成"
+    entries = next(p["entries"] for p in audited["paragraphs"] if p["index"] == 0)
+    assert entries[0]["sense"] == "河岸" and entries[0]["root"] == "原有说明"
+    assert any(e["word"] == "candid" and e["contextPending"] for e in entries)
 
 
 @case("生词分块候选隔离、长段落与旧缓存续传")

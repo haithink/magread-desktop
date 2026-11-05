@@ -261,8 +261,15 @@ class ReaderFrame(tk.Frame):
 
     # ---------- 数据加载 ----------
     def _load_worker(self):
-        core_dict.prewarm()
         content = store.ensure_content(self.meta)
+        article = next((a for a in content["articles"] if a["index"] == self.article_index), None)
+        cached = store.load_vocab(self.meta["id"], self.article_index, self.app.settings["vocabLevel"])
+        if article and cached:
+            audited = gen.audit_vocab_coverage(cached, article, self.app.settings["vocabLevel"])
+            if audited != cached:
+                store.save_vocab(self.meta["id"], audited)
+        else:
+            core_dict.prewarm()
         self.app.emit("content_loaded", (content, self.article_index))
 
     def on_content_loaded(self, payload):
@@ -373,7 +380,8 @@ class ReaderFrame(tk.Frame):
     def _refresh_status(self):
         if self.vocab_running:
             return  # 进度由 on_vocab_* 事件刷新
-        self.status.config(text="")
+        pending = gen.vocab_context_pending(self.vocab or {})
+        self.status.config(text=f"已补齐 {pending} 个漏词的词典释义 · 可在生词表中补充本文释义" if pending else "")
 
     # ---------- 生词表 ----------
     def _vocab_btn(self):
@@ -410,7 +418,7 @@ class ReaderFrame(tk.Frame):
         missing = sum(1 for i in range(len(self.article["paragraphs"])) if i not in processed)
         return missing or None
 
-    def generate_vocab(self, cfg=None):
+    def generate_vocab(self, cfg=None, enrich=False):
         if self.article is None or self.vocab_running:
             return
         cfg = dict(cfg or cfgmod.get_llm(self.app.settings))
@@ -421,9 +429,9 @@ class ReaderFrame(tk.Frame):
         self.vocab_running = True
         self.vocab_btn.config(state="disabled")
         self.status.config(text=f"生词表生成中… 准备中（{cfg.get('name', '默认')}）")
-        self.app.post(self._vocab_worker, cfg)
+        self.app.post(self._vocab_worker, cfg, enrich)
 
-    def _vocab_worker(self, cfg):
+    def _vocab_worker(self, cfg, enrich=False):
         def progress(done, total, llm_name=None):
             self.app.emit("vocab_progress", {"done": done, "total": total, "llm": llm_name})
 
@@ -435,6 +443,7 @@ class ReaderFrame(tk.Frame):
             vocab = gen.generate_vocab(
                 self.meta, self.article, self.app.settings["vocabLevel"], cfg,
                 on_progress=progress, on_chars=chars, llm_rotation=rotation,
+                enrich=enrich,
             )
             self.app.emit("vocab_done", vocab)
         except Exception as e:
@@ -469,7 +478,9 @@ class ReaderFrame(tk.Frame):
         else:
             elapsed = (vocab.get("generationStats") or {}).get("elapsedMs")
             timing = f"，{elapsed / 1000:.1f} 秒" if elapsed is not None else ""
-            self.status.config(text=f"生词表完成（{self._total_words()} 词{timing}，已缓存）")
+            pending = gen.vocab_context_pending(vocab)
+            suffix = f" · {pending} 词已用词典补齐，可补充本文释义" if pending else ""
+            self.status.config(text=f"生词表完成（{self._total_words()} 词{timing}，已缓存）{suffix}")
         self._show_full_vocab()
 
     def on_vocab_error(self, msg):
@@ -730,6 +741,13 @@ class ReaderFrame(tk.Frame):
     def _render_vocab_sheet(self, title, only_para):
         win, txt, bar = self._make_sheet(title, self.article["title"][:36])
         _render_vocab(txt, self.vocab, only_para)
+        pending = gen.vocab_context_pending(self.vocab)
+        if pending:
+            def enrich():
+                self.generate_vocab(enrich=True)
+                if self.vocab_running:
+                    win.destroy()
+            ttk.Button(bar, text=f"补充本文释义（{pending} 词）", command=enrich).pack(side="right", padx=8, pady=3)
 
     # ---------- 公共弹层 ----------
     def _make_sheet(self, title, subtitle):
@@ -859,6 +877,8 @@ def _render_vocab(txt, vocab, only_para):
         txt.insert("end", line, "word")
         if e.get("term"):
             txt.insert("end", "[术语] ", "term")
+        if e.get("senseSource") == "dictionary":
+            txt.insert("end", "\n词典释义（待补充本文含义）", "meta")
         txt.insert("end", "\n" + e.get("sense", ""), "sense")
         if e.get("inText"):
             txt.insert("end", f"\n原文：{e['inText']}", "quote")

@@ -28,6 +28,17 @@
 - 当前仓库未记录原始来源、版本或许可证，不能据此认定该资源已获得 AGPL 授权。
   公开分发该词表前，需要核实来源和再分发条款，或替换为来源与许可明确的词表。
 
+## 基础至 CET-4 的已知词补充表
+
+- 文件：`kandu/assets/cet4_known_supplement.txt`，与原词表取并集，不覆盖用户本地词表。
+- 来源：ECDICT 的 `ecdict.csv`，提交 `39cfb9672c0906b63569e0453c2e6abfb9ab182a`。
+- 上游固定版本：https://github.com/skywind3000/ECDICT/tree/39cfb9672c0906b63569e0453c2e6abfb9ab182a
+- 选择规则：保留含 `zk`（中考）、`gk`（高考）或 `cet4` 标签的词，转小写、去重、排序。
+  这些是 ECDICT 的分级标注，不宣称为官方完整考试大纲。
+- 许可证：MIT，随附 `LICENSES/ECDICT-MIT.txt`；导出过程不改动该版权声明。
+- 源文件 SHA-256、行数和导出词数见 `kandu/assets/cet4_known_supplement.json`。
+- 复现：`python tools/build_cet4_supplement.py <固定版本的ecdict.csv>`。
+
 ## 其他依赖与打包组件
 
 `requirements.txt` 中的其他依赖，以及打包时包含的 Python、Tcl/Tk、SQLite 等组件，
