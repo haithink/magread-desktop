@@ -687,6 +687,91 @@ def test_digest_browsing():
         root.destroy()
 
 
+@case("摘要标记局部更新、筛选移除与性能")
+def test_digest_incremental_mark():
+    import statistics
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_digest import DigestFrame
+
+    meta = dict(META, id="T_DIGEST_PERF")
+    articles = [{"index": i, "titleEn": f"Article {i}: A different way to understand the world",
+                 "titleZh": f"第 {i + 1} 篇：用另一种方式理解世界",
+                 "summaryZh": "这篇文章探讨技术、社会和生活的变化，介绍不同观点与相关背景。" * 5}
+                for i in range(80)]
+    store.save_digest({"bookId": meta["id"], "articles": articles})
+    app = SimpleNamespace(settings={}, show_library=lambda: None, open_reader=lambda *a: None)
+    root = tk.Tk()
+    root.geometry("1180x800")
+    errors = []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    try:
+        with patch.object(gen, "digest_incomplete", return_value=False):
+            frame = DigestFrame(root, app, meta)
+        frame.pack(fill="both", expand=True)
+        root.update()
+        time.sleep(.05)
+        root.update()
+        # 对比上一版的保存 + 整页重建路径。包含布局/绘制，使用同一份沙箱数据。
+        full_times = []
+        for state in ("read", "unread", "read"):
+            start = time.perf_counter()
+            frame._states = store.set_article_state(meta["id"], 0, state)
+            frame._render(keep_scroll=True)
+            root.update()
+            full_times.append(time.perf_counter() - start)
+        cards = dict(frame._cards)
+        frame.canvas.yview_moveto(.35)
+        root.update()
+        scroll = frame.canvas.yview()
+        bounds = {i: (c["frame"].winfo_y(), c["frame"].winfo_height()) for i, c in cards.items()}
+        local_times = []
+        with patch.object(frame, "_render", side_effect=AssertionError("标记不能重建整页")), \
+             patch.object(frame, "_make_card", side_effect=AssertionError("标记不能创建卡片")):
+            for state in ("uninterested", "unread", "read", "uninterested", "unread"):
+                start = time.perf_counter()
+                frame._mark(0, state)
+                root.update()
+                local_times.append(time.perf_counter() - start)
+                assert all(frame._cards[i] is c and c["frame"].winfo_exists() for i, c in cards.items())
+                assert bounds == {i: (c["frame"].winfo_y(), c["frame"].winfo_height()) for i, c in cards.items()}
+                assert frame.canvas.yview() == scroll, "全部列表中标记不应改变滚动位置"
+            assert "未读" in frame._cards[0]["badge"].cget("text")
+            assert frame._counts == {"unread": 80, "read": 0, "uninterested": 0}
+            with patch.object(store, "set_article_state", side_effect=AssertionError("重复标记无需写盘")):
+                frame._mark(0, "unread")
+        print(f"  80 articles, median incl. save/layout/paint: full={statistics.median(full_times)*1000:.1f}ms, "
+              f"local={statistics.median(local_times)*1000:.1f}ms")
+        # 在未读筛选中标记：仅删除当前卡片，保留其余控件和附近文章位置。
+        frame._select_filter("unread")
+        root.update()
+        cards = dict(frame._cards)
+        victim, following = 35, 36
+        height = frame.inner.winfo_reqheight()
+        frame.canvas.yview_moveto((cards[victim]["frame"].winfo_y() + 24) / height)
+        root.update()
+        relative_y = cards[following]["frame"].winfo_y() - frame.canvas.canvasy(0)
+        with patch.object(frame, "_render", side_effect=AssertionError("筛选内标记不能重建整页")), \
+             patch.object(frame, "_make_card", side_effect=AssertionError("筛选内标记不能创建卡片")):
+            frame._mark(victim, "uninterested")
+            root.update()
+            assert victim not in frame._cards and not cards[victim]["frame"].winfo_exists()
+            assert len(frame._visible_articles) == 79
+            assert all(frame._cards[i] is c for i, c in cards.items() if i != victim)
+            assert abs(cards[following]["frame"].winfo_y() - frame.canvas.canvasy(0) - relative_y) <= 24
+            assert frame._counts["uninterested"] == 1
+            assert "显示 79 / 80" in frame.result_label.cget("text")
+        frame._select_filter("uninterested")
+        frame._mark(victim, "read")
+        root.update()
+        assert not frame._cards and not frame._visible_articles
+        assert frame.inner.winfo_children(), "最后一张卡片移除后应显示空态"
+        assert frame.vbar.winfo_ismapped()
+        assert not errors, errors
+    finally:
+        root.destroy()
+
+
 def main():
     only = set(sys.argv[1:])
     if os.path.exists(SANDBOX):

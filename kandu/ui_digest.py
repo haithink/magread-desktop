@@ -188,12 +188,42 @@ class DigestFrame(tk.Frame):
         return self._states.get(str(index), "unread")
 
     def _mark(self, index, state):
+        if self._state(index) == state:
+            return
         try:
             self._states = store.set_article_state(self.meta["id"], index, state)
         except (OSError, ValueError) as e:
             self.status.config(text=f"标记保存失败：{e}")
             return
-        self._render(keep_scroll=True)
+        self._update_counts()
+        card = self._cards.get(index)
+        if card is None:
+            return
+        if self._filter == "all" or self._filter == state:
+            label, color, tint = STATES[state]
+            card["badge"].config(text=f"  {label}  ", fg=color, bg=tint)
+            for key, button in card["marks"].items():
+                _, fg, bg = STATES[key]
+                button.config(bg=bg if key == state else "white",
+                              fg=fg if key == state else MUTED)
+        else:
+            # 只移除不再符合筛选的卡片。保留其他控件，避免整页重建和闪烁。
+            top = self.canvas.canvasy(0)
+            anchor = next((c["frame"] for i, c in self._cards.items() if i != index
+                           and c["frame"].winfo_y() + c["frame"].winfo_height() > top), None)
+            offset = anchor.winfo_y() - top if anchor is not None else 0
+            self._text_labels = [w for w in self._text_labels if w not in card["labels"]]
+            card["frame"].destroy()
+            del self._cards[index]
+            self._visible_articles = [a for a in self._visible_articles if a["index"] != index]
+            if not self._visible_articles:
+                self._show_empty()
+            self._update_result_label()
+            self.canvas.update_idletasks()
+            self._update_scrollregion()
+            if anchor is not None:
+                height = max(1, self.inner.winfo_reqheight())
+                self.canvas.yview_moveto(max(0, anchor.winfo_y() - offset) / height)
 
     def _select_filter(self, state):
         self._filter = state
@@ -213,7 +243,7 @@ class DigestFrame(tk.Frame):
     def _reset_filters(self):
         self._filter = "all"
         self.search_var.set("")
-        self._render()
+        self._apply_search()
 
     # ---- 生成 ----
     def generate(self):
@@ -303,6 +333,24 @@ class DigestFrame(tk.Frame):
             w.destroy()
         self._text_labels.clear()
         self._cards.clear()
+        self._update_counts()
+        query = self.search_var.get().strip().casefold()
+        self._visible_articles = [a for a in self._articles
+                                  if (self._filter == "all" or self._state(a["index"]) == self._filter)
+                                  and all(term in " ".join(str(a.get(k, "")) for k in
+                                          ("titleEn", "titleZh", "summaryZh")).casefold()
+                                          for term in query.split())]
+        self._update_result_label()
+        for article in self._visible_articles:
+            self._make_card(article)
+        if not self._visible_articles:
+            self._show_empty()
+        self._layout_content(self.canvas.winfo_width())
+        self.canvas.update_idletasks()
+        self._update_scrollregion()
+        self.canvas.yview_moveto(scroll)
+
+    def _update_counts(self):
         self._counts = {s: sum(self._state(a["index"]) == s for a in self._articles) for s in STATES}
         total = len(self._articles)
         for key, button in self.filter_buttons.items():
@@ -311,28 +359,20 @@ class DigestFrame(tk.Frame):
             button.config(text=f"{label}  {count}", bg=GREEN if key == self._filter else "#e7ebe4",
                           fg="white" if key == self._filter else MUTED)
         self.overview.config(text=f"{total} 篇文章   /   已读 {self._counts['read']} 篇")
-        query = self.search_var.get().strip().casefold()
-        self._visible_articles = [a for a in self._articles
-                                  if (self._filter == "all" or self._state(a["index"]) == self._filter)
-                                  and all(term in " ".join(str(a.get(k, "")) for k in
-                                          ("titleEn", "titleZh", "summaryZh")).casefold()
-                                          for term in query.split())]
-        self.result_label.config(text=f"显示 {len(self._visible_articles)} / {total} 篇" +
-                                 (f" · 搜索：{self.search_var.get().strip()}" if query else ""))
-        for article in self._visible_articles:
-            self._make_card(article)
-        if not self._visible_articles:
-            empty = tk.Frame(self.inner, bg=PAPER, pady=56)
-            empty.pack(fill="x")
-            tk.Label(empty, text="暂时没有匹配的文章", bg=PAPER, fg=INK,
-                     font=(FAMILY, 15, "bold")).pack()
-            tk.Label(empty, text="试试其他状态，或换一个搜索词。", bg=PAPER,
-                     fg=MUTED, font=(FAMILY, 10)).pack(pady=(10, 18))
-            self._button(empty, "查看全部文章", self._reset_filters, bg=GREEN, fg="white").pack()
-        self._layout_content(self.canvas.winfo_width())
-        self.canvas.update_idletasks()
-        self._update_scrollregion()
-        self.canvas.yview_moveto(scroll)
+
+    def _update_result_label(self):
+        query = self.search_var.get().strip()
+        self.result_label.config(text=f"显示 {len(self._visible_articles)} / {len(self._articles)} 篇" +
+                                 (f" · 搜索：{query}" if query else ""))
+
+    def _show_empty(self):
+        empty = tk.Frame(self.inner, bg=PAPER, pady=56)
+        empty.pack(fill="x")
+        tk.Label(empty, text="暂时没有匹配的文章", bg=PAPER, fg=INK,
+                 font=(FAMILY, 15, "bold")).pack()
+        tk.Label(empty, text="试试其他状态，或换一个搜索词。", bg=PAPER,
+                 fg=MUTED, font=(FAMILY, 10)).pack(pady=(10, 18))
+        self._button(empty, "查看全部文章", self._reset_filters, bg=GREEN, fg="white").pack()
 
     def _make_card(self, article):
         index = article["index"]
@@ -345,8 +385,9 @@ class DigestFrame(tk.Frame):
         meta_row.pack(fill="x", pady=(0, 10))
         tk.Label(meta_row, text=f"ARTICLE  {index + 1:02d}", bg="white", fg=MUTED,
                  font=(FAMILY, 9)).pack(side="left")
-        tk.Label(meta_row, text=f"  {label}  ", bg=tint, fg=color,
-                 font=(FAMILY, 9), pady=3).pack(side="right")
+        badge = tk.Label(meta_row, text=f"  {label}  ", bg=tint, fg=color,
+                         font=(FAMILY, 9), pady=3, width=8)
+        badge.pack(side="right")
         text_widgets = []
         for key, font, fg, padding in [
             ("titleEn", ("Georgia", 17, "bold"), INK, (0, 6)),
@@ -376,4 +417,5 @@ class DigestFrame(tk.Frame):
             buttons[key] = button
         open_button = self._button(footer, "阅读全文  →", lambda i=index: self._open(i), bg=GREEN, fg="white")
         open_button.pack(side="right")
-        self._cards[index] = {"frame": card, "marks": buttons, "open": open_button, "labels": text_widgets}
+        self._cards[index] = {"frame": card, "badge": badge, "marks": buttons,
+                              "open": open_button, "labels": text_widgets}
