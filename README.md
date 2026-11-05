@@ -7,20 +7,19 @@
 
 用中文摘要快速找到感兴趣的文章，在舒展的英文排版中精读；阅读位置自动保存，下次从最近阅读入口继续。
 
+每张截图单独展示，点击图片可查看原图。
+
 **原文阅读：中英文标题、全文词数、阅读进度与段落生词入口。**
 
-![Windows 桌面版原文阅读界面](docs/screenshots/desktop-reader.png)
+[![Windows 桌面版原文阅读界面](docs/screenshots/desktop-reader.png)](docs/screenshots/desktop-reader.png)
 
-<table>
-  <tr>
-    <th>文章摘要与最近阅读</th>
-    <th>逐段生词表</th>
-  </tr>
-  <tr>
-    <td><img src="docs/screenshots/desktop-digest.png" alt="文章摘要浏览：最近阅读、继续阅读、未读与已读标记、搜索筛选" width="580"></td>
-    <td><img src="docs/screenshots/desktop-vocabulary.png" alt="生词表：音标、本文含义、原文短语与词根词源" width="460"></td>
-  </tr>
-</table>
+**文章摘要与最近阅读：继续阅读入口、文章标记与搜索筛选。**
+
+[![文章摘要浏览：最近阅读、继续阅读、未读与已读标记、搜索筛选](docs/screenshots/desktop-digest.png)](docs/screenshots/desktop-digest.png)
+
+**逐段生词表：音标、本文含义、原文短语与词根词源。**
+
+[![生词表：音标、本文含义、原文短语与词根词源](docs/screenshots/desktop-vocabulary.png)](docs/screenshots/desktop-vocabulary.png)
 
 截图来自当前源码实际运行的程序，使用原创示例文章及预置的摘要、释义演示数据；实际生成结果随所选模型而异。下载包的版本以下载区标注为准。
 
@@ -28,10 +27,13 @@
 
 三个版本分别维护，按阅读场景选择；目前不提供跨端自动同步。
 
-| [Android 手机版](https://github.com/haithink/magread) | [Chrome 网页版](https://github.com/haithink/magread-chrome) |
-| --- | --- |
-| <a href="https://github.com/haithink/magread"><img src="https://raw.githubusercontent.com/haithink/magread/main/docs/screenshots/android-reader.png" alt="Android 手机版原文阅读界面" width="210"></a> | <a href="https://github.com/haithink/magread-chrome"><img src="https://raw.githubusercontent.com/haithink/magread-chrome/main/docs/screenshots/chrome-vocabulary.png" alt="Chrome 网页版正文与生词侧栏" width="580"></a> |
-| 手机上阅读 EPUB / PDF，随时查看生词与句解。 | 保留网页原文，在侧栏查看摘要、生词和句解。 |
+**[Android 手机版](https://github.com/haithink/magread)**：手机上阅读 EPUB / PDF，随时查看生词与句解。
+
+[![Android 手机版原文阅读界面](https://raw.githubusercontent.com/haithink/magread/main/docs/screenshots/android-reader.png)](https://raw.githubusercontent.com/haithink/magread/main/docs/screenshots/android-reader.png)
+
+**[Chrome 网页版](https://github.com/haithink/magread-chrome)**：保留网页原文，在侧栏查看摘要、生词和句解。
+
+[![Chrome 网页版正文与生词侧栏](https://raw.githubusercontent.com/haithink/magread-chrome/main/docs/screenshots/chrome-vocabulary.png)](https://raw.githubusercontent.com/haithink/magread-chrome/main/docs/screenshots/chrome-vocabulary.png)
 
 ## 下载 Windows 安装包
 
