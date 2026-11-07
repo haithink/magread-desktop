@@ -743,6 +743,46 @@ def test_analysis_reading_layout():
         root.destroy()
 
 
+@case("语法图解缩进、中英文列对齐与字号缩放")
+def test_analysis_diagram_alignment():
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_analysis import make_sheet, render_analysis, _styles
+
+    root = tk.Tk()
+    root.withdraw()
+    app = SimpleNamespace(settings={"sheetFontSize": 11}, save_settings=lambda: None)
+    # 中文占两个英文列；第一行缩进和中文标签之间的空格都参与定位。
+    diagram = "    [We]    [read]    [books]\n    主语    谓语      宾语\n"
+    tabbed = "    [We]\t[read]\t[books]\n    主语\t谓语\t宾语\n"
+    try:
+        win, txt, _ = make_sheet(root, app, "Alignment regression")
+        win.geometry("960x860")
+        for original in (diagram, tabbed):
+            render_analysis(txt, {"grammarDiagram": original}, "We read books.")
+            root.update()
+            start, end = txt.tag_ranges("diagram")
+            assert txt.get(start, end) == original, "图解的原始缩进、空格与换行不能被修改"
+            first_line = int(str(start).split(".")[0])
+            english, chinese = original.splitlines()
+            for size in range(9, 23):
+                _styles(txt, size)
+                txt.yview(start)
+                txt.xview_moveto(0)
+                root.update()
+                for word, label in (("[We]", "主语"), ("[read]", "谓语"), ("[books]", "宾语")):
+                    upper = txt.bbox(f"{first_line}.{english.index(word)}")
+                    lower = txt.bbox(f"{first_line + 1}.{chinese.index(label)}")
+                    assert upper is not None and lower is not None
+                    assert abs(upper[0] - lower[0]) <= 1, f"{size} 号 {word}/{label} 错位：{upper[0]} vs {lower[0]}"
+        # 缓存中双重转义的换行同样支持，且不删除首行缩进。
+        render_analysis(txt, {"grammarDiagram": diagram.rstrip("\n").replace("\n", "\\n")})
+        start, end = txt.tag_ranges("diagram")
+        assert txt.get(start, end) == diagram
+    finally:
+        root.destroy()
+
+
 @case("JSON 修补")
 def test_repair():
     broken = '{"paragraphs":[{"index":1,"startWords":"He had","entries":[{"word":"patent","sense":"专利"},{"word":"sensor",'

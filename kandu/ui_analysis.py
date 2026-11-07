@@ -1,6 +1,6 @@
 """句子讲解窗口：原句、词汇、语法、语境与译文的阅读排版。"""
 import tkinter as tk
-from tkinter import ttk
+from tkinter import font as tkfont, ttk
 
 FAMILY = "Microsoft YaHei UI"
 GREEN = "#1b4b43"
@@ -25,9 +25,12 @@ def _styles(txt, size):
     txt.tag_configure("note", foreground="#6c7e64", font=(FAMILY, max(9, size - 1)), spacing3=12)
     txt.tag_configure("point", font=(FAMILY, size, "bold"), foreground=INK,
                       spacing1=10, spacing3=4)
-    txt.tag_configure("diagram", font=("Consolas", size), foreground="#365c54",
+    # Consolas 回退中文时，汉字宽度并非英文的两倍；新宋体保持严格的 2:1 列宽。
+    diagram_font = tkfont.Font(root=txt, family="NSimSun", size=size)
+    txt.tag_configure("diagram", font=("NSimSun", size), foreground="#365c54",
                       background="#edf2eb", lmargin1=14, lmargin2=14, rmargin=14,
-                      spacing1=10, spacing2=6, spacing3=10, wrap="none")
+                      spacing1=10, spacing2=6, spacing3=10, wrap="none",
+                      tabs=(diagram_font.measure(" ") * 8,), tabstyle="wordprocessor")
     txt.tag_configure("translation", font=(FAMILY, size + 1), foreground=GREEN,
                       background="#e8f1e6", lmargin1=16, lmargin2=16, rmargin=16,
                       spacing1=12, spacing2=8, spacing3=12)
@@ -187,7 +190,9 @@ def render_analysis(txt, analysis, sentence=None):
     if analysis.get("grammarDiagram") or analysis.get("grammarPoints"):
         _section(txt, "grammar", "02  /  句子结构与语法")
         if analysis.get("grammarDiagram"):
-            txt.insert("end", analysis["grammarDiagram"].replace("\\n", "\n").strip() + "\n", "diagram")
+            # 缩进也是图解布局的一部分，不能用 strip() 删除第一行的空格。
+            diagram = analysis["grammarDiagram"].replace("\\n", "\n")
+            txt.insert("end", diagram if diagram.endswith("\n") else diagram + "\n", "diagram")
         for i, point in enumerate(analysis.get("grammarPoints") or [], 1):
             txt.insert("end", f"{i:02d}   {point.get('title', '')}\n", "point")
             if point.get("text"):
