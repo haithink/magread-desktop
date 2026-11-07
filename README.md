@@ -21,6 +21,10 @@
 
 [![生词表：音标、本文含义、原文短语与词根词源](docs/screenshots/desktop-vocabulary.png)](docs/screenshots/desktop-vocabulary.png)
 
+**句子讲解：原句、疑难词汇、语法结构、上下文与参考译文，可通过顶部导航快速定位。**
+
+[![句子讲解：分区排版、语法图解与参考译文](docs/screenshots/desktop-analysis.png)](docs/screenshots/desktop-analysis.png)
+
 截图来自当前源码实际运行的程序，使用原创示例文章及预置的摘要、释义演示数据；实际生成结果随所选模型而异。下载包的版本以下载区标注为准。
 
 ### 其他版本
@@ -59,6 +63,10 @@
    生词表词条级段落锚点自愈、运行日志（error.log）
 
 数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache / article_states）
+
+v0.8.4 重新设计句子讲解窗口：暖白阅读页、英文原句衬线排版、分区导航、独立音标样式、
+语法图解底色与译文强调色；生成进度固定在底部。可快速跳转原句 / 词汇 / 语法 / 语境 / 译文，
+保留文本选择、复制、字号调整与滚动；过宽的语法图解可横向滚动查看。
 
 v0.8.3 对 DeepSeek 的句子解析请求显式关闭思考模式，保留疑难词汇、语法图解、语法点、语境与译文。
 等待时显示经过秒数、已接收字符数与重试次数；完成后展示生成耗时。

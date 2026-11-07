@@ -661,6 +661,88 @@ def test_analysis_progress_ui():
         root.destroy()
 
 
+@case("句解分区导航、窄窗大字与语法图解滚动")
+def test_analysis_reading_layout():
+    import tkinter as tk
+    import tkinter.font as tkfont
+    from tkinter import ttk
+    from types import SimpleNamespace
+    from kandu.ui_analysis import make_sheet, render_analysis, render_loading
+
+    root = tk.Tk()
+    root.withdraw()
+    saves, errors = [], []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    app = SimpleNamespace(settings={"sheetFontSize": 11}, save_settings=lambda: saves.append(True))
+    sentence = "The shop became a place where people shared stories."
+    analysis = {"vocab": [{"word": "ingenuity", "phonetic": "ˌɪndʒəˈnjuːəti", "sense": "巧思", "note": "词源说明"}],
+                "grammarDiagram": "Main clause: " + "subject predicate complement " * 12 + "\n定语从句",
+                "grammarPoints": [{"title": "定语从句", "text": "where 指代先行词 place，充当从句中的地点状语。" * 5} for _ in range(4)],
+                "context": "小店成为了邻里分享故事的场所。" * 12,
+                "translation": "修理铺成为人们分享故事的地方。"}
+    try:
+        win, txt, footer = make_sheet(root, app, "An article title " * 20)
+        render_loading(txt, sentence)
+        root.update()
+        assert txt._analysis_nav["source"].cget("state") == "normal"
+        assert txt._analysis_nav["translation"].cget("state") == "disabled"
+        render_analysis(txt, analysis, sentence)
+        root.update()
+        assert txt.cget("state") == "disabled"
+        for content in (sentence, "ingenuity", "词源说明", analysis["translation"]):
+            assert content in txt.get("1.0", "end")
+        assert txt.tag_ranges("source") and txt.tag_ranges("translation")
+        assert tkfont.Font(root=root, font=txt.tag_cget("source", "font")).actual("family") == "Georgia"
+        assert txt.tag_cget("diagram", "wrap") == "none", "语法图解不能自动折行破坏对齐"
+
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+
+        widgets = list(descendants(win))
+        vertical = next(w for w in widgets if isinstance(w, ttk.Scrollbar) and str(w.cget("orient")) == "vertical")
+        horizontal = next(w for w in widgets if isinstance(w, ttk.Scrollbar) and str(w.cget("orient")) == "horizontal")
+        for geometry in ("560x420", "960x860"):
+            win.geometry(geometry)
+            root.update()
+            assert vertical.winfo_ismapped()
+            assert txt.winfo_width() > 400 and txt.winfo_height() > 150
+            for key, btn in txt._analysis_nav.items():
+                assert btn.winfo_ismapped() and btn.winfo_width() >= btn.winfo_reqwidth()
+                btn.invoke()
+                root.update()
+                assert txt.bbox("section_" + key) is not None, f"导航未定位到 {key}"
+            txt._analysis_nav["grammar"].invoke()
+            root.update()
+            assert horizontal.winfo_ismapped(), "过宽图解必须能横向滚动查看"
+            txt.xview_moveto(.5)
+            root.update()
+            assert txt.xview()[0] > 0
+            txt.yview_moveto(1)
+            root.update()
+            assert txt.yview()[1] > .999, "译文必须可以完整滚动到"
+        plus = next(w for w in widgets if isinstance(w, tk.Button) and w.cget("text") == "A+")
+        for _ in range(11):
+            plus.invoke()
+        root.update()
+        assert app.settings["sheetFontSize"] == 22 and saves
+        assert tkfont.Font(root=root, font=txt.tag_cget("source", "font")).actual("size") == 25
+        txt._analysis_nav["translation"].invoke()
+        root.update()
+        assert txt.bbox("section_translation") is not None
+        txt.tag_add("sel", "1.0", "1.8")
+        assert txt.get("sel.first", "sel.last"), "文本必须保留原生选择和复制能力"
+        assert not win.attributes("-topmost") and root.grab_current() is None
+        render_analysis(txt, {"grammarDiagram": "A shop opens.", "translation": "小店开门了。"}, sentence)
+        assert txt._analysis_nav["vocab"].cget("state") == "disabled"
+        assert "section_vocab" not in txt.mark_names(), "重新渲染必须清除旧导航定位"
+        assert "ingenuity" not in txt.get("1.0", "end")
+        assert not errors, errors
+    finally:
+        root.destroy()
+
+
 @case("JSON 修补")
 def test_repair():
     broken = '{"paragraphs":[{"index":1,"startWords":"He had","entries":[{"word":"patent","sense":"专利"},{"word":"sensor",'

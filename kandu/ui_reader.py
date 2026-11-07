@@ -10,6 +10,9 @@ from kandu import core_gen as gen
 from kandu import core_dict
 from kandu import core_config as cfgmod
 from kandu.core_config import app_dir
+from kandu.ui_analysis import (make_sheet as make_analysis_sheet,
+                               render_analysis as _render_analysis,
+                               render_loading as _render_loading)
 
 
 def _render_lookup(txt, word, result):
@@ -616,7 +619,7 @@ class ReaderFrame(tk.Frame):
             return
         cached = store.load_analysis(self.meta["id"], sentence, self.article["index"])
         if cached and not cached.get("partial"):
-            win, txt, bar = self._make_sheet("句解", self.article["title"][:36])
+            win, txt, bar = make_analysis_sheet(self, self.app, self.article["title"])
             self._sheets[key] = (win, txt, bar)
             _render_analysis(txt, cached, sentence)
             return
@@ -626,7 +629,7 @@ class ReaderFrame(tk.Frame):
             self.status.config(text=f"⚠ {invalid}（设置里配置）")
             return
         self.analysis_busy.add(key)
-        win, txt, bar = self._make_sheet("句解", self.article["title"][:36])
+        win, txt, bar = make_analysis_sheet(self, self.app, self.article["title"])
         self._sheets[key] = (win, txt, bar)
         _render_loading(txt, sentence)
         self._begin_analysis_progress(key, bar)
@@ -887,54 +890,6 @@ def _config_tags(txt, size=11):
     txt.tag_config("trans", background="#e9f4ef", font=(FAMILY, size))
     txt.tag_config("src", foreground="#667", font=(FAMILY, max(8, size - 1)))
     txt.tag_config("warn", foreground="#b06000", font=(FAMILY, small))
-
-
-def _render_loading(txt, sentence):
-    txt.configure(state="normal")
-    txt.delete("1.0", "end")
-    txt.insert("end", sentence + "\n", "src")
-    txt.insert("end", "\n解析中…接收进度见窗口上方，完整结果会自动缓存。", "meta")
-    txt.configure(state="disabled")
-
-
-def _render_analysis(txt, analysis, sentence=None):
-    """句解渲染：原句 → 疑难词汇 → 语法对齐图解 → 语法点 → 语境 → 参考译文"""
-    txt.configure(state="normal")
-    txt.delete("1.0", "end")
-    stats = analysis.get("generationStats") or {}
-    if stats.get("elapsedMs") is not None:
-        txt.insert("end", f"生成耗时 {stats['elapsedMs'] / 1000:.1f} 秒 · {stats.get('model', '')}\n\n", "meta")
-    if sentence:
-        txt.insert("end", sentence + "\n", "src")
-    if analysis.get("partial"):
-        txt.insert("end", "⚠ 本次解析可能不完整（模型输出被截断）。关闭弹窗后重新双击本句将自动重试。\n\n", "warn")
-    vocab = analysis.get("vocab") or []
-    if vocab:
-        txt.insert("end", "一、疑难词汇\n", "h1")
-        for v in vocab:
-            line = v.get("word", "")
-            if v.get("phonetic"):
-                line += f"  /{v['phonetic']}/"
-            txt.insert("end", line, "word")
-            if v.get("sense"):
-                txt.insert("end", "\n" + v["sense"], "sense")
-            if v.get("note"):
-                txt.insert("end", "\n" + v["note"], "root")
-            txt.insert("end", "\n\n")
-    if analysis.get("grammarDiagram"):
-        txt.insert("end", "二、语法图解\n", "h1")
-        txt.insert("end", analysis["grammarDiagram"] + "\n", "mono")
-    for i, p in enumerate(analysis.get("grammarPoints") or [], 1):
-        txt.insert("end", f"{i}. {p.get('title', '')}\n", "word")
-        if p.get("text"):
-            txt.insert("end", p["text"] + "\n\n", "sense")
-    if analysis.get("context"):
-        txt.insert("end", "三、语境\n", "h1")
-        txt.insert("end", analysis["context"] + "\n\n", "sense")
-    if analysis.get("translation"):
-        txt.insert("end", "参考译文\n", "h1")
-        txt.insert("end", analysis["translation"] + "\n", "trans")
-    txt.configure(state="disabled")
 
 
 def _render_error(txt, msg):
