@@ -7,6 +7,7 @@ rem 生成 PE 版本信息（版本号取自 kandu/__init__.py）
 
 .venv\Scripts\python.exe -m PyInstaller --noconfirm --windowed --name Kandu ^
   --version-file "ver.txt" ^
+  --icon "kandu/assets/kandu.ico" ^
   --add-data "kandu/assets;assets" ^
   --add-binary "D:/anaconda/Library/bin/tcl86t.dll;." ^
   --add-binary "D:/anaconda/Library/bin/tk86t.dll;." ^

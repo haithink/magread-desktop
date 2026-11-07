@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>刊读：打开的英文刊物</title>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#1b4b43"/>
+  <path d="M40 66 Q84 51 124 72 L124 202 Q84 181 40 196 Z" fill="#fffdf3"/>
+  <path d="M132 72 Q172 51 216 66 L216 196 Q172 181 132 202 Z" fill="#e6eddf"/>
+  <path d="M56 145 L74 91 L88 91 L106 145 L93 145 L89 132 L72 132 L68 145 Z M75 121 L86 121 L81 103 Z" fill="#1b4b43" fill-rule="evenodd"/>
+  <path d="M58 163 L103 163 M58 176 L92 176 M151 117 L196 117 M151 137 L196 137 M151 157 L188 157 M151 177 L196 177" fill="none" stroke="#729083" stroke-width="7" stroke-linecap="round"/>
+  <path d="M177 61 Q186 60 198 62 L198 100 L187 92 L177 100 Z" fill="#dcb35e"/>
+</svg>

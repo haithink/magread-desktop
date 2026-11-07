@@ -64,6 +64,10 @@
 
 数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache / article_states）
 
+v0.8.6 增加原创「英文刊物 + A + 书签」应用图标，统一主窗口、设置、生词与句解等弹窗的标题栏，
+并嵌入 Windows 程序文件；提供 16–256 像素的多尺寸 ICO 与可编辑的 SVG 源文件。
+图标资源可通过 `.venv\Scripts\python.exe scripts/build_icon.py` 从 SVG 重新生成。
+
 v0.8.5 修复句子语法图解的成分标注错位：保留首行缩进和原始空格，使用中文宽度严格为英文两倍的等宽字体，
 制表符按图解字号设置定位；已有缓存直接应用修复，无需重新请求模型。
 

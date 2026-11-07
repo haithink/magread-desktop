@@ -14,11 +14,13 @@ from kandu.ui_library import LibraryFrame
 from kandu.ui_digest import DigestFrame, _RUNNING as DIGEST_RUNNING
 from kandu.ui_reader import ReaderFrame
 from kandu.ui_settings import SettingsDialog
+from kandu.ui_icon import set_app_icon
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        set_app_icon(self)
         self.title(f"刊读 · Kandu Desktop v{__version__}")
         self.geometry("1180x800")
         self.minsize(900, 620)
