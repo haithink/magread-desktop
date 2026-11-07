@@ -1,5 +1,6 @@
 """阅读页：正文渲染、双击句解、长按/选中解析、全篇与逐段生词表。"""
 import re
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -61,6 +62,8 @@ class ReaderFrame(tk.Frame):
         self.vocab = None
         self.vocab_running = False
         self.analysis_busy = set()
+        self._analysis_progress = {}
+        self._analysis_tick_after = None
         self._last_click = (None, None)
         self._sheets = {}
         self._vocab_sheets = {}
@@ -254,7 +257,7 @@ class ReaderFrame(tk.Frame):
 
     def destroy(self):
         self.save_reading_position()
-        for pending in (self._position_after, self._restore_position_after):
+        for pending in (self._position_after, self._restore_position_after, self._analysis_tick_after):
             if pending is not None:
                 self.after_cancel(pending)
         self._position_ready = False
@@ -605,6 +608,11 @@ class ReaderFrame(tk.Frame):
     def _start_analysis(self, para, sentence):
         key = sentence
         if key in self.analysis_busy:
+            entry = self._sheets.get(key)
+            if entry and entry[0].winfo_exists():
+                entry[0].deiconify()
+                entry[0].lift()
+                entry[1].focus_set()
             return
         cached = store.load_analysis(self.meta["id"], sentence, self.article["index"])
         if cached and not cached.get("partial"):
@@ -621,7 +629,44 @@ class ReaderFrame(tk.Frame):
         win, txt, bar = self._make_sheet("句解", self.article["title"][:36])
         self._sheets[key] = (win, txt, bar)
         _render_loading(txt, sentence)
+        self._begin_analysis_progress(key, bar)
         self.app.post(self._analysis_worker, cfg, para, sentence, key)
+
+    def _begin_analysis_progress(self, key, bar):
+        previous = getattr(bar, "_analysis_status", None)
+        if previous is not None and previous.winfo_exists():
+            previous.destroy()
+        label = tk.Label(bar, bg="#1b4b43", fg="#e1ece5", font=(FAMILY, 9))
+        bar._analysis_status = label
+        label.pack(side="left", padx=10)
+        self._analysis_progress[key] = {"label": label, "started": time.monotonic(),
+                                        "chars": 0, "attempt": 1}
+        if self._analysis_tick_after is None:
+            self._tick_analysis_progress()
+
+    def _tick_analysis_progress(self):
+        self._analysis_tick_after = None
+        for key in self.analysis_busy:
+            progress = self._analysis_progress.get(key)
+            if not progress or not progress["label"].winfo_exists():
+                continue
+            elapsed = time.monotonic() - progress["started"]
+            stage = f"已接收 {progress['chars']:,} 字" if progress["chars"] else "等待模型响应"
+            retry = f" · 第 {progress['attempt']} 次尝试" if progress["attempt"] > 1 else ""
+            progress["label"].configure(text=f"{stage} · {elapsed:.1f} 秒{retry}")
+        if self.analysis_busy:
+            self._analysis_tick_after = self.after(500, self._tick_analysis_progress)
+
+    def on_analysis_progress(self, payload):
+        key, update = payload
+        progress = self._analysis_progress.get(key)
+        if progress and key in self.analysis_busy:
+            progress.update(chars=update["chars"], attempt=update["attempt"])
+
+    def _finish_analysis_progress(self, key, text):
+        progress = self._analysis_progress.pop(key, None)
+        if progress and progress["label"].winfo_exists():
+            progress["label"].configure(text=text)
 
     # ---------- 本地查词（不依赖 LLM） ----------
     def _lookup_selection(self, para, offset):
@@ -695,7 +740,8 @@ class ReaderFrame(tk.Frame):
             sents = gen.split_sentences(para_text)
             hit = gen.sentence_at(sents, para_text.find(sentence[:40]) if sentence in para_text else 0)
             before, after = gen.neighbors(sents, hit) if hit else ("", "")
-            analysis = gen.analyze(self.meta, self.article, sentence, before, after, cfg)
+            analysis = gen.analyze(self.meta, self.article, sentence, before, after, cfg,
+                                   on_progress=lambda update: self.app.emit("analysis_progress", (key, update)))
             self.app.emit("analysis_done", (key, sentence, analysis))
         except Exception as e:
             self.app.emit("analysis_error", (key, str(e)))
@@ -703,6 +749,8 @@ class ReaderFrame(tk.Frame):
     def on_analysis_done(self, payload):
         key, sentence, analysis = payload
         self.analysis_busy.discard(key)
+        elapsed = (analysis.get("generationStats") or {}).get("elapsedMs")
+        self._finish_analysis_progress(key, f"完成 · {elapsed / 1000:.1f} 秒" if elapsed is not None else "完成")
         entry = self._sheets.pop(key, None)
         if entry and entry[0].winfo_exists():
             _render_analysis(entry[1], analysis, sentence)
@@ -710,6 +758,7 @@ class ReaderFrame(tk.Frame):
     def on_analysis_error(self, payload):
         key, msg = payload
         self.analysis_busy.discard(key)
+        self._finish_analysis_progress(key, "解析失败，可重试")
         entry = self._sheets.get(key)
         if entry and entry[0].winfo_exists():
             _render_error(entry[1], msg)
@@ -726,6 +775,7 @@ class ReaderFrame(tk.Frame):
         entry = self._sheets.get(key)
         if entry and entry[0].winfo_exists():
             _render_loading(entry[1], sentence)
+            self._begin_analysis_progress(key, entry[2])
         self.app.post(self._analysis_worker, cfg, para, sentence, key)
 
     # ---------- 生词表弹层 ----------
@@ -843,7 +893,7 @@ def _render_loading(txt, sentence):
     txt.configure(state="normal")
     txt.delete("1.0", "end")
     txt.insert("end", sentence + "\n", "src")
-    txt.insert("end", "\n解析中…（首次解析约需十几秒，结果会缓存）", "meta")
+    txt.insert("end", "\n解析中…接收进度见窗口上方，完整结果会自动缓存。", "meta")
     txt.configure(state="disabled")
 
 
@@ -851,6 +901,9 @@ def _render_analysis(txt, analysis, sentence=None):
     """句解渲染：原句 → 疑难词汇 → 语法对齐图解 → 语法点 → 语境 → 参考译文"""
     txt.configure(state="normal")
     txt.delete("1.0", "end")
+    stats = analysis.get("generationStats") or {}
+    if stats.get("elapsedMs") is not None:
+        txt.insert("end", f"生成耗时 {stats['elapsedMs'] / 1000:.1f} 秒 · {stats.get('model', '')}\n\n", "meta")
     if sentence:
         txt.insert("end", sentence + "\n", "src")
     if analysis.get("partial"):

@@ -559,6 +559,108 @@ def test_llm_stream():
             raise AssertionError("OpenAI 流中的 error 事件不能被忽略")
 
 
+@case("句解关闭 DeepSeek 思考、流式进度、耗时与缓存")
+def test_analysis_latency():
+    result = {"vocab": [], "grammarDiagram": "A shop opens.\n主语 谓语",
+              "grammarPoints": [{"title": "一般现在时", "text": "描述日常活动。"}],
+              "context": "介绍小店的日常。", "translation": "一家小店开门了。"}
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "text/event-stream"}
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def __init__(self, provider): self.provider = provider
+        def iter_lines(self, **kwargs):
+            raw = J.dumps(result, ensure_ascii=False)
+            for text in (raw[:35], raw[35:]):
+                frame = ({"type": "content_block_delta", "delta": {"text": text}}
+                         if self.provider == "anthropic" else {"choices": [{"delta": {"content": text}}]})
+                yield ("data: " + J.dumps(frame, ensure_ascii=False)).encode("utf8")
+            end = ({"type": "message_stop"} if self.provider == "anthropic"
+                   else {"choices": [{"delta": {}, "finish_reason": "stop"}]})
+            yield ("data: " + J.dumps(end)).encode("utf8")
+    for provider, model in [("anthropic", "deepseek-v4-flash"), ("openai", "deepseek-chat"), ("openai", "other-model")]:
+        meta = dict(META, id="T_ANALYSIS_" + provider + model)
+        cfg = {"name": "test", "provider": provider, "baseUrl": "http://local.test",
+               "apiKey": "not-real", "model": model}
+        original = dict(cfg)
+        updates = []
+        with patch.object(llm.requests, "post", return_value=Response(provider)) as post:
+            analysis = gen.analyze(meta, ART, "A shop opens.", "", "", cfg, on_progress=updates.append)
+            assert post.call_count == 1, "成功句解只能发送一次请求"
+            payload = post.call_args.kwargs["json"]
+            if "deepseek" in model:
+                assert payload["thinking"] == {"type": "disabled"}
+            else:
+                assert "thinking" not in payload, "其他模型不应收到 DeepSeek 参数"
+            assert cfg == original, "不能修改用户保存的模型配置"
+            assert not analysis["partial"] and analysis["grammarPoints"] == result["grammarPoints"]
+            stats = analysis["generationStats"]
+            assert stats["calls"] == 1 and stats["outputChars"] > 0
+            assert 0 <= stats["firstTextMs"] <= stats["modelMs"] <= stats["elapsedMs"]
+            assert "apiKey" not in J.dumps(stats) and "not-real" not in J.dumps(stats)
+            assert updates[0]["chars"] == 0 and updates[-1]["chars"] > 0
+            assert gen.analyze(meta, ART, "A shop opens.", "", "", cfg) == analysis
+            assert post.call_count == 1, "已有完整缓存不能重新调用 API"
+    attempts = []
+    with patch.object(llm, "chat", side_effect=[llm.LlmError("temporary"), "ok"]), patch.object(gen.time, "sleep"):
+        assert gen._chat_retry(cfg, "s", "u", 12000, on_attempt=attempts.append) == "ok"
+    assert attempts == [1, 2], "自动重试必须报告次数"
+
+
+@case("句解等待提示、接收进度与完成失败状态")
+def test_analysis_progress_ui():
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_reader import ReaderFrame
+    root = tk.Tk()
+    root.geometry("900x620")
+    posts, errors = [], []
+    cfg = {"name": "test", "provider": "anthropic", "baseUrl": "http://local.test",
+           "apiKey": "not-real", "model": "deepseek-v4-flash"}
+    app = SimpleNamespace(settings={"readerFontSize": 13, "sheetFontSize": 11, "vocabLevel": "cet4",
+                                    "llms": [cfg], "defaultLlm": "test"},
+                          post=lambda *args: posts.append(args), save_settings=lambda: None,
+                          open_digest=lambda *args: None)
+    root.report_callback_exception = lambda *args: errors.append(args)
+    try:
+        reader = ReaderFrame(root, app, dict(META, id="T_ANALYSIS_UI"), 0)
+        reader.pack(fill="both", expand=True)
+        reader.on_content_loaded(({"articles": [{"index": 0, "title": "A shop", "paragraphs": ["A shop opens."]}]}, 0))
+        root.update()
+        reader._start_analysis(0, "A shop opens.")
+        root.update()
+        win, txt, bar = reader._sheets["A shop opens."]
+        label = bar._analysis_status
+        assert "等待模型响应" in label.cget("text")
+        count = len(posts)
+        reader._start_analysis(0, "A shop opens.")
+        assert len(posts) == count, "等待中重复双击不能再发请求"
+        reader.on_analysis_progress(("A shop opens.", {"chars": 120, "attempt": 2}))
+        reader.after_cancel(reader._analysis_tick_after)
+        reader._tick_analysis_progress()
+        assert "120" in label.cget("text") and "第 2 次" in label.cget("text")
+        analysis = {"vocab": [], "grammarDiagram": "A shop opens.", "grammarPoints": [],
+                    "context": "示例", "translation": "小店开门了。",
+                    "generationStats": {"elapsedMs": 2580, "model": cfg["model"]}}
+        reader.on_analysis_done(("A shop opens.", "A shop opens.", analysis))
+        assert "完成 · 2.6 秒" in label.cget("text")
+        assert "小店开门了。" in txt.get("1.0", "end")
+        assert "2.6 秒" in txt.get("1.0", "end")
+        reader._start_analysis(0, "A shop closes.")
+        reader.on_analysis_error(("A shop closes.", "示例错误"))
+        failed_bar = reader._sheets["A shop closes."][2]
+        assert "失败" in failed_bar._analysis_status.cget("text")
+        reader._retry_analysis(cfg, "A shop closes.")
+        assert len([w for w in failed_bar.winfo_children() if w is failed_bar._analysis_status]) == 1
+        win.destroy()
+        reader.destroy()
+        root.update()
+        assert not errors, errors
+    finally:
+        root.destroy()
+
+
 @case("JSON 修补")
 def test_repair():
     broken = '{"paragraphs":[{"index":1,"startWords":"He had","entries":[{"word":"patent","sense":"专利"},{"word":"sensor",'

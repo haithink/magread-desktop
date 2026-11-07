@@ -264,9 +264,11 @@ class VocabValidationError(GenError):
         super().__init__("；".join(f"段落 {i}: {text}" for i, text in errors.items())[:500])
 
 
-def _chat_retry(cfg, system, user, max_tokens, on_chars=None, attempts=2):
+def _chat_retry(cfg, system, user, max_tokens, on_chars=None, attempts=2, on_attempt=None):
     last = None
     for i in range(attempts):
+        if on_attempt:
+            on_attempt(i + 1)
         try:
             return llm.chat(cfg, system, user, max_tokens=max_tokens, on_delta=on_chars)
         except Exception as e:
@@ -805,12 +807,33 @@ def _analysis_partial(analysis: dict) -> bool:
     )
 
 
-def analyze(meta, article, sentence, before, after, cfg):
+def analyze(meta, article, sentence, before, after, cfg, on_progress=None):
     cached = store.load_analysis(meta["id"], sentence, article["index"])
     if cached and not _analysis_partial(cached):
         return cached
+    started = time.monotonic()
+    request_cfg = dict(cfg)
+    if "deepseek" in (cfg.get("model") or "").lower():
+        request_cfg["thinkingMode"] = "disabled"
+    attempt, first_text_ms = 0, None
+
+    def progress(chars):
+        nonlocal first_text_ms
+        elapsed = round((time.monotonic() - started) * 1000)
+        if chars and first_text_ms is None:
+            first_text_ms = elapsed
+        if on_progress:
+            on_progress({"attempt": attempt, "chars": chars, "elapsedMs": elapsed})
+
+    def begin(number):
+        nonlocal attempt
+        attempt = number
+        progress(0)
+
     user = prompts.analysis_user(sentence, before, after, article["title"])
-    raw = _chat_retry(cfg, prompts.analysis_system(), user, 12000)
+    raw = _chat_retry(request_cfg, prompts.analysis_system(), user, 12000,
+                      on_chars=progress, on_attempt=begin)
+    model_ms = round((time.monotonic() - started) * 1000)
     obj = _parse_json(raw, want_array=False)
 
     def _s(o, k, default=""):
@@ -839,6 +862,12 @@ def analyze(meta, article, sentence, before, after, cfg):
                 }
             )
     backfill_phonetics(analysis["vocab"])
+    analysis["generationStats"] = {
+        "elapsedMs": round((time.monotonic() - started) * 1000),
+        "modelMs": model_ms, "firstTextMs": first_text_ms,
+        "calls": attempt, "outputChars": len(raw),
+        "model": cfg.get("model", ""), "thinkingMode": request_cfg.get("thinkingMode", "default"),
+    }
     analysis["partial"] = _analysis_partial(analysis)
     if not analysis["partial"]:
         # 残缺结果不落盘：下次双击会自动重试
