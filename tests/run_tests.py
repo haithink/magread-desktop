@@ -800,16 +800,189 @@ def test_ui_startup():
     try:
         app.update()
         assert type(app.current).__name__ == "LibraryFrame", f"启动页异常: {type(app.current).__name__}"
-        bar = app.current.winfo_children()[0]
-        btns = [c for c in bar.winfo_children() if c.winfo_class() == "TButton"]
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        btns = [c for c in descendants(app.current) if c.winfo_class() in ("Button", "TButton")]
         labels = [b.cget("text") for b in btns]
-        for need in ("添加刊物", "从文件夹导入", "建立索引"):
-            assert need in labels, f"缺少按钮: {need}（实际 {labels}）"
+        for need in ("添加刊物", "从文件夹导入", "建立索引", "生成全部摘要", "设置"):
+            assert any(need in label for label in labels), f"缺少按钮: {need}（实际 {labels}）"
         t0 = time.time()
         while time.time() - t0 < 3:
             app.update(); time.sleep(0.02)
     finally:
         app.destroy()
+
+
+@case("首页书架自适应、筛选复用、封面按需加载与继续阅读")
+def test_library_layout_and_navigation():
+    import statistics
+    import tkinter as tk
+    from PIL import Image
+    from types import SimpleNamespace
+    from kandu.ui_library import LibraryFrame
+
+    root = tk.Tk()
+    errors, opened, resumed, saves = [], [], [], []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    metas = [dict(META, id=f"T_HOME_{i}", fileName=f"Journal_{i:02d}_2026.11." + ("pdf" if i % 3 == 0 else "epub"),
+                  ext="pdf" if i % 3 == 0 else "epub") for i in range(60)]
+    metas[7]["fileName"] = "A very long journal title with many words and a long issue date 2026.11.epub"
+    for meta in metas[:-2]:
+        Image.new("RGB", (250, 340), "#587763").save(store.cover_file(meta["id"]))
+    store.cover_file(metas[-1]["id"]).write_bytes(b"invalid cover")
+    store.save_reading_progress(metas[0]["id"], 5, {"title": "The article to resume", "titleZh": "继续这篇文章",
+        "paragraphIndex": 7, "paragraphOffset": 2, "paragraphStart": "Sample", "paragraphCount": 20,
+        "wordCount": 900, "progress": .4, "atStart": False, "atEnd": False})
+    app = SimpleNamespace(settings={"recentBooks": [metas[0]["id"], metas[1]["id"], "removed", metas[2]["id"]]},
+        open_settings=lambda: None, start_indexing=lambda: None, start_batch_digest=lambda: None,
+        save_settings=lambda: saves.append(True), open_digest=lambda m: opened.append(m["id"]),
+        open_reader=lambda m, i: resumed.append((m["id"], i)),
+        index_state={"running": False, "done": 0}, batch_state={"running": False, "done": 0})
+
+    def pump(seconds=.25):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            root.update()
+            time.sleep(.005)
+
+    try:
+        root.geometry("900x620")
+        with patch.object(store, "load_library", return_value=metas), patch.object(store, "has_digest", return_value=False), \
+             patch("kandu.ui_library.Image.open", wraps=Image.open) as images:
+            frame = LibraryFrame(root, app)
+            frame.pack(fill="both", expand=True)
+            pump()
+            assert 0 < images.call_count < len(metas) // 2, "启动时只能加载可见及相邻行封面"
+            identities = {key: str(entry["frame"]) for key, entry in frame._cards.items()}
+            for geometry, expected_cols in (("900x620", 4), ("1180x800", 5), ("1600x900", 8), ("900x620", 4)):
+                root.geometry(geometry)
+                pump()
+                assert frame._cols == expected_cols, (geometry, frame._cols, root.winfo_width(), frame.canvas.winfo_width())
+                assert frame.canvas.winfo_height() > 400, "顶部操作区不能挤占大部分屏幕"
+                for book_id in frame._visible_ids[:expected_cols]:
+                    entry = frame._cards[book_id]
+                    card = entry["frame"]
+                    assert card.winfo_rootx() >= frame.canvas.winfo_rootx()
+                    assert card.winfo_rootx() + card.winfo_width() <= frame.canvas.winfo_rootx() + frame.canvas.winfo_width()
+                    assert card.winfo_height() <= 264 and entry["cover"].winfo_width() == 126
+                for widget in (frame.search_entry, frame.sort_choice, frame.index_btn, frame.digest_btn):
+                    assert widget.winfo_ismapped() and widget.winfo_width() >= widget.winfo_reqwidth()
+                    assert widget.winfo_rootx() + widget.winfo_width() <= root.winfo_rootx() + root.winfo_width()
+            assert len(frame._recent_cards) == 3
+            recent_btn = next(w for w in frame._recent_cards[0].winfo_children() if isinstance(w, tk.Button))
+            recent_btn.invoke()
+            assert resumed == [(metas[0]["id"], 5)] and saves
+            fallback_btn = next(w for w in frame._recent_cards[1].winfo_children() if isinstance(w, tk.Button))
+            fallback_btn.invoke()
+            assert opened == [metas[1]["id"]]
+            frame._cards[metas[3]["id"]]["cover"].event_generate("<Button-1>")
+            assert opened[-1] == metas[3]["id"], "单击封面应打开对应刊物"
+            with patch.object(frame, "_show_menu") as menu:
+                frame._cards[metas[1]["id"]]["title"].event_generate("<Button-3>", rootx=20, rooty=30)
+                assert menu.call_args.args == (metas[1], 20, 30)
+            original_images = dict(frame._photo_cache)
+            timings = []
+            with patch.object(store, "has_digest", side_effect=AssertionError("筛选不能重读摘要状态")), \
+                 patch.object(frame, "_load_thumb", side_effect=AssertionError("已加载的卡片不能重读封面")):
+                for key in ("epub", "pdf", "all") * 3:
+                    started = time.perf_counter()
+                    frame._select_format(key)
+                    root.update()
+                    timings.append(time.perf_counter() - started)
+                    assert all(key == "all" or frame._cards[i]["meta"]["ext"] == key for i in frame._visible_ids)
+            print(f"  60 books, filter incl. layout/paint median: {statistics.median(timings) * 1000:.1f}ms")
+            assert statistics.median(timings) < .5, "筛选不能出现明显卡顿"
+            assert all(frame._photo_cache[k] is image for k, image in original_images.items())
+            frame.search_var.set("jOuRnAl 04 2026")
+            pump(.2)
+            assert frame._visible_ids == [metas[4]["id"]]
+            frame.search_var.set("no such journal")
+            pump(.2)
+            assert not frame._visible_ids and frame.empty.winfo_ismapped()
+            frame.empty_action.invoke()
+            pump()
+            assert len(frame._visible_ids) == len(metas)
+            frame.sort_var.set("最近打开")
+            frame._apply_filters()
+            assert frame._visible_ids[:3] == [metas[i]["id"] for i in (0, 1, 2)]
+            frame.sort_var.set("名称排序")
+            frame._apply_filters()
+            assert frame._visible_ids[0] == metas[7]["id"]
+            assert identities == {key: str(entry["frame"]) for key, entry in frame._cards.items()}
+            frame.canvas.yview_moveto(1)
+            pump()
+            assert frame.canvas.yview()[1] > .999
+            assert frame._cards[metas[-1]["id"]]["loaded"], "损坏封面应显示占位，不重复尝试加载"
+            frame.on_wheel(SimpleNamespace(delta=120))
+            pump()
+            assert frame.canvas.yview()[1] < .999
+            frame.search_var.set("pending")
+            pending = [getattr(frame, name) for name in ("_search_after", "_layout_after", "_thumb_after", "_tick_after")]
+            frame.destroy()
+            pump()
+            callbacks = root.tk.call("after", "info")
+            assert not any(job in callbacks for job in pending if job), "离开书库必须取消未完成的 UI 回调"
+            assert not errors, errors
+    finally:
+        root.destroy()
+
+
+@case("首页空书库、导入刷新与后台任务状态")
+def test_library_empty_and_refresh():
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_library import LibraryFrame
+
+    root = tk.Tk()
+    root.geometry("900x620")
+    errors = []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    meta = dict(META, id="T_HOME_IMPORT", fileName="New_issue_2026.epub")
+    app = SimpleNamespace(settings={}, open_settings=lambda: None, start_indexing=lambda: None,
+        start_batch_digest=lambda: None, index_state={"running": False, "done": 0},
+        batch_state={"running": False, "done": 0})
+    try:
+        with patch.object(store, "load_library", return_value=[]):
+            frame = LibraryFrame(root, app)
+        frame.pack(fill="both", expand=True)
+        root.update()
+        assert frame.empty.winfo_ismapped() and not frame._recent_cards
+        assert "开始阅读" in frame.empty_title.cget("text")
+        with patch("kandu.ui_library.filedialog.askopenfilenames", return_value=["chosen.epub"]), \
+             patch.object(frame, "_import") as importing:
+            frame.empty_action.invoke()
+            importing.assert_called_once_with(["chosen.epub"])
+        with patch.object(store, "load_library", return_value=[meta]):
+            frame.on_import_done({"added": 1, "skipped": 0})
+        root.update()
+        assert not frame.empty.winfo_ismapped() and frame._visible_ids == [meta["id"]]
+        card = frame._cards[meta["id"]]
+        assert "待生成" in card["state"].cget("text")
+        app.index_state.update(running=True, done=1, total=2, current="new.epub")
+        frame.after_cancel(frame._tick_after)
+        frame._tick_index_status()
+        assert frame.index_btn.cget("state") == "disabled" and "后台索引" in frame.status.cget("text")
+        app.index_state.update(running=False, done=0)
+        store.save_digest({"bookId": meta["id"], "articles": []})
+        app.batch_state.update(running=False, done=1, total=1, failed=0)
+        frame.after_cancel(frame._tick_after)
+        frame._tick_index_status()
+        root.update()
+        assert frame.index_btn.cget("state") == "normal" and "批量摘要完成" in frame.status.cget("text")
+        assert "已就绪" in card["state"].cget("text")
+        frame._purge_one(meta, digest_only=True)
+        assert frame._cards[meta["id"]] is card and "待生成" in card["state"].cget("text")
+        with patch("kandu.ui_library.messagebox.askyesno", return_value=True), \
+             patch.object(store, "remove_book") as remove, patch.object(store, "load_library", return_value=[]):
+            frame._remove_book(meta)
+            remove.assert_called_once_with(meta["id"])
+        root.update()
+        assert not frame._cards and frame.empty.winfo_ismapped()
+        assert not errors, errors
+    finally:
+        root.destroy()
 
 
 @case("生词表弹窗滚动条、拖动和滚轮")

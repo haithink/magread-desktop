@@ -9,6 +9,10 @@
 
 每张截图单独展示，点击图片可查看原图。
 
+**我的书库：自适应刊物书架、最近阅读直达文章、刊名搜索与 EPUB / PDF 筛选。**
+
+[![书库首页：刊物封面、继续阅读、搜索与格式筛选](docs/screenshots/desktop-library.png)](docs/screenshots/desktop-library.png)
+
 **原文阅读：中英文标题、全文词数、阅读进度与段落生词入口。**
 
 [![Windows 桌面版原文阅读界面](docs/screenshots/desktop-reader.png)](docs/screenshots/desktop-reader.png)
@@ -25,7 +29,7 @@
 
 [![句子讲解：分区排版、语法图解与参考译文](docs/screenshots/desktop-analysis.png)](docs/screenshots/desktop-analysis.png)
 
-截图来自当前源码实际运行的程序，使用原创示例文章及预置的摘要、释义演示数据；实际生成结果随所选模型而异。下载包的版本以下载区标注为准。
+截图来自当前源码实际运行的程序，使用原创示例刊物封面、文章及预置的摘要、释义演示数据；实际生成结果随所选模型而异。下载包的版本以下载区标注为准。
 
 ### 其他版本
 
@@ -63,6 +67,12 @@
    生词表词条级段落锚点自愈、运行日志（error.log）
 
 数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache / article_states）
+
+v0.8.7 重新设计书库首页：添加与导入、设置、批量任务分区排列，书架随窗口宽度调整列数，
+支持刊名搜索、EPUB / PDF 筛选和名称 / 最近打开排序；继续阅读区最多展示 3 本，
+有阅读记录时可直接返回上次文章与段落。单击封面打开刊物，右键或卡片「···」管理。
+卡片与封面复用，只显示可见及邻近行，封面按需加载；无封面刊物使用固定尺寸的排版占位图。
+增加空书库与搜索无结果提示，后台任务完成后自动刷新摘要状态。
 
 v0.8.6 增加原创「英文刊物 + A + 书签」应用图标，统一主窗口、设置、生词与句解等弹窗的标题栏，
 并嵌入 Windows 程序文件；提供 16–256 像素的多尺寸 ICO 与可编辑的 SVG 源文件。
