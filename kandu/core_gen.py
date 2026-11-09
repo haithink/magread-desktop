@@ -797,13 +797,13 @@ def backfill_phonetics(entries):
 
 
 def _analysis_partial(analysis: dict) -> bool:
-    """缺语境/译文/图解任一主要部分即视为不完整（多为输出被截断后修补）。"""
+    """缺语境、译文或句法成分/旧图解时视为不完整。"""
     if not isinstance(analysis, dict):
         return True
     return not (
         (analysis.get("context") or "").strip()
         and (analysis.get("translation") or "").strip()
-        and (analysis.get("grammarDiagram") or "").strip()
+        and (analysis.get("grammarComponents") or (analysis.get("grammarDiagram") or "").strip())
     )
 
 
@@ -840,8 +840,11 @@ def analyze(meta, article, sentence, before, after, cfg, on_progress=None):
         v = o.get(k)
         return v if isinstance(v, str) else default
 
+    from .core_grammar import normalize_components
+
     analysis = {
         "vocab": [],
+        "grammarComponents": normalize_components(obj.get("grammarComponents"), sentence),
         "grammarDiagram": _s(obj, "grammarDiagram").replace("\\n", "\n"),
         "grammarPoints": [
             {"title": gp.get("title", ""), "text": gp.get("text", "")}

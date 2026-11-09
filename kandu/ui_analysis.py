@@ -1,6 +1,7 @@
 """句子讲解窗口：原句、词汇、语法、语境与译文的阅读排版。"""
 import tkinter as tk
 from tkinter import font as tkfont, ttk
+from kandu.core_grammar import normalize_components, legacy_components
 
 FAMILY = "Microsoft YaHei UI"
 GREEN = "#1b4b43"
@@ -38,6 +39,54 @@ def _styles(txt, size):
                       spacing1=8, spacing3=6)
     txt.tag_configure("warn", foreground="#9a6238", spacing1=10, spacing3=12)
     txt.tag_configure("term", foreground="#9a6238")
+    txt.tag_configure("component_label", font=(FAMILY, size), foreground=GREEN)
+    txt.tag_configure("component_text", font=("Georgia", size + 1), foreground=INK)
+    txt.tag_configure("diagram_toggle", font=(FAMILY, max(9, size - 1)),
+                      foreground="#60765a", underline=True, spacing1=10, spacing3=12)
+    _layout_components(txt, size)
+
+
+def _layout_components(txt, size):
+    rows = getattr(txt, "_grammar_rows", [])
+    font = tkfont.Font(root=txt, family=FAMILY, size=size)
+    column = max((font.measure(label) for _, label, _, stacked in rows if not stacked), default=0) + 26
+    for tag, _, depth, stacked in rows:
+        margin = 14 + depth * 18
+        txt.tag_configure(tag, background="#edf2eb", wrap="word", lmargin1=margin,
+                          lmargin2=margin if stacked else margin + column, rmargin=14,
+                          spacing1=7, spacing2=5, spacing3=10,
+                          tabs=(margin + column,), tabstyle="wordprocessor")
+
+
+def _insert_components(txt, components):
+    def visit(nodes, depth=0):
+        for node in nodes:
+            tag = f"component_row_{len(txt._grammar_rows)}"
+            label = node["label"]
+            # 长标题独占一行，避免占据英文片段的阅读宽度。
+            stacked = len(label) > 10
+            txt._grammar_rows.append((tag, label, depth, stacked))
+            txt.insert("end", label + ("\n" if stacked else "\t"), (tag, "component_label"))
+            txt.insert("end", node["text"] + "\n", (tag, "component_text"))
+            visit(node.get("children", []), depth + 1)
+
+    visit(components)
+    _layout_components(txt, getattr(txt, "_analysis_size", 11))
+
+
+def _toggle_diagram(txt):
+    position = txt.index("@0,0")
+    txt.configure(state="normal")
+    opened = not txt._legacy_diagram_open
+    txt.mark_gravity("legacy_diagram_end", "right")
+    txt.delete("legacy_diagram_start", "legacy_diagram_end")
+    txt.insert("legacy_diagram_start", "收起原始文本图解\n" if opened else "查看原始文本图解\n", "diagram_toggle")
+    if opened:
+        txt.insert("legacy_diagram_end", txt._legacy_diagram.rstrip("\n") + "\n", "diagram")
+    txt.mark_gravity("legacy_diagram_end", "left")
+    txt._legacy_diagram_open = opened
+    txt.configure(state="disabled")
+    txt.yview(position)
 
 
 def make_sheet(parent, app, subtitle):
@@ -140,8 +189,12 @@ def make_sheet(parent, app, subtitle):
 def _reset(txt, sentence):
     txt.configure(state="normal")
     txt.delete("1.0", "end")
+    for tag, *_ in getattr(txt, "_grammar_rows", []):
+        txt.tag_delete(tag)
+    txt._grammar_rows = []
+    txt._legacy_diagram_open = False
     for mark in txt.mark_names():
-        if str(mark).startswith("section_"):
+        if str(mark).startswith(("section_", "legacy_diagram_")):
             txt.mark_unset(mark)
     txt._analysis_source = sentence or ""
     for btn in getattr(txt, "_analysis_nav", {}).values():
@@ -187,12 +240,23 @@ def render_analysis(txt, analysis, sentence=None):
                 txt.insert("end", item["sense"] + "\n", "body")
             if item.get("note"):
                 txt.insert("end", item["note"] + "\n", "note")
-    if analysis.get("grammarDiagram") or analysis.get("grammarPoints"):
+    components = normalize_components(analysis.get("grammarComponents"), sentence)
+    if not components:
+        components = legacy_components(analysis, sentence)
+    if components or analysis.get("grammarDiagram") or analysis.get("grammarPoints"):
         _section(txt, "grammar", "02  /  句子结构与语法")
+        if components:
+            _insert_components(txt, components)
         if analysis.get("grammarDiagram"):
             # 缩进也是图解布局的一部分，不能用 strip() 删除第一行的空格。
             diagram = analysis["grammarDiagram"].replace("\\n", "\n")
-            txt.insert("end", diagram if diagram.endswith("\n") else diagram + "\n", "diagram")
+            txt._legacy_diagram = diagram
+            txt.mark_set("legacy_diagram_start", "end-1c")
+            txt.mark_gravity("legacy_diagram_start", "left")
+            txt.insert("end", "查看原始文本图解\n", "diagram_toggle")
+            txt.mark_set("legacy_diagram_end", "end-1c")
+            txt.mark_gravity("legacy_diagram_end", "left")
+            txt.tag_bind("diagram_toggle", "<Button-1>", lambda e: _toggle_diagram(txt))
         for i, point in enumerate(analysis.get("grammarPoints") or [], 1):
             txt.insert("end", f"{i:02d}   {point.get('title', '')}\n", "point")
             if point.get("text"):

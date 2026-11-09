@@ -667,7 +667,7 @@ def test_analysis_reading_layout():
     import tkinter.font as tkfont
     from tkinter import ttk
     from types import SimpleNamespace
-    from kandu.ui_analysis import make_sheet, render_analysis, render_loading
+    from kandu.ui_analysis import make_sheet, render_analysis, render_loading, _toggle_diagram
 
     root = tk.Tk()
     root.withdraw()
@@ -687,6 +687,8 @@ def test_analysis_reading_layout():
         assert txt._analysis_nav["source"].cget("state") == "normal"
         assert txt._analysis_nav["translation"].cget("state") == "disabled"
         render_analysis(txt, analysis, sentence)
+        assert not txt.tag_ranges("diagram"), "旧空格图默认折叠，避免把模型的错位标注作为成分对应显示"
+        _toggle_diagram(txt)
         root.update()
         assert txt.cget("state") == "disabled"
         for content in (sentence, "ingenuity", "词源说明", analysis["translation"]):
@@ -747,7 +749,7 @@ def test_analysis_reading_layout():
 def test_analysis_diagram_alignment():
     import tkinter as tk
     from types import SimpleNamespace
-    from kandu.ui_analysis import make_sheet, render_analysis, _styles
+    from kandu.ui_analysis import make_sheet, render_analysis, _styles, _toggle_diagram
 
     root = tk.Tk()
     root.withdraw()
@@ -760,6 +762,7 @@ def test_analysis_diagram_alignment():
         win.geometry("960x860")
         for original in (diagram, tabbed):
             render_analysis(txt, {"grammarDiagram": original}, "We read books.")
+            _toggle_diagram(txt)
             root.update()
             start, end = txt.tag_ranges("diagram")
             assert txt.get(start, end) == original, "图解的原始缩进、空格与换行不能被修改"
@@ -777,6 +780,7 @@ def test_analysis_diagram_alignment():
                     assert abs(upper[0] - lower[0]) <= 1, f"{size} 号 {word}/{label} 错位：{upper[0]} vs {lower[0]}"
         # 缓存中双重转义的换行同样支持，且不删除首行缩进。
         render_analysis(txt, {"grammarDiagram": diagram.rstrip("\n").replace("\n", "\\n")})
+        _toggle_diagram(txt)
         start, end = txt.tag_ranges("diagram")
         assert txt.get(start, end) == diagram
     finally:
@@ -2014,6 +2018,123 @@ def test_vocabulary_navigation():
         txt._vocab_query.set("pending")
         win.destroy()
         root.update()
+        assert not errors, errors
+    finally:
+        root.destroy()
+
+
+@case("句法成分锚定、嵌套、无效片段与新旧缓存兼容")
+def test_grammar_components():
+    from kandu.core_grammar import normalize_components, legacy_components
+    sentence = "There’s a reason that we read books."
+    components = normalize_components([
+        {"text": "There's", "label": "引导词与谓语"},
+        {"text": "a reason that we read books", "label": "真正主语", "children": [
+            {"text": "that we read books", "label": "定语从句", "children": [
+                {"text": "we", "label": "主语"}, {"text": "read", "label": "谓语"},
+                {"text": "books", "label": "宾语"}, {"text": "There’s", "label": "越出父成分"}]}]},
+        {"text": "invented words", "label": "臆造片段"}], sentence)
+    assert len(components) == 2 and components[0]["text"] == "There’s"
+    clause = components[1]["children"][0]
+    assert [c["label"] for c in clause["children"]] == ["主语", "谓语", "宾语"]
+    for component in [*components, clause, *clause["children"]]:
+        assert sentence[component["start"]:component["end"]] == component["text"]
+    assert not normalize_components([{"text": "he", "label": "主语"}], "The book.")
+    repeated = normalize_components([{"text": "that", "label": "一"}, {"text": "that", "label": "二"}], "that that")
+    assert [c["start"] for c in repeated] == [0, 5]
+    assert not normalize_components([None, {"text": 5, "label": "错"}, {"text": "we", "label": []}], sentence)
+    assert normalize_components([{"text": "read books", "label": "谓语"}], "We read\n  books.")[0]["text"] == "read\n  books"
+    legacy = {"grammarDiagram": "We [read books].\n       主语  谓语 错位",
+              "grammarPoints": [{"title": "谓宾结构", "text": "“read books” 是谓宾结构。"},
+                                {"title": "宾语", "text": "“books” 是宾语。"},
+                                {"title": "错误引文", "text": "“invented” 不在原文。"}]}
+    recovered = legacy_components(legacy, "We read books.")
+    assert len(recovered) == 1 and recovered[0]["text"] == "read books"
+    assert recovered[0]["children"][0]["text"] == "books"
+    nested = legacy_components({
+        "grammarDiagram": "I believe [that we read books [that matter]].\n    标注位置有误",
+        "grammarPoints": [{"title": "宾语从句", "text": "“that we read books...” 作宾语。"},
+                          {"title": "定语从句", "text": "“that matter” 修饰 books。"}]},
+        "I believe that we read books that matter.")
+    assert nested[0]["text"] == "that we read books that matter"
+    assert nested[0]["children"][0]["text"] == "that matter"
+    assert not legacy_components({"grammarPoints": [{"title": "主语", "text": "“that” 是主语。"}]}, "that that")
+    result = {"vocab": [], "grammarComponents": [{"text": "We", "label": "主语"},
+              {"text": "read", "label": "谓语"}, {"text": "books", "label": "宾语"}],
+              "grammarPoints": [], "context": "描述阅读行为。", "translation": "我们读书。"}
+    meta = dict(META, id="T_STRUCTURED_GRAMMAR")
+    with patch.object(gen, "_chat_retry", return_value=J.dumps(result)) as chat:
+        analysis = gen.analyze(meta, ART, "We read books.", "", "", {"model": "test"})
+        assert not analysis["partial"] and len(analysis["grammarComponents"]) == 3
+        assert not analysis["grammarDiagram"]
+        assert gen.analyze(meta, ART, "We read books.", "", "", {}) == analysis
+        assert chat.call_count == 1
+    result["grammarComponents"] = [{"text": "made up", "label": "无效"}]
+    with patch.object(gen, "_chat_retry", return_value=J.dumps(result)):
+        invalid = gen.analyze(meta, ART, "Another sentence.", "", "", {"model": "test"})
+        assert invalid["partial"] and store.load_analysis(meta["id"], "Another sentence.", 0) is None
+    old = {"grammarDiagram": "We read books.\n主语 谓语 宾语", "context": "原缓存", "translation": "我们读书。"}
+    store.save_analysis(meta["id"], "Old cached sentence.", 0, old)
+    with patch.object(gen, "_chat_retry", side_effect=AssertionError("旧缓存不应请求模型")):
+        assert gen.analyze(meta, ART, "Old cached sentence.", "", "", {}) == old
+
+
+@case("成分对应列、窄窗换行、大字与原图折叠")
+def test_grammar_component_layout():
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_analysis import make_sheet, render_analysis, _styles, _toggle_diagram
+    root = tk.Tk()
+    root.withdraw()
+    errors = []
+    root.report_callback_exception = lambda *a: errors.append(a)
+    app = SimpleNamespace(settings={"sheetFontSize": 11}, save_settings=lambda: None)
+    words = "very interesting books about nature and the places where we live"
+    sentence = "We read " + words + "."
+    analysis = {"grammarComponents": [
+        {"text": "We", "label": "主语"}, {"text": "read", "label": "谓语"},
+        {"text": words, "label": "宾语", "children": [{"text": "interesting", "label": "定语"}]}]}
+    try:
+        win, txt, _ = make_sheet(root, app, "Grammar alignment")
+        render_analysis(txt, analysis, sentence)
+        for geometry in ("960x860", "560x420"):
+            win.geometry(geometry)
+            for size in (9, 11, 15, 22):
+                _styles(txt, size)
+                root.update()
+                columns = []
+                for tag, label, depth, _ in txt._grammar_rows:
+                    start, end = txt.tag_ranges(tag)
+                    source = txt.index(f"{start} +{len(label) + 1} chars")
+                    txt.yview(start)
+                    root.update()
+                    english_box = txt.bbox(source)
+                    label_box = txt.bbox(start)
+                    assert english_box and label_box and english_box[0] > label_box[0]
+                    columns.append((depth, english_box[0]))
+                    second = txt.index(f"{source} +1 display lines display linestart")
+                    if txt.compare(second, "<", txt.index(f"{end} -1 chars")):
+                        continuation = txt.bbox(second)
+                        assert continuation is not None and abs(continuation[0] - english_box[0]) <= 1, (geometry, size, label, continuation, english_box)
+                assert len({x for depth, x in columns if depth == 0}) == 1, "所有主成分应共用同一原文列"
+                assert columns[-1][1] == columns[0][1] + 18, "从句内部成分应缩进一层"
+                assert txt.xview() == (0.0, 1.0), "结构化成分应换行显示，不产生横向长图"
+        legacy = {"grammarDiagram": "We [read books].\n                        主语 谓语",
+                  "grammarPoints": [{"title": "谓宾结构", "text": "“read books” 构成谓宾结构。"}],
+                  "translation": "我们读书。"}
+        render_analysis(txt, legacy, "We read books.")
+        assert txt._grammar_rows and not txt.tag_ranges("diagram"), "旧缓存应优先显示有明确引文的成分对应"
+        for _ in range(3):
+            _toggle_diagram(txt)
+            assert txt.tag_ranges("diagram") and txt._legacy_diagram_open
+            assert "我们读书。" in txt.get("1.0", "end")
+            _toggle_diagram(txt)
+            assert not txt.tag_ranges("diagram") and not txt._legacy_diagram_open
+            assert txt.get("1.0", "end").count("构成谓宾结构") == 1
+        render_analysis(txt, analysis, sentence)
+        assert "legacy_diagram_start" not in txt.mark_names()
+        txt.tag_add("sel", "1.0", "1.8")
+        assert txt.get("sel.first", "sel.last") and str(txt.cget("state")) == "disabled"
         assert not errors, errors
     finally:
         root.destroy()
