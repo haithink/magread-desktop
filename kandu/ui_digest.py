@@ -136,7 +136,7 @@ class DigestFrame(tk.Frame):
                 self.status.config(text="检测到摘要不完整，自动续传缺失批次…")
                 self.generate()
             else:
-                self.status.config(text="摘要已缓存 · 阅读标记仅保存在本机")
+                self.status.config(text="摘要已缓存 · 阅读标记仅保存在本机" + self._pdf_notice(digest))
         self._restore_after = self.after(30, lambda: self._restore_scroll(view.get("scroll", 0)))
 
     # ---- 布局 ----
@@ -429,7 +429,7 @@ class DigestFrame(tk.Frame):
             switch = "；可换上方 LLM 再点一次只补缺的" if getattr(self, "_can_switch", False) else ""
             self.status.config(text=f"部分批次失败（{fb} 批）{censor}{switch}")
         else:
-            self.status.config(text=f"完成：{len(digest['articles'])} 篇（已缓存，重开不再调用大模型）")
+            self.status.config(text=f"完成：{len(digest['articles'])} 篇（已缓存，重开不再调用大模型）" + self._pdf_notice(digest))
         self._fill(digest)
 
     def on_digest_error(self, msg):
@@ -445,7 +445,15 @@ class DigestFrame(tk.Frame):
             self.status.config(text=f"出错：{msg}")
 
     # ---- 渲染 ----
+    @staticmethod
+    def _pdf_notice(digest):
+        return " · 未识别文章目录，当前按完整 PDF 展示" if digest.get("pdfSplitMethod") == "document" else ""
+
     def _fill(self, digest):
+        # PDF 缓存升级可能在后台迁移了整本阅读位置和标记。
+        if self.meta.get("ext") == "pdf":
+            self._states = store.load_article_states(self.meta["id"])
+            self._reading_history = store.load_reading_history(self.meta["id"])
         self._articles = digest["articles"]
         self._render_recent()
         signatures = {a["index"]: self._article_signature(a) for a in self._articles}
@@ -461,7 +469,7 @@ class DigestFrame(tk.Frame):
 
     @staticmethod
     def _article_signature(article):
-        return tuple(article.get(key, "") for key in ("titleEn", "titleZh", "summaryZh"))
+        return tuple(article.get(key, "") for key in ("titleEn", "titleZh", "summaryZh", "pageStart", "pageEnd"))
 
     def _render(self, keep_scroll=False):
         scroll = self.canvas.yview()[0] if keep_scroll else 0
@@ -536,7 +544,8 @@ class DigestFrame(tk.Frame):
                         highlightbackground="#dce3da", padx=24, pady=18)
         meta_row = tk.Frame(card, bg="white")
         meta_row.pack(fill="x", pady=(0, 10))
-        tk.Label(meta_row, text=f"ARTICLE  {index + 1:02d}", bg="white", fg=MUTED,
+        page_hint = f"   ·   PDF 第 {article['pageStart']}–{article['pageEnd']} 页" if article.get("pageStart") else ""
+        tk.Label(meta_row, text=f"ARTICLE  {index + 1:02d}" + page_hint, bg="white", fg=MUTED,
                  font=(FAMILY, 9)).pack(side="left")
         badge = tk.Label(meta_row, text=f"  {label}  ", bg=tint, fg=color,
                          font=(FAMILY, 9), pady=3, width=8)

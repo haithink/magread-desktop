@@ -2,14 +2,21 @@
 import hashlib
 import json
 import re
+import threading
 import zipfile
 import xml.etree.ElementTree as ET
+from functools import lru_cache
 from pathlib import Path
 
 import pymupdf
 from bs4 import BeautifulSoup
 
 from . import core_config as cfgmod
+from . import core_pdf
+
+PDF_PARSER_VERSION = core_pdf.PARSER_VERSION
+_CONTENT_LOCKS = {}
+_CONTENT_LOCKS_GUARD = threading.Lock()
 
 WATERMARK = re.compile(r"(?i)zlibrary|this (article|file) was downloaded by|中商海外高资")
 SKIP_NAME = ["cover", "toc", "ad_page", "masthead", "titlepage", "title_page", "colophon", "nav"]
@@ -254,22 +261,8 @@ def epub_cover_stream(file_path: str):
 # ---------------- PDF ----------------
 
 def pdf_parse(file_path: str):
-    """PDF：单篇文章，每页一个粗略段落。"""
-    doc = pymupdf.open(file_path)
-    try:
-        paragraphs = []
-        for page in doc:
-            text = " ".join(
-                ln.strip() for ln in page.get_text("text").splitlines() if ln.strip()
-            )
-            if text and not WATERMARK.search(text):
-                paragraphs.append(text)
-        title = Path(file_path).stem
-        if not paragraphs:
-            paragraphs = ["(PDF 文本提取失败)"]
-        return [{"index": 0, "title": title, "paragraphs": paragraphs}]
-    finally:
-        doc.close()
+    """优先按叶级书签目录切文章，无书签时尝试可点击目录。"""
+    return core_pdf.parse(file_path)
 
 
 def pdf_cover(file_path: str, target_width: int = 480):
@@ -355,16 +348,28 @@ def has_content(meta: dict) -> bool:
         return False
     try:
         import json
-        return json.loads(f.read_text(encoding="utf-8")).get("bookSize") == meta["size"]
+        return _content_current(meta, json.loads(f.read_text(encoding="utf-8")))
     except Exception:
         return False
 
 
 def ensure_content(meta: dict) -> dict:
-    """解析正文（content.json 缓存，源文件大小变化时失效）。"""
+    """同刊解析串行，PDF 解析器升级时自动迁移旧整本文档缓存。"""
+    with _CONTENT_LOCKS_GUARD:
+        lock = _CONTENT_LOCKS.setdefault(meta["id"], threading.RLock())
+    with lock:
+        return _ensure_content(meta)
+
+
+def _content_current(meta, cache):
+    return (isinstance(cache, dict) and cache.get("bookSize") == meta["size"]
+            and (meta["ext"] != "pdf" or cache.get("pdfParserVersion") == PDF_PARSER_VERSION))
+
+
+def _ensure_content(meta):
     cf = _cache_dir(meta["id"]) / "content.json"
     cache = _json_read(cf)
-    if cache and cache.get("bookSize") == meta["size"]:
+    if _content_current(meta, cache):
         return {
             "bookId": meta["id"],
             "format": cache["format"],
@@ -377,12 +382,81 @@ def ensure_content(meta: dict) -> dict:
         articles = pdf_parse(meta["path"])
         fmt = "pdf"
     payload = {"bookSize": meta["size"], "format": fmt, "articles": articles}
-    _json_write(cf, payload)
+    if fmt == "pdf":
+        payload["pdfParserVersion"] = PDF_PARSER_VERSION
+        if cache and cache.get("pdfParserVersion") != PDF_PARSER_VERSION:
+            _migrate_pdf_cache(meta, cache, articles)
+    _atomic_json_write(cf, payload)
     return {"bookId": meta["id"], "format": fmt, "articles": articles}
 
 
+def _migrate_pdf_cache(meta, old, articles):
+    import shutil
+
+    folder = _cache_dir(meta["id"])
+    backup = folder / f"before_pdf_v{PDF_PARSER_VERSION}"
+    backup.mkdir(exist_ok=True)
+    files = [folder / "content.json", folder / "digest.json", *folder.glob("vocab_*.json"),
+             *folder.glob("analysis_*.json")]
+    backups = [(source, backup / source.name) for source in files]
+    backups.extend([(_reading_history_file(meta["id"]), backup / "reading_history.json"),
+                    (_article_states_file(meta["id"]), backup / "article_states.json")])
+    for source, destination in backups:
+        if source.exists() and not destination.exists():
+            shutil.copy2(source, destination)
+    legacy_articles = old.get("articles", [])
+    if len(legacy_articles) == 1 and not old.get("pdfParserVersion"):
+        history = _json_read(backup / "reading_history.json") or {}
+        migrated = {}
+        record = history.get("0")
+        if record:
+            moved = core_pdf.relocate_legacy_record(meta["path"], legacy_articles[0], record, articles)
+            if moved:
+                index, position = moved
+                migrated[str(index)] = position
+        if history:
+            _atomic_json_write(_reading_history_file(meta["id"]), migrated)
+        if _article_states_file(meta["id"]).exists():
+            _atomic_json_write(_article_states_file(meta["id"]), {})
+    # 旧索引下的词表和句解不能套到新文章上，原内容保存在备份目录。
+    for source in files[1:]:
+        source.unlink(missing_ok=True)
+
+
 def load_digest(book_id: str):
-    return _json_read(_cache_dir(book_id) / "digest.json")
+    folder = _cache_dir(book_id)
+    digest = _json_read(folder / "digest.json")
+    if digest:
+        content = _content_signature(folder / "content.json")
+        if content and content.get("format") == "pdf" and (
+                content.get("pdfParserVersion") != PDF_PARSER_VERSION
+                or digest.get("pdfParserVersion") != PDF_PARSER_VERSION
+                or digest.get("pdfSourceSize") != content.get("bookSize")):
+            return None
+    return digest
+
+
+def _content_signature(path):
+    try:
+        stat = path.stat()
+        return _cached_content_signature(str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+
+
+@lru_cache(maxsize=128)
+def _cached_content_signature(path, mtime_ns, size):
+    # 首页只需版本信息；同一正文文件不在每次筛选、刷新时重新解码。
+    try:
+        with Path(path).open(encoding="utf-8") as source:
+            prefix = source.read(512)
+        fmt = re.search(r'"format"\s*:\s*"(epub|pdf)"', prefix)
+        if fmt and fmt[1] == "epub":
+            return {"format": "epub"}
+    except OSError:
+        return None
+    content = _json_read(Path(path))
+    return {key: content.get(key) for key in ("format", "bookSize", "pdfParserVersion")} if content else None
 
 
 def save_digest(digest: dict):
@@ -483,7 +557,13 @@ def save_reading_progress(book_id: str, article_index: int, progress: dict) -> d
 
 
 def has_digest(book_id: str) -> bool:
-    return (_cache_dir(book_id) / "digest.json").exists()
+    folder = _cache_dir(book_id)
+    if not (folder / "digest.json").is_file():
+        return False
+    content = _content_signature(folder / "content.json")
+    if not content or content.get("format") != "pdf":
+        return True
+    return load_digest(book_id) is not None
 
 
 def load_vocab(book_id: str, article_index: int, level: str):

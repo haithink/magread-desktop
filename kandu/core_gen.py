@@ -364,7 +364,10 @@ def digest_incomplete(meta) -> bool:
     try:
         content = store.ensure_content(meta)
     except Exception:
-        return False
+        return True
+    digest = store.load_digest(meta["id"])
+    if not digest:
+        return True
     have = {a.get("index"): a for a in digest.get("articles", [])}
     for a in content["articles"]:
         e = have.get(a["index"])
@@ -468,11 +471,14 @@ def _final_digest(meta, articles, existing, collected, on_progress=None, done=No
         d = collected.get(a["index"]) or existing.get(a["index"])
         if not d or not (d.get("summaryZh") or "").strip():
             d = {"index": a["index"], "titleEn": a["title"], "titleZh": "", "summaryZh": PLACEHOLDER_SUMMARY}
-        merged[a["index"]] = d
+        merged[a["index"]] = {**d, **{key: a[key] for key in ("pageStart", "pageEnd") if key in a}}
     return {
         "bookId": meta["id"],
         "articles": [merged[k] for k in sorted(merged)],
         "generatedAt": int(time.time() * 1000),
+        **({"pdfParserVersion": store.PDF_PARSER_VERSION, "pdfSourceSize": meta["size"],
+            "pdfSplitMethod": articles[0].get("pdfSplitMethod", "document")}
+           if meta.get("ext") == "pdf" else {}),
     }
 
 

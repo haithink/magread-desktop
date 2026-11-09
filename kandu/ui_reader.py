@@ -336,7 +336,9 @@ class ReaderFrame(tk.Frame):
             self.text.insert("end", subtitle + "\n", "t_subtitle")
         words = self._article_word_count
         minutes = max(1, (words + 219) // 220)
-        self.text.insert("end", f"{words:,} 词   ·   约 {minutes} 分钟   ·   {len(self.article['paragraphs'])} 段\n", "t_hint")
+        page_hint = (f"   ·   PDF 第 {self.article['pageStart']}–{self.article['pageEnd']} 页"
+                     if self.article.get("pageStart") else "")
+        self.text.insert("end", f"{words:,} 词   ·   约 {minutes} 分钟   ·   {len(self.article['paragraphs'])} 段" + page_hint + "\n", "t_hint")
         for i, para in enumerate(self.article["paragraphs"]):
             entries = self._entries_for(i)
             if entries:

@@ -2354,6 +2354,148 @@ def test_recent_articles_more():
         root.destroy()
 
 
+@case("PDF 按文章书签切分、同页边界与正文段落")
+def test_pdf_articles():
+    import pymupdf
+    from pathlib import Path
+    path = Path(SANDBOX) / "articles.pdf"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pymupdf.open() as doc:
+        doc.new_page().insert_text((72, 90), "Magazine cover and contents")
+        page = doc.new_page()
+        page.insert_text((72, 90), "First article", fontsize=22)
+        page.insert_text((72, 150), "Alpha body begins here.\nThis is a wrapped line.")
+        page.insert_text((72, 210), "Alpha has a separate paragraph.")
+        page.insert_text((72, 300), "Second article", fontsize=22)
+        page.insert_text((72, 360), "Beta belongs only to the second article.")
+        page = doc.new_page()
+        page.insert_text((72, 90), "Beta continues on another page.")
+        page.insert_text((72, 130), "| Next | Section menu | Main menu | Previous |", fontsize=8)
+        page = doc.new_page()
+        page.insert_text((72, 90), "Third article", fontsize=22)
+        page.insert_text((72, 160), "Gamma belongs only to the third article.")
+        toc = [[1, "Magazine section", 2], [2, "First article", 2],
+               [2, "Second article", 2], [2, "Third article", 4]]
+        doc.set_toc(toc)
+        doc.set_toc_item(1, kind=pymupdf.LINK_GOTO, pno=2, to=pymupdf.Point(72, 60))
+        doc.set_toc_item(2, kind=pymupdf.LINK_GOTO, pno=2, to=pymupdf.Point(72, 270))
+        doc.save(path)
+    articles = store.pdf_parse(str(path))
+    assert [a["title"] for a in articles] == ["First article", "Second article", "Third article"]
+    assert [a["index"] for a in articles] == [0, 1, 2]
+    assert articles[0]["paragraphs"] == ["Alpha body begins here. This is a wrapped line.",
+                                        "Alpha has a separate paragraph."]
+    assert articles[1]["paragraphPages"] == [2, 3]
+    assert articles[1]["pageStart"] == 2 and articles[1]["pageEnd"] == 3
+    assert "Beta" not in " ".join(articles[0]["paragraphs"])
+    assert "Gamma" not in " ".join(articles[1]["paragraphs"])
+    assert not any("Section menu" in p for a in articles for p in a["paragraphs"])
+
+
+@case("PDF 可点击目录、无目录说明与扫描件报错")
+def test_pdf_directory_fallback():
+    import pymupdf
+    from pathlib import Path
+    path = Path(SANDBOX) / "linked.pdf"
+    with pymupdf.open() as doc:
+        for _ in range(4):
+            doc.new_page()
+        page = doc[0]
+        page.insert_text((72, 72), "Magazine Articles")
+        for i in range(1, 4):
+            y = 110 + i * 40
+            page.insert_text((72, y), f"Article number {i}")
+            rect = page.search_for(f"Article number {i}")[0]
+            page.insert_link({"kind": pymupdf.LINK_GOTO, "from": rect, "page": i,
+                              "to": pymupdf.Point(72, 60)})
+            doc[i].insert_text((72, 90), f"Independent article body {i}.")
+        doc.save(path)
+    arts = store.pdf_parse(str(path))
+    assert len(arts) == 3 and all(a["pdfSplitMethod"] == "linked_contents" for a in arts)
+    assert [a["title"] for a in arts] == [f"Article number {i}" for i in range(1, 4)]
+    plain = path.with_name("plain.pdf")
+    with pymupdf.open() as doc:
+        doc.new_page().insert_text((72, 90), "A standalone document without a table of contents.")
+        doc.save(plain)
+    art = store.pdf_parse(str(plain))[0]
+    assert art["pdfSplitMethod"] == "document" and "未识别文章目录" in art["title"]
+    blank = path.with_name("scan.pdf")
+    with pymupdf.open() as doc:
+        doc.new_page()
+        doc.save(blank)
+    try:
+        store.pdf_parse(str(blank))
+    except ValueError as error:
+        assert "OCR" in str(error)
+    else:
+        raise AssertionError("不能把扫描件伪装成有正文的文章")
+
+
+@case("PDF 旧整本缓存迁移、阅读位置保留与摘要重新生成")
+def test_pdf_cache_upgrade():
+    import pymupdf
+    from pathlib import Path
+    from concurrent.futures import ThreadPoolExecutor
+    path = Path(SANDBOX) / "legacy.pdf"
+    with pymupdf.open() as doc:
+        for i in range(3):
+            doc.new_page().insert_text((72, 100), f"Unique body of article {i}. More original text to read.")
+        doc.set_toc([[1, f"Article {i}", i + 1] for i in range(3)])
+        doc.save(path)
+    meta = dict(META, id="T_PDF_UPGRADE", ext="pdf", path=str(path), size=path.stat().st_size)
+    with pymupdf.open(path) as doc:
+        paragraphs = [" ".join(p.get_text().split()) for p in doc]
+    folder = store._cache_dir(meta["id"])
+    legacy = {"bookSize": meta["size"], "format": "pdf", "articles": [
+        {"index": 0, "title": "legacy", "paragraphs": paragraphs}]}
+    store._json_write(folder / "content.json", legacy)
+    old_digest = {"bookId": meta["id"], "articles": [
+        {"index": 0, "titleEn": "legacy", "titleZh": "整本", "summaryZh": "这是错误的整本摘要"}]}
+    store.save_digest(old_digest)
+    for name in ("vocab_0_cet4.json", "analysis_fake.json"):
+        store._json_write(folder / name, {"old": True})
+    position = {"title": "legacy", "titleZh": "旧刊物名", "paragraphIndex": 1, "paragraphOffset": 12,
+                "paragraphStart": paragraphs[1][:160], "paragraphCount": 3, "wordCount": 50,
+                "progress": .4, "atStart": False, "atEnd": False}
+    record = store.save_reading_progress(meta["id"], 0, position)
+    store.set_article_state(meta["id"], 0, "read")
+    assert not store.has_content(meta) and not store.has_digest(meta["id"])
+    assert store.load_digest(meta["id"]) is None and gen.digest_incomplete(meta)
+    # 两个后台入口同时索引时只能解析一次，不能重复迁移或覆盖阅读位置。
+    with patch.object(store, "pdf_parse", wraps=store.pdf_parse) as parse:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            contents = list(executor.map(store.ensure_content, [meta, meta]))
+        assert parse.call_count == 1
+    assert contents[0] == contents[1] and len(contents[0]["articles"]) == 3
+    assert store.has_content(meta)
+    history = store.load_reading_history(meta["id"])
+    assert list(history) == ["1"] and history["1"]["title"] == "Article 1"
+    assert history["1"]["paragraphOffset"] == 12 and history["1"]["lastReadAt"] == record["lastReadAt"]
+    assert store.load_article_states(meta["id"]) == {}
+    backup = folder / f"before_pdf_v{store.PDF_PARSER_VERSION}"
+    assert J.loads((backup / "content.json").read_text(encoding="utf-8")) == legacy
+    assert J.loads((backup / "digest.json").read_text(encoding="utf-8")) == old_digest
+    assert J.loads((backup / "reading_history.json").read_text(encoding="utf-8"))["0"] == record
+    assert J.loads((backup / "article_states.json").read_text(encoding="utf-8")) == {"0": "read"}
+    assert (backup / "vocab_0_cet4.json").is_file() and not (folder / "vocab_0_cet4.json").exists()
+    assert (backup / "analysis_fake.json").is_file() and not (folder / "analysis_fake.json").exists()
+    calls = []
+    def fake(cfg, system, user, max_tokens=0, on_chars=None, **kwargs):
+        indexes = [int(v) for v in re.findall(r"index=(\d+)", user)]
+        calls.extend(indexes)
+        return J.dumps([{"index": i, "titleEn": f"Article {i}", "titleZh": f"文章{i}",
+                         "summaryZh": f"独立摘要{i}"} for i in indexes], ensure_ascii=False)
+    with patch.object(gen, "_chat_retry", fake):
+        digest = gen.generate_digest(meta, {})
+        assert calls == [0, 1, 2], "不能复用旧的 index=0 整本摘要"
+        assert len(digest["articles"]) == 3 and store.has_digest(meta["id"])
+        assert not gen.digest_incomplete(meta)
+        calls.clear()
+        gen.generate_digest(meta, {})
+        assert not calls, "升级后的完整摘要继续复用缓存"
+    assert store.load_reading_history(meta["id"]) == history
+
+
 def main():
     only = set(sys.argv[1:])
     if os.path.exists(SANDBOX):
