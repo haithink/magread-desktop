@@ -13,37 +13,10 @@ from kandu.core_config import app_dir
 from kandu.ui_analysis import (make_sheet as make_analysis_sheet,
                                render_analysis as _render_analysis,
                                render_loading as _render_loading)
-
-
-def _render_lookup(txt, word, result):
-    """本地查词结果渲染"""
-    txt.configure(state="normal")
-    txt.delete("1.0", "end")
-    if not result:
-        txt.insert("end", "词典尚未就绪（首次初始化约需半分钟），稍后再试。", "meta")
-        txt.configure(state="disabled")
-        return
-    if result.get("miss"):
-        txt.insert("end", f"本地词典未收录「{word}」。\n\n", "word")
-        txt.insert("end", "可能是专有名词、生僻变形或合成词。可以选中整句用「解析」让大模型讲解，"
-                          "或确认拼写后重试。", "sense")
-        txt.configure(state="disabled")
-        return
-    txt.insert("end", result.get("word", word) + "\n", "word")
-    meta_bits = []
-    if result.get("phonetic"):
-        meta_bits.append("/" + result["phonetic"].strip("/") + "/")
-    if result.get("pos"):
-        meta_bits.append(result["pos"])
-    if meta_bits:
-        txt.insert("end", "  ".join(meta_bits) + "\n", "meta")
-    txt.insert("end", "\n" + (result.get("translation") or "（无释义）") + "\n", "sense")
-    if result.get("exchange"):
-        txt.insert("end", "\n变形：" + result["exchange"], "root")
-    if result.get("lookedUp") and result["lookedUp"].lower() != word.lower():
-        txt.insert("end", f"\n（由「{result['lookedUp']}」还原原形）", "meta")
-    txt.insert("end", "\n\n来源：本地词典 ECDICT（离线）", "meta")
-    txt.configure(state="disabled")
+from kandu.ui_vocabulary import (make_sheet as make_vocabulary_sheet,
+                                 render_vocab as _render_vocab,
+                                 render_lookup as _render_lookup,
+                                 button as vocabulary_button)
 
 
 FAMILY = "Microsoft YaHei UI"
@@ -691,7 +664,7 @@ class ReaderFrame(tk.Frame):
         if not word:
             self.status.config(text="先选中或把光标放到要查的单词上")
             return
-        win, txt, bar = self._make_sheet(f"查词 · {word}", self.article["title"][:36])
+        win, txt, bar = self._make_sheet(f"查词 · {word}", self.article["title"])
         txt.insert("end", word + "\n", "word")
         txt.insert("end", "\n查询中…（词典首次初始化约需半分钟）", "meta")
         self._lookup_bar = bar
@@ -708,7 +681,7 @@ class ReaderFrame(tk.Frame):
             return
         _render_lookup(txt, word, result)
         if result and not result.get("miss"):
-            ttk.Button(bar, text="收进本篇生词表",
+            vocabulary_button(bar, text="收进本篇生词表",
                        command=lambda: self._add_word_to_vocab(para, result)).pack(side="right", padx=8, pady=3)
 
     def _add_word_to_vocab(self, para, result):
@@ -790,19 +763,19 @@ class ReaderFrame(tk.Frame):
 
     def _show_full_vocab(self):
         label = gen.level_label(self.app.settings["vocabLevel"])
-        self._render_vocab_sheet(f"本篇生词表（{label}，{self._total_words()} 词）", only_para=None)
+        self._render_vocab_sheet(f"本篇生词表（{label}）", only_para=None)
 
     def _render_vocab_sheet(self, title, only_para):
         entry = self._vocab_sheets.get(only_para)
         if entry and entry[0].winfo_exists():
             win, txt, bar = entry
             position = txt.index("@0,0")
-            win.title(f"{title} — {self.article['title'][:36]}")
-            bar.winfo_children()[0].configure(text=title)
+            win.title(f"{title} — {self.article['title']}")
+            win._sheet_title.configure(text=title)
             if win._enrich_button is not None:
                 win._enrich_button.destroy()
         else:
-            win, txt, bar = self._make_sheet(title, self.article["title"][:36])
+            win, txt, bar = self._make_sheet(title, self.article["title"])
             self._vocab_sheets[only_para] = (win, txt, bar)
             position = "1.0"
 
@@ -821,7 +794,7 @@ class ReaderFrame(tk.Frame):
                 self.generate_vocab(enrich=True)
                 if self.vocab_running:
                     win.destroy()
-            win._enrich_button = ttk.Button(bar, text=f"补充本文释义（{pending} 词）", command=enrich)
+            win._enrich_button = vocabulary_button(bar, text=f"补充本文释义（{pending} 词）", command=enrich)
             win._enrich_button.pack(side="right", padx=8, pady=3)
         if entry and entry[0] is win:
             win.deiconify()
@@ -830,119 +803,11 @@ class ReaderFrame(tk.Frame):
 
     # ---------- 公共弹层 ----------
     def _make_sheet(self, title, subtitle):
-        win = tk.Toplevel(self)
-        win.title(f"{title} — {subtitle}")
-        win.geometry("860x800")
-        bar = tk.Frame(win, bg="#1b4b43")
-        bar.pack(fill="x")
-        tk.Label(bar, text=title, bg="#1b4b43", fg="white",
-                 font=(FAMILY, 10, "bold")).pack(side="left", padx=10, pady=4)
+        return make_vocabulary_sheet(self, self.app, title, subtitle)
 
-        size = int(self.app.settings.get("sheetFontSize", 11))
-
-        def apply_size(delta=None):
-            s = int(self.app.settings.get("sheetFontSize", 11))
-            if delta:
-                s = max(9, min(22, s + delta))
-                self.app.settings["sheetFontSize"] = s
-                self.app.save_settings()
-            txt.configure(font=(FAMILY, s))
-            _config_tags(txt, s)
-
-        ttk.Button(bar, text="A-", width=3, command=lambda: apply_size(-1)).pack(side="right", padx=(2, 8), pady=3)
-        ttk.Button(bar, text="A+", width=3, command=lambda: apply_size(1)).pack(side="right", padx=2, pady=3)
-
-        body = ttk.Frame(win)
-        body.pack(fill="both", expand=True)
-        body.rowconfigure(0, weight=1)
-        body.columnconfigure(0, weight=1)
-        txt = tk.Text(body, wrap="word", bd=0, padx=20, pady=14,
-                      font=(FAMILY, size))
-        vbar = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=vbar.set)
-        txt.grid(row=0, column=0, sticky="nsew")
-        vbar.grid(row=0, column=1, sticky="ns")
-        _config_tags(txt, size)
-
-        def activate_on_map(event):
-            if event.widget is win:
-                win.unbind("<Map>", map_binding)
-                # Windows 首次显示可能只抬高窗口而未激活，正文仍为活动窗口时，
-                # 点击正文不会改变堆叠。映射后正常转移焦点，保持非模态切换。
-                win.after_idle(txt.focus_set)
-
-        map_binding = win.bind("<Map>", activate_on_map, add="+")
-        return win, txt, bar
-
-
-def _config_tags(txt, size=11):
-    """弹层文本样式：字号以 size 为基准缩放，供 A-/A+ 调节。"""
-    small = max(8, size - 2)
-    txt.tag_config("h1", font=(FAMILY, size + 2, "bold"), foreground="#1b4b43", spacing1=10)
-    txt.tag_config("h2", font=(FAMILY, size, "bold"), foreground="#7fa829", spacing1=10)
-    txt.tag_config("word", font=(FAMILY, size, "bold"), foreground="#1b4b43")
-    txt.tag_config("meta", foreground="#7a8a86", font=(FAMILY, small))
-    txt.tag_config("sense", font=(FAMILY, size))
-    txt.tag_config("root", foreground="#5c7f10", font=(FAMILY, max(8, size - 1)))
-    txt.tag_config("term", foreground="#8a6d00", font=(FAMILY, small, "bold"))
-    txt.tag_config("quote", foreground="#556", font=(FAMILY, max(8, size - 1), "italic"))
-    txt.tag_config("mono", font=("Consolas", max(8, size - 1)), background="#f2f6f4")
-    txt.tag_config("trans", background="#e9f4ef", font=(FAMILY, size))
-    txt.tag_config("src", foreground="#667", font=(FAMILY, max(8, size - 1)))
-    txt.tag_config("warn", foreground="#b06000", font=(FAMILY, small))
 
 
 def _render_error(txt, msg):
     txt.configure(state="normal")
     txt.insert("end", f"\n出错：{msg}", "term")
-    txt.configure(state="disabled")
-
-
-def _render_vocab(txt, vocab, only_para):
-    txt.configure(state="normal")
-    txt.delete("1.0", "end")
-
-    def entry_block(e):
-        line = f"{e['word']}  "
-        if e.get("phonetic"):
-            line += f"/{e['phonetic']}/  "
-        if e.get("pos"):
-            line += f"{e['pos']}  "
-        txt.insert("end", line, "word")
-        if e.get("term"):
-            txt.insert("end", "[术语] ", "term")
-        if e.get("senseSource") == "dictionary":
-            txt.insert("end", "\n词典释义（待补充本文含义）", "meta")
-        txt.insert("end", "\n" + e.get("sense", ""), "sense")
-        if e.get("inText"):
-            txt.insert("end", f"\n原文：{e['inText']}", "quote")
-        if e.get("root"):
-            txt.insert("end", f"\n拆词：{e['root']}", "root")
-        txt.insert("end", "\n\n")
-
-    if only_para is None:
-        te = vocab.get("titleEntries", [])
-        if te:
-            txt.insert("end", "〇 · 标题生词\n", "h1")
-            for e in te:
-                entry_block(e)
-        idioms = vocab.get("idioms", [])
-        if idioms:
-            txt.insert("end", "〇 · 熟词僻义（常见义 → 本文义）\n", "h1")
-            for it in idioms:
-                txt.insert("end", it["word"] + "\n", "word")
-                txt.insert("end", f"常见义：{it.get('common', '')}\n", "sense")
-                txt.insert("end", f"本文义：{it.get('inText', '')}\n\n", "sense")
-        txt.insert("end", "逐段生词\n", "h1")
-
-    sections = [p for p in vocab.get("paragraphs", []) if only_para is None or p.get("index") == only_para]
-    for p in sections:
-        txt.insert("end", f"第 {p['index'] + 1} 段 ｜ {p.get('startWords', '')}…\n", "h2")
-        entries = p.get("entries", [])
-        if not entries:
-            if only_para is not None:
-                txt.insert("end", "本段没有收录生词\n\n", "meta")
-            continue
-        for e in entries:
-            entry_block(e)
     txt.configure(state="disabled")

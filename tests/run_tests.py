@@ -270,7 +270,7 @@ def test_vocab_coverage_ui():
                 yield from descendants(child)
         txt = next(w for w in descendants(win) if isinstance(w, tk.Text))
         assert "词典释义（待补充本文含义）" in txt.get("1.0", "end")
-        button = next(w for w in descendants(win) if w.winfo_class() == "TButton"
+        button = next(w for w in descendants(win) if w.winfo_class() in ("Button", "TButton")
                       and "补充本文释义" in str(w.cget("text")))
         with patch.object(frame, "generate_vocab", side_effect=lambda **kw: setattr(frame, "vocab_running", True)) as generate:
             button.invoke()
@@ -876,7 +876,7 @@ def test_library_layout_and_navigation():
             assert resumed == [(metas[0]["id"], 5)] and saves
             fallback_btn = next(w for w in frame._recent_cards[1].winfo_children() if isinstance(w, tk.Button))
             fallback_btn.invoke()
-            assert opened == [metas[1]["id"]]
+            assert opened == [metas[1]["id"]], (opened, resumed)
             frame._cards[metas[3]["id"]]["cover"].event_generate("<Button-1>")
             assert opened[-1] == metas[3]["id"], "单击封面应打开对应刊物"
             with patch.object(frame, "_show_menu") as menu:
@@ -1030,7 +1030,7 @@ def test_vocab_sheet_scroll():
             assert txt.yview()[1] > .999, f"应能滚到最后一个词条：{txt.yview()}"
             txt.yview_moveto(0)
         before = int(txt.cget("font").split()[-1])
-        plus = next(w for w in toolbar.winfo_children() if isinstance(w, ttk.Button) and w.cget("text") == "A+")
+        plus = next(w for w in descendants(win) if isinstance(w, (tk.Button, ttk.Button)) and w.cget("text") == "A+")
         plus.invoke()
         app.update()
         assert int(txt.cget("font").split()[-1]) == before + 1
@@ -1091,7 +1091,7 @@ def test_vocab_sheet_reuse():
             reader._show_para_vocab(0)
             root.update()
         assert "最新释义" in txt.get("1.0", "end"), "复用窗口应显示最新缓存词条"
-        enrich = lambda: [w for w in bar.winfo_children() if isinstance(w, ttk.Button)
+        enrich = lambda: [w for w in bar.winfo_children() if isinstance(w, (tk.Button, ttk.Button))
                           and str(w.cget("text")).startswith("补充本文释义")]
         assert len(enrich()) == 1, "复用窗口不能重复添加补充释义按钮"
         reader.vocab["paragraphs"][0]["entries"][0].pop("senseSource")
@@ -1963,6 +1963,60 @@ def test_reading_resume():
     finally:
         if root.winfo_exists():
             root.destroy()
+
+
+@case("生词查找、段落定位与离线查词状态")
+def test_vocabulary_navigation():
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_vocabulary import make_sheet, render_vocab, render_lookup, _search, _move_hit
+
+    root = tk.Tk()
+    root.withdraw()
+    errors = []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    app = SimpleNamespace(settings={}, save_settings=lambda: None)
+    win, txt, _ = make_sheet(root, app, "本篇生词表", "A long article title " * 20)
+    try:
+        vocab = {"paragraphs": [
+            {"index": i, "entries": [{"word": f"craft{i}", "sense": "patient 手艺人", "root": "craft 手艺"}
+                                     for _ in range(5)]} for i in range(8)]}
+        render_vocab(txt, vocab, None)
+        root.update()
+        assert len(txt._vocab_section_choice.cget("values")) == 8
+        txt._vocab_section_choice.current(6)
+        txt._vocab_section_choice.event_generate("<<ComboboxSelected>>")
+        root.update()
+        assert txt.compare(txt.index("@0,0"), "<=", "vocab_section_6")
+        assert txt.yview()[0] > .5
+        txt._vocab_query.set("CRAFT6")
+        _move_hit(txt, 1)  # 输入后立刻回车也应按新查询定位，不使用旧结果。
+        assert len(txt._vocab_hits) == 5 and txt._vocab_hit == 0
+        _move_hit(txt, -1)
+        assert txt._vocab_hit == 4, "查找应支持循环向前定位"
+        txt._vocab_query.set("patient")
+        _search(txt)
+        assert not txt._vocab_hits and "未找到" in txt._vocab_status.cget("text"), "查找只匹配英文词头"
+        txt._vocab_query.set("")
+        render_vocab(txt, vocab, 2)
+        assert len(txt._vocab_sections) == 1 and "5 个词条" in txt._vocab_status.cget("text")
+        assert "craft2" in txt.get("1.0", "end") and "craft3" not in txt.get("1.0", "end")
+        render_vocab(txt, {"paragraphs": []}, None)
+        assert str(txt._vocab_section_choice.cget("state")) == "disabled"
+        assert "尚未收录" in txt.get("1.0", "end")
+        for result, expected in [(None, "尚未就绪"), ({"miss": True}, "未收录"),
+                                  ({"word": "craft", "lookedUp": "crafts", "translation": "手艺", "exchange": "crafts"}, "还原原形")]:
+            render_lookup(txt, "crafts", result)
+            assert expected in txt.get("1.0", "end")
+            assert str(txt.cget("state")) == "disabled"
+        txt.tag_add("sel", "1.0", "1.5")
+        assert txt.get("sel.first", "sel.last") == "craft", "词条应可选择复制"
+        txt._vocab_query.set("pending")
+        win.destroy()
+        root.update()
+        assert not errors, errors
+    finally:
+        root.destroy()
 
 
 def main():

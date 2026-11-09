@@ -21,15 +21,19 @@
 
 [![文章摘要浏览：最近阅读、继续阅读、未读与已读标记、搜索筛选](docs/screenshots/desktop-digest.png)](docs/screenshots/desktop-digest.png)
 
-**逐段生词表：音标、本文含义、原文短语与词根词源。**
+**全篇生词表：暖白纸面、分层词条、查找与段落定位。**
 
 [![生词表：音标、本文含义、原文短语与词根词源](docs/screenshots/desktop-vocabulary.png)](docs/screenshots/desktop-vocabulary.png)
+
+**段落生词：阅读《经济学人》诺奖科学报道时，直接查看该段的音标、本文义与词源。**
+
+[![真实文章的段落生词窗口](docs/screenshots/desktop-paragraph-vocabulary.png)](docs/screenshots/desktop-paragraph-vocabulary.png)
 
 **句子讲解：原句、疑难词汇、语法结构、上下文与参考译文，可通过顶部导航快速定位。**
 
 [![句子讲解：分区排版、语法图解与参考译文](docs/screenshots/desktop-analysis.png)](docs/screenshots/desktop-analysis.png)
 
-截图来自当前源码实际运行的程序，使用原创示例刊物封面、文章及预置的摘要、释义演示数据；实际生成结果随所选模型而异。下载包的版本以下载区标注为准。
+以上桌面截图来自当前版本实际运行的程序，使用现有书库中的真实刊物封面和文章：书库与摘要展示 Wired 等刊物，原文、生词与句解展示《经济学人》2026 年 10 月 10 日期的 “This year’s Nobel science prizes are real-life sci-fi”。摘要、释义与讲解均使用已有的实际生成结果。下载包的版本以下载区标注为准。
 
 ### 其他版本
 
@@ -67,6 +71,11 @@
    生词表词条级段落锚点自愈、运行日志（error.log）
 
 数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache / article_states）
+
+v0.8.8 统一全篇生词、段落生词与离线查词窗口的暖白纸面和深绿配色，突出英文词头、音标、本文义、原文短语与词源。
+支持查找词条（Ctrl+F、回车前进、Shift+回车后退）、段落定位、字号调整与回到开头；
+保留文本选择复制、滚动条、非模态切换和同段窗口复用。词典补漏仍明确标注待补充本文含义。
+README 的桌面截图改用现有书库的真实刊物、正文及已生成的辅助阅读内容，每张单独展示并可点击查看原图。
 
 v0.8.7 重新设计书库首页：添加与导入、设置、批量任务分区排列，书架随窗口宽度调整列数，
 支持刊名搜索、EPUB / PDF 筛选和名称 / 最近打开排序；继续阅读区最多展示 3 本，
