@@ -21,6 +21,10 @@
 
 [![文章摘要浏览：最近阅读、继续阅读、未读与已读标记、搜索筛选](docs/screenshots/desktop-digest.png)](docs/screenshots/desktop-digest.png)
 
+**更多最近阅读：首页跨刊物汇总，摘要页查看本刊记录，点击文章回到上次阅读位置。**
+
+[![更多最近阅读：文章链接、所属刊物和阅读位置](docs/screenshots/desktop-recent.png)](docs/screenshots/desktop-recent.png)
+
 **全篇生词表：暖白纸面、分层词条、查找与段落定位。**
 
 [![生词表：音标、本文含义、原文短语与词根词源](docs/screenshots/desktop-vocabulary.png)](docs/screenshots/desktop-vocabulary.png)
@@ -71,6 +75,11 @@
    生词表词条级段落锚点自愈、运行日志（error.log）
 
 数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache / article_states）
+
+v0.8.11 在首页「继续阅读」和摘要页「最近阅读」增加「更多」入口，保持原有三条快捷入口。
+首页汇总书库内各刊物的文章阅读记录，摘要页只显示本刊，均按最后阅读时间排序；
+显示中英文文章标题、所属刊物、段落位置和进度，点击文章直接恢复上次阅读位置。
+列表支持滚动和分批加载，重复点击复用已有窗口；直接使用本地阅读记录，无需请求模型。
 
 v0.8.10 首页按 Wired、经济学人、纽约客、大西洋月刊等刊名分区，同刊各期集中展示，默认新期优先。
 分类下拉框可直达某刊，支持组合刊名搜索和 EPUB / PDF 筛选，继续阅读入口保持固定。

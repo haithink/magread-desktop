@@ -1445,6 +1445,13 @@ def test_digest_compact_header():
             print(f"  {geometry}: header {top}px, article viewport {frame.canvas.winfo_height()}px")
         frame.recent_buttons[1].invoke()
         assert opened == [1]
+        progress = dict(store.load_reading_history(meta["id"])["1"])
+        for index in (4, 5, 999):
+            store.save_reading_progress(meta["id"], index, dict(progress, title=f"Article {index}"))
+        frame.recent_more_btn.invoke()
+        root.update()
+        assert len(frame._recent_window._recent_items) == 5, "本刊更多应显示超过三篇，且排除已不在摘要中的文章"
+        assert all(item[0]["id"] == meta["id"] for item in frame._recent_window._recent_items)
     finally:
         root.destroy()
 
@@ -2260,6 +2267,88 @@ def test_cover_repair():
             App._index_worker(holder, [meta])
         cover.assert_called_once_with(meta)
         assert holder.index_state["skipped"] == 1 and not holder.index_state["running"]
+        assert not errors, errors
+    finally:
+        root.destroy()
+
+
+@case("更多最近阅读跨刊汇总、分页、刷新复用与文章链接")
+def test_recent_articles_more():
+    import tkinter as tk
+    from tkinter import ttk
+    from types import SimpleNamespace
+    from kandu.ui_recent import show_recent
+    from kandu.ui_library import LibraryFrame
+    root = tk.Tk()
+    root.geometry("900x620")
+    errors, opened = [], []
+    root.report_callback_exception = lambda *a: errors.append(a)
+    metas = [dict(META, id="T_RECENT_MORE_A", fileName="wired_2026.11.02.epub"),
+             dict(META, id="T_RECENT_MORE_B", fileName="TheEconomist.2026.11.07.epub")]
+    record = {"title": "Same title", "titleZh": "同名文章", "paragraphIndex": 7,
+              "paragraphOffset": 40, "paragraphStart": "We read", "paragraphCount": 20,
+              "wordCount": 1000, "progress": .35, "atStart": False, "atEnd": False}
+    history = {str(i): dict(record, title=f"Article {i}", titleZh=f"文章 {i}", lastReadAt=1000000000000 + i)
+               for i in range(58)}
+    store._atomic_json_write(store._reading_history_file(metas[0]["id"]), history)
+    store._atomic_json_write(store._reading_history_file(metas[1]["id"]),
+                             {"4": dict(record, lastReadAt=1000000000080)})
+    store._atomic_json_write(store._reading_history_file("T_REMOVED_BOOK"),
+                             {"1": dict(record, lastReadAt=1000000000090)})
+    app = SimpleNamespace(settings={"recentBooks": [metas[0]["id"]]}, open_settings=lambda: None,
+                          start_indexing=lambda: None, start_batch_digest=lambda: None,
+                          index_state={"running": False, "done": 0}, batch_state={"running": False, "done": 0},
+                          open_reader=lambda m, i: opened.append((m["id"], i)))
+    try:
+        with patch.object(store, "load_library", return_value=metas):
+            frame = LibraryFrame(root, app)
+        frame.pack(fill="both", expand=True)
+        root.update()
+        frame.recent_more_btn.invoke()
+        root.update()
+        win = frame._recent_window
+        assert len(win._recent_items) == 59 and win._recent_shown == 50
+        assert [(m["id"], i) for m, i, _ in win._recent_items[:3]] == [
+            (metas[1]["id"], 4), (metas[0]["id"], 57), (metas[0]["id"], 56)]
+        txt = win._recent_text
+        assert "第 8 / 20 段 · 35%" in txt.get("1.0", "end")
+        assert "TheEconomist.2026.11.07.epub" in txt.get("1.0", "end")
+        win.geometry("520x400")
+        root.update()
+        assert txt.winfo_height() > 180
+        assert any(isinstance(w, ttk.Scrollbar) and w.winfo_ismapped() for w in txt.master.winfo_children())
+        txt.yview_moveto(.5)
+        root.update()
+        before = txt.index("@0,0")
+        win._recent_more.invoke()
+        root.update()
+        assert win._recent_shown == 59 and win._recent_more.cget("state") == "disabled"
+        assert txt.index("@0,0") == before, "分页追加不能跳回开头"
+        assert "Article 0" in txt.get("1.0", "end")
+        frame.recent_more_btn.invoke()
+        assert frame._recent_window is win, "重复点击更多应唤回同一个列表窗口"
+        assert not win.attributes("-topmost") and root.grab_current() is None and not win.transient()
+        # 原有列表窗口刷新后可收窄到本刊，也可更新新增文章的阅读时间。
+        store.save_reading_progress(metas[0]["id"], 30, record)
+        assert show_recent(frame, app, [metas[0]], {30, 20}) is win
+        assert [i for _, i, _ in win._recent_items] == [30, 20]
+        txt.yview_moveto(0)
+        root.update()
+        title = txt.bbox(txt.tag_ranges("recent_article_0")[0])
+        assert title
+        txt.event_generate("<Motion>", x=title[0] + 2, y=title[1] + 2)
+        txt.event_generate("<Button-1>", x=title[0] + 2, y=title[1] + 2)
+        root.update()
+        assert opened == [(metas[0]["id"], 30)] and not win.winfo_exists()
+        frame.recent_more_btn.invoke()
+        root.update()
+        replacement = frame._recent_window
+        assert replacement is not win
+        frame.destroy()
+        root.update()
+        assert not replacement.winfo_exists(), "离开首页应关闭最近阅读窗口"
+        empty = show_recent(root, app, [])
+        assert not empty._recent_items and "还没有" in empty._recent_text.get("1.0", "end")
         assert not errors, errors
     finally:
         root.destroy()

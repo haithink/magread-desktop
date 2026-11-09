@@ -6,6 +6,7 @@ from kandu import core_parsers as store
 from kandu import core_llm as llm
 from kandu import core_gen as gen
 from kandu import core_config as cfgmod
+from kandu.ui_recent import show_recent
 
 FAMILY = "Microsoft YaHei UI"
 PAPER = "#f3f4ef"
@@ -273,6 +274,10 @@ class DigestFrame(tk.Frame):
         tk.Label(self.recent_section, text="最近阅读", bg="#e9f0e5", fg=GREEN,
                  font=(FAMILY, 9, "bold")).pack(side="left", anchor="n", padx=(0, 12), pady=4)
         rows = tk.Frame(self.recent_section, bg="#e9f0e5")
+        self.recent_more_btn = self._button(self.recent_section, "更多 →",
+            lambda: show_recent(self, self.app, [self.meta], {a["index"] for a in self._articles} or None),
+            bg="#e9f0e5", padx=6, pady=1)
+        self.recent_more_btn.pack(side="right", anchor="n", padx=(10, 0), pady=3)
         rows.pack(side="left", fill="x", expand=True)
         for rank, (index, record) in enumerate(recent):
             article = articles.get(index, {})

@@ -8,6 +8,7 @@ from PIL import Image, ImageTk
 
 from kandu import core_config as cfgmod
 from kandu import core_parsers as store
+from kandu.ui_recent import show_recent
 
 FAMILY = "Microsoft YaHei UI"
 THUMB_W, THUMB_H = 126, 166
@@ -411,8 +412,13 @@ class LibraryFrame(tk.Frame):
         self._recent_cards.clear()
         recent = [by_id[i] for i in dict.fromkeys(self.app.settings.get("recentBooks") or []) if i in by_id][:3]
         if recent:
-            tk.Label(self.recent_section, text="继续阅读", bg=PAPER, fg=GREEN,
-                     font=(FAMILY, 10, "bold")).pack(anchor="w", pady=(0, 7))
+            heading = tk.Frame(self.recent_section, bg=PAPER)
+            heading.pack(fill="x", pady=(0, 7))
+            tk.Label(heading, text="继续阅读", bg=PAPER, fg=GREEN,
+                     font=(FAMILY, 10, "bold")).pack(side="left")
+            self.recent_more_btn = self._button(heading, "更多 →", lambda: show_recent(self, self.app, self.metas),
+                                                bg=PAPER, padx=6, pady=0)
+            self.recent_more_btn.pack(side="right")
             row = tk.Frame(self.recent_section, bg=PAPER)
             row.pack(fill="x", pady=(0, 16))
             for i, meta in enumerate(recent):
