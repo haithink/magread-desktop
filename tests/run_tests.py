@@ -2140,6 +2140,131 @@ def test_grammar_component_layout():
         root.destroy()
 
 
+@case("书库刊名分组、分类筛选、日期排序与卡片复用")
+def test_library_publication_groups():
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu.ui_library import LibraryFrame, publication
+    root = tk.Tk()
+    root.geometry("900x620")
+    errors = []
+    root.report_callback_exception = lambda *a: errors.append(a)
+    names = ["wired_2026.09.02.epub", "TheEconomist.2026.11.07.epub",
+             "wired_2026.11.02.epub", "TheEconomist.2026.10.31.pdf",
+             "new_yorker.2026.10.19.pdf", "Atlantic_2026.09.02.epub", "Other.epub"]
+    metas = [dict(META, id=f"T_GROUP_{i}", fileName=name, ext=name.rsplit(".", 1)[1])
+             for i, name in enumerate(names)]
+    app = SimpleNamespace(settings={}, open_settings=lambda: None, start_indexing=lambda: None,
+                          start_batch_digest=lambda: None, index_state={"running": False, "done": 0},
+                          batch_state={"running": False, "done": 0})
+    try:
+        with patch.object(store, "load_library", return_value=metas):
+            frame = LibraryFrame(root, app)
+        frame.pack(fill="both", expand=True)
+        root.update()
+        frame._layout_cards()
+        root.update()
+        identities = {key: entry["frame"] for key, entry in frame._cards.items()}
+        assert len(frame._groups) == 5 and len(frame._group_headings) == 5
+        assert frame._groups[0][1] == [metas[2]["id"], metas[0]["id"]], "新刊应在同刊分组内排前面"
+        assert len(set(frame._visible_ids)) == len(metas)
+        previous_bottom = 0
+        for label, ids in frame._groups:
+            heading = frame._group_headings[label]
+            assert heading.winfo_y() >= previous_bottom
+            assert frame._cards[ids[0]]["position"][1] > heading.winfo_y() + heading.winfo_height()
+            previous_bottom = max(frame._cards[i]["position"][1] + 264 for i in ids)
+        category = publication(metas[1])
+        frame.category_var.set(category)
+        frame.category_choice.event_generate("<<ComboboxSelected>>")
+        root.update()
+        assert frame._visible_ids == [metas[1]["id"], metas[3]["id"]]
+        assert set(frame._group_headings) == {category}
+        frame._select_format("pdf")
+        assert frame._visible_ids == [metas[3]["id"]]
+        frame.search_var.set("11.07")
+        frame._apply_filters()
+        root.update()
+        assert not frame._groups and not frame._group_headings and frame.empty.winfo_ismapped()
+        frame._reset_filters()
+        root.update()
+        assert len(frame._groups) == 5 and frame.category_var.get() == "全部刊物"
+        assert all(entry["frame"] is identities[key] for key, entry in frame._cards.items())
+        for widget in (frame.category_choice, frame.search_entry, frame.sort_choice):
+            assert widget.winfo_ismapped() and widget.winfo_width() >= widget.winfo_reqwidth()
+        assert frame.category_choice.winfo_rootx() + frame.category_choice.winfo_width() < frame.search_entry.master.winfo_rootx()
+        frame.canvas.yview_moveto(1)
+        root.update()
+        assert frame.canvas.yview()[1] > .999
+        assert not errors, errors
+    finally:
+        root.destroy()
+
+
+@case("缺失封面后台补取、即时刷新、去重与索引跳过正文仍补封面")
+def test_cover_repair():
+    import io
+    import zipfile
+    import tkinter as tk
+    from PIL import Image
+    from pathlib import Path
+    from types import SimpleNamespace
+    from kandu.ui_library import LibraryFrame
+    from main import App
+    image = io.BytesIO()
+    Image.new("RGB", (160, 220), "#548376").save(image, "JPEG")
+    source = Path(SANDBOX) / "repair.epub"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("META-INF/container.xml", '<container><rootfile full-path="EPUB/book.opf"/></container>')
+        archive.writestr("EPUB/book.opf", '<package><metadata><meta name="cover" content="c"/></metadata>'
+                         '<manifest><item id="c" href="images/cover.jpg" media-type="image/jpeg"/></manifest></package>')
+        archive.writestr("EPUB/images/cover.jpg", image.getvalue())
+    meta = dict(META, id="T_COVER_REPAIR", path=str(source))
+    bad = dict(meta, id="T_COVER_BAD", path=str(Path(SANDBOX) / "bad.epub"))
+    Path(bad["path"]).write_bytes(b"not an epub")
+    posts, events, errors = [], [], []
+    root = tk.Tk()
+    root.geometry("900x620")
+    root.report_callback_exception = lambda *a: errors.append(a)
+    app = SimpleNamespace(settings={}, open_settings=lambda: None, start_indexing=lambda: None,
+                          start_batch_digest=lambda: None, index_state={"running": False, "done": 0},
+                          batch_state={"running": False, "done": 0}, post=lambda *args: posts.append(args),
+                          emit=lambda *args: events.append(args))
+    try:
+        with patch.object(store, "load_library", return_value=[meta, bad]):
+            frame = LibraryFrame(root, app)
+        frame.pack(fill="both", expand=True)
+        root.update()
+        assert len(posts) == 1 and not store.has_cover(meta["id"]), "渲染不能同步提取封面"
+        frame._render()
+        root.update()
+        assert len(posts) == 1, "重绘不能重复排队"
+        worker = threading.Thread(target=posts[0][0], args=posts[0][1:])
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive() and len(events) == 1
+        assert events[0] == ("covers_ready", {meta["id"]: True, bad["id"]: False})
+        frame.on_covers_ready(events[0][1])
+        root.update()
+        assert meta["id"] in frame._photo_cache and not frame._cover_pending
+        photo = frame._photo_cache[meta["id"]]
+        frame._render()
+        root.update()
+        assert len(posts) == 1 and frame._photo_cache[meta["id"]] is photo
+        frame._repair_missing_covers([bad], retry=True)
+        assert len(posts) == 2, "失败封面允许手动重试"
+        holder = SimpleNamespace(index_state={"running": True, "errors": [], "done": 0})
+        with patch.object(store, "has_content", return_value=True), \
+             patch.object(store, "ensure_cover") as cover, \
+             patch.object(store, "ensure_content", side_effect=AssertionError("已有正文不能重复解析")):
+            App._index_worker(holder, [meta])
+        cover.assert_called_once_with(meta)
+        assert holder.index_state["skipped"] == 1 and not holder.index_state["running"]
+        assert not errors, errors
+    finally:
+        root.destroy()
+
+
 def main():
     only = set(sys.argv[1:])
     if os.path.exists(SANDBOX):

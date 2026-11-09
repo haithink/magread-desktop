@@ -18,6 +18,18 @@ MUTED = "#738079"
 WHITE = "#fffdf8"
 
 
+def publication(meta):
+    """按刊名归类；文件名的日期与格式不影响分类。"""
+    name = re.sub(r"[^a-z0-9\u3400-\u9fff]", "", meta["fileName"].casefold())
+    for needles, label in ((("economist", "经济学人"), "The Economist · 经济学人"),
+                           (("wired", "连线"), "Wired · 连线"),
+                           (("newyorker", "纽约客"), "The New Yorker · 纽约客"),
+                           (("atlantic", "大西洋月刊"), "The Atlantic · 大西洋月刊")):
+        if any(needle in name for needle in needles):
+            return label
+    return "其他刊物"
+
+
 class LibraryFrame(tk.Frame):
     def __init__(self, parent, app: "App"):
         super().__init__(parent, bg=PAPER)
@@ -29,6 +41,10 @@ class LibraryFrame(tk.Frame):
         self._recent_cards = []
         self._visible_ids = []
         self._mounted_ids = set()
+        self._groups = []
+        self._group_headings = {}
+        self._cover_attempted = set()
+        self._cover_pending = set()
         self._cols = 0
         self._search_after = self._layout_after = self._thumb_after = None
         self._tick_after = None
@@ -65,6 +81,10 @@ class LibraryFrame(tk.Frame):
             btn = self._button(controls, title, lambda k=key: self._select_format(k), pady=4)
             btn.pack(side="left", padx=(0, 6))
             self.filter_buttons[key] = btn
+        self.category_var = tk.StringVar(self, "全部刊物")
+        self.category_choice = ttk.Combobox(controls, textvariable=self.category_var, state="readonly", width=15)
+        self.category_choice.pack(side="left", padx=(4, 0), ipady=3)
+        self.category_choice.bind("<<ComboboxSelected>>", lambda e: self._apply_filters())
         self.sort_var = tk.StringVar(self, "默认顺序")
         self.sort_choice = ttk.Combobox(controls, textvariable=self.sort_var, state="readonly",
                                         values=("默认顺序", "名称排序", "最近打开"), width=11)
@@ -302,8 +322,47 @@ class LibraryFrame(tk.Frame):
             entry["state"].configure(text="摘要已就绪" if ready else "待生成摘要",
                                       fg="#4e7857" if ready else "#9a8b72")
         self.overview.configure(text=f"{len(self.metas)} 本刊物  ·  {len(self._digest_ids)} 本有摘要")
+        categories = sorted({publication(m) for m in self.metas})
+        self.category_choice.configure(values=["全部刊物", *categories])
+        if self.category_var.get() not in ("全部刊物", *categories):
+            self.category_var.set("全部刊物")
         self._render_recent(by_id)
         self._apply_filters()
+        self._repair_missing_covers()
+
+    def _repair_missing_covers(self, metas=None, retry=False):
+        """提取只在后台运行；文件缺失时不阻塞首页，也不在滚动时反复重试。"""
+        post = getattr(self.app, "post", None)
+        if post is None:
+            return
+        todo = [m for m in (self.metas if metas is None else metas)
+                if m["id"] not in self._cover_pending and
+                (retry or (m["id"] not in self._cover_attempted and not store.has_cover(m["id"])))
+                and os.path.isfile(m["path"])]
+        if not todo:
+            return
+        ids = {m["id"] for m in todo}
+        self._cover_pending.update(ids)
+        self._cover_attempted.update(ids)
+        post(self._cover_worker, todo)
+
+    def _cover_worker(self, metas):
+        results = {}
+        for meta in metas:
+            try:
+                results[meta["id"]] = bool(store.ensure_cover(meta))
+            except Exception:
+                results[meta["id"]] = False
+        self.app.emit("covers_ready", results)
+
+    def on_covers_ready(self, results):
+        self._cover_pending.difference_update(results)
+        for book_id, ready in results.items():
+            entry = self._cards.get(book_id)
+            if entry and ready:
+                self._photo_cache.pop(book_id, None)
+                entry["loaded"] = False
+        self._queue_thumbs()
 
     @staticmethod
     def _book_title(meta):
@@ -404,6 +463,7 @@ class LibraryFrame(tk.Frame):
     def _reset_filters(self):
         self.search_var.set("")
         self._format = "all"
+        self.category_var.set("全部刊物")
         self._apply_filters()
 
     @staticmethod
@@ -416,13 +476,24 @@ class LibraryFrame(tk.Frame):
             self._search_after = None
         words = self._search_text(self.search_var.get()).split()
         metas = [m for m in self.metas if (self._format == "all" or m["ext"] == self._format)
+                 and (self.category_var.get() == "全部刊物" or publication(m) == self.category_var.get())
                  and all(word in self._search_text(m["fileName"]) for word in words)]
         if self.sort_var.get() == "名称排序":
             metas.sort(key=lambda m: self._search_text(m["fileName"]))
         elif self.sort_var.get() == "最近打开":
             order = {book_id: i for i, book_id in enumerate(self.app.settings.get("recentBooks", []))}
             metas.sort(key=lambda m: order.get(m["id"], len(order)))
-        self._visible_ids = [m["id"] for m in metas]
+        grouped = {}
+        for meta in metas:
+            grouped.setdefault(publication(meta), []).append(meta["id"])
+        if self.sort_var.get() == "默认顺序":
+            by_id = {m["id"]: m for m in metas}
+            for name, ids in grouped.items():
+                if name != "其他刊物":
+                    ids.sort(key=lambda book_id: tuple(int(p) for p in re.findall(
+                        r"\d+", by_id[book_id]["fileName"])), reverse=True)
+        self._groups = list(grouped.items())
+        self._visible_ids = [book_id for _, ids in self._groups for book_id in ids]
         visible = set(self._visible_ids)
         for book_id, entry in self._cards.items():
             if book_id not in visible:
@@ -432,7 +503,7 @@ class LibraryFrame(tk.Frame):
         for key, button in self.filter_buttons.items():
             button.configure(bg=GREEN if key == self._format else "#e6ebe1",
                              fg="white" if key == self._format else GREEN)
-        filtered = self._format != "all" or bool(words)
+        filtered = self._format != "all" or bool(words) or self.category_var.get() != "全部刊物"
         self.result_label.configure(text=f"找到 {len(metas)} / {len(self.metas)} 本刊物" if filtered else f"全部刊物  /  {len(metas)}")
         if metas:
             self.empty.pack_forget()
@@ -452,15 +523,28 @@ class LibraryFrame(tk.Frame):
         width = max(1, self.canvas.winfo_width())
         cols = max(1, min(8, width // 192))
         self._cols = cols
-        self.shelf.configure(height=((len(self._visible_ids) + cols - 1) // cols) * 276)
-        for i, book_id in enumerate(self._visible_ids):
-            entry = self._cards[book_id]
-            left, right = (i % cols) * width // cols, (i % cols + 1) * width // cols
-            entry["position"] = (left + 6, i // cols * 276, max(1, right - left - 12))
-            wrap = max(100, right - left - 36)
-            if wrap != entry["wrap"]:
-                entry["title"].configure(wraplength=wrap)
-                entry["wrap"] = wrap
+        active = {name for name, _ in self._groups}
+        for name in set(self._group_headings) - active:
+            self._group_headings.pop(name).destroy()
+        y = 0
+        for name, ids in self._groups:
+            heading = self._group_headings.get(name)
+            if heading is None:
+                heading = self._group_headings[name] = tk.Label(self.shelf, bg=PAPER, fg=GREEN,
+                    anchor="w", font=(FAMILY, 11, "bold"))
+            heading.configure(text=f"{name}  /  {len(ids)} 本")
+            heading.place(x=6, y=y, width=max(1, width - 12), height=30)
+            y += 38
+            for i, book_id in enumerate(ids):
+                entry = self._cards[book_id]
+                left, right = (i % cols) * width // cols, (i % cols + 1) * width // cols
+                entry["position"] = (left + 6, y + i // cols * 276, max(1, right - left - 12))
+                wrap = max(100, right - left - 36)
+                if wrap != entry["wrap"]:
+                    entry["title"].configure(wraplength=wrap)
+                    entry["wrap"] = wrap
+            y += ((len(ids) + cols - 1) // cols) * 276 + 10
+        self.shelf.configure(height=max(1, y))
         self._queue_thumbs()
 
     def _load_visible_thumbs(self):
@@ -520,6 +604,7 @@ class LibraryFrame(tk.Frame):
         menu = tk.Menu(self, tearoff=0)
         self._card_popup = menu
         menu.add_command(label="打开", command=lambda: self.app.open_digest(meta))
+        menu.add_command(label="补取缺失封面", command=lambda: self._repair_missing_covers([meta], retry=True))
         menu.add_command(label="清除本书摘要", command=lambda: self._purge_one(meta, digest_only=True))
         menu.add_separator()
         menu.add_command(label="移出书库（删除文件与缓存）", command=lambda: self._remove_book(meta))

@@ -62,13 +62,12 @@ class App(tk.Tk):
                 break
             self.index_state["current"] = m["fileName"]
             self.index_state["done"] = i
-            if store.has_content(m):
-                skipped += 1
-                self.index_state["done"] = i + 1
-                continue
             try:
-                store.ensure_content(m)
                 store.ensure_cover(m)
+                if store.has_content(m):
+                    skipped += 1
+                else:
+                    store.ensure_content(m)
             except Exception as e:
                 self.index_state["errors"].append(f"{m['fileName']}：{e}")
             self.index_state["done"] = i + 1
