@@ -62,6 +62,8 @@ class LibraryFrame(tk.Frame):
         tk.Label(bar, text="刊读", bg=GREEN, fg="white", font=(FAMILY, 15, "bold")).pack(side="left")
         tk.Label(bar, text="ENGLISH READING", bg=GREEN, fg="#bdd0c5", font=(FAMILY, 8)).pack(side="left", padx=16)
         self._button(bar, "设置", self.app.open_settings, bg=GREEN, fg="#e0eae2").pack(side="right")
+        from kandu.ui_wordbook import show_wordbook
+        self._button(bar, '个人生词本', lambda: show_wordbook(self.app), bg=GREEN, fg='#e0eae2').pack(side='right', padx=10)
         self._button(bar, "从文件夹导入", self.import_folder, bg=GREEN, fg="#e0eae2").pack(side="right", padx=12)
         self._button(bar, "+ 添加刊物", self.add_files, bg="#e5eddf").pack(side="right")
 

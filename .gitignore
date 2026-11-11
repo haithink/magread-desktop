@@ -4,3 +4,8 @@ dist/
 __pycache__/
 *.spec
 ver.txt
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+settings.json
+_test_artifacts/

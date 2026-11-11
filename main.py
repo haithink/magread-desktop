@@ -157,6 +157,13 @@ class App(tk.Tk):
                             pass
                         self._erroring = False
                     continue
+                if kind == 'wordbook_changed':
+                    from kandu.ui_wordbook import notify_changed
+                    try:
+                        notify_changed(self)
+                    except Exception as e:
+                        self._handle_handler_error(e)
+                    continue
                 handler = getattr(self.current, f"on_{kind}", None)
                 if handler:
                     try:

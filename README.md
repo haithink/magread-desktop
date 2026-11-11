@@ -33,6 +33,10 @@
 
 [![真实文章的段落生词窗口](docs/screenshots/desktop-paragraph-vocabulary.png)](docs/screenshots/desktop-paragraph-vocabulary.png)
 
+**个人生词本：右键查词自动收藏，跨刊物保留；可搜索、编辑释义与笔记、删除词条。**
+
+[![个人生词本与词条编辑](docs/screenshots/desktop-wordbook.png)](docs/screenshots/desktop-wordbook.png)
+
 **句子讲解：原句、疑难词汇、语法成分与原文对应、上下文与参考译文，可通过顶部导航快速定位。**
 
 [![句子讲解：分区排版、语法成分对应与参考译文](docs/screenshots/desktop-analysis.png)](docs/screenshots/desktop-analysis.png)
@@ -74,7 +78,15 @@
 5. **可靠性** — SSE 流式、推理模型额度自适应重试、截断 JSON 自动修补、分批落盘、
    生词表词条级段落锚点自愈、运行日志（error.log）
 
-数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache / article_states）
+数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache / article_states）。
+个人生词本保存在该目录的 `wordbook.sqlite3`，跨刊物共享，移除刊物或清理文章缓存不会删除收藏。
+
+v0.8.13 增加个人生词本：正文右键「查词」自动收藏英文单词或短语，重复查询会合并词条并保留手工释义和笔记。
+首页和阅读页提供独立管理窗口，支持搜索单词 / 中文释义 / 笔记、仅看本篇出现的词、新增、编辑、删除、词典补全。
+选中正文后右键「加入 / 查看个人生词本」可预填词条，生词弹窗也可选中词头进入管理。
+生成过的旧生词表和未生成的文章都会即时展示本篇出现的收藏词，包括已被四级词表过滤的词；标题、段落及常见词形均可匹配。
+个人收藏实时叠加到显示层，不重写模型缓存、不调用 LLM；已有本文释义优先保留，并标注「已收录生词本」。
+编辑或删除后同步刷新打开的阅读页和生词窗口；删除只移除个人收藏，模型原本生成的词条仍保留。
 
 v0.8.12 修复 PDF 杂志被整本当作一篇文章的问题：优先按书签目录的文章叶节点切分，
 没有书签时尝试可点击目录；支持同页多篇的目标位置，保留文章标题、独立段落和来源页码，过滤目录导航。

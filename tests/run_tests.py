@@ -2496,6 +2496,167 @@ def test_pdf_cache_upgrade():
     assert store.load_reading_history(meta["id"]) == history
 
 
+@case('个人生词本持久化、去重、编辑删除与并发查词')
+def test_wordbook_store():
+    from kandu import core_wordbook as words
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+    source = dict(bookId='T_WB', articleIndex=2, paragraph=0, articleTitle='A candid view')
+    hit = dict(word='candid', lemma='candid', phonetic='kændɪd', translation='adj. 坦率的', pos='adj.')
+    with patch.object(cfgmod, 'app_dir', return_value=Path(SANDBOX) / 'wb_store'):
+        cfgmod.app_dir().mkdir(parents=True)
+        first = words.remember_lookup('Candid', hit, source)
+        words.save(dict(word='candid', sense='我记录的：坦诚的', note='注意语境', root='个人词源'), original='candid')
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _: words.remember_lookup('CANDID', hit, source), range(12)))
+        record = words.get('Candid')
+        assert record['lookups'] == 13 and len(words.list_words()) == 1
+        assert record['sense'] == '我记录的：坦诚的' and record['note'] == '注意语境'
+        assert record['created_at'] == first['created_at'] and record['source'] == source
+        assert len(words.list_words('坦诚')) == len(words.list_words('语境')) == 1
+        words.save(dict(word='honest', sense='诚实的'))
+        try:
+            words.save(dict(word='honest'), original='candid')
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('重命名不能覆盖另一词')
+        renamed = words.save(dict(word='candour'), original='candid')
+        assert renamed['sense'] == record['sense'] and not words.get('candid')
+        assert not renamed['aliases'], '重命名不能继续匹配旧单词'
+        assert words.delete('CANDOUR') and not words.delete('candour')
+        assert [r['word'] for r in words.list_words()] == ['honest']
+        for bad in ('', '你好', '<script>', '../bad'):
+            try:
+                words.save(dict(word=bad))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('非法单词应拒绝')
+
+
+@case('个人生词覆盖四级词、标题、变形、旧缓存与删除')
+def test_wordbook_overlay():
+    from kandu import core_wordbook as words
+    from pathlib import Path
+    import copy
+    with patch.object(cfgmod, 'app_dir', return_value=Path(SANDBOX) / 'wb_overlay'), patch.object(core_dict, 'lookup_many', return_value={}):
+        cfgmod.app_dir().mkdir(parents=True)
+        words.save(dict(word='simple', sense='简单的'))  # 即便已经掌握，也须显示
+        words.save(dict(word='cat', sense='猫'))
+        words.save(dict(word='in fact', sense='事实上'))
+        words.remember_lookup('running', dict(word='running', lemma='run', translation='跑'), {})
+        article = dict(index=3, title='A simple view', paragraphs=['SIMPLE cats are running, in fact.', 'Education matters.'])
+        cached = dict(level='cet4', articleIndex=3, processedParagraphs=[-1, 0, 1], titleEntries=[], idioms=[], paragraphs=[
+            dict(index=0, entries=[dict(word='simple', sense='本文特定含义', inText='SIMPLE cats')])])
+        before = copy.deepcopy(cached)
+        shown = words.overlay(cached, article)
+        assert cached == before, '个人生词叠加不能写入旧模型缓存'
+        assert shown['titleEntries'][0]['word'] == 'simple'
+        entries = shown['paragraphs'][0]['entries']
+        assert len(entries) == 4 and {e['word'] for e in entries} == {'simple', 'cat', 'run', 'in fact'}
+        assert entries[0]['sense'] == '本文特定含义' and entries[0]['inWordbook']
+        assert len(shown['paragraphs']) == 1, '不能把 cat 匹配到 education'
+        words.save(dict(word='cat', sense='猫科动物'), original='cat')
+        assert next(e for e in words.overlay(cached, article)['paragraphs'][0]['entries'] if e['word'] == 'cat')['sense'] == '猫科动物'
+        for record in words.list_words():
+            words.delete(record['word'])
+        assert words.overlay(cached, article) == cached, '删除后只移除个人叠加，模型释义仍保留'
+        assert words.overlay(None, article)['paragraphs'] == []
+
+
+@case('个人生词本查词自动入库、阅读页同步与管理UI')
+def test_wordbook_ui():
+    import tkinter as tk
+    from types import SimpleNamespace
+    from pathlib import Path
+    import queue
+    from kandu.ui_reader import ReaderFrame
+    from kandu.ui_wordbook import show_wordbook, notify_changed
+    from kandu import core_wordbook as words
+    root = tk.Tk()
+    root.geometry('1180x800')
+    errors = []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    root.settings = dict(readerFontSize=13, sheetFontSize=11, vocabLevel='cet4', llms=[])
+    root.post = lambda *args: None
+    root.save_settings = lambda: None
+    root.q = queue.Queue()
+    root.emit = lambda kind, payload=None: root.q.put((kind, payload))
+    article = dict(index=0, title='A simple view', paragraphs=['A simple test starts here.', 'An honest view.'])
+    meta = dict(META, id='T_WB_UI')
+    try:
+        with patch.object(cfgmod, 'app_dir', return_value=Path(SANDBOX) / 'wb_ui'), patch.object(core_dict, 'lookup_many', return_value={}):
+            cfgmod.app_dir().mkdir(parents=True)
+            reader = ReaderFrame(root, root, meta, 0)
+            root.current = reader
+            reader.pack(fill='both', expand=True)
+            reader.on_content_loaded((dict(articles=[article]), 0))
+            root.update()
+            assert reader.vocab is None
+            win, txt, bar = reader._make_sheet('查词', article['title'])
+            hit = dict(word='simple', lemma='simple', phonetic='sɪmpl', translation='简单的', pos='adj.')
+            with patch.object(core_dict, 'ensure_db'), patch.object(core_dict, 'lookup', return_value=hit):
+                reader._lookup_worker('SIMPLE', 0, win, bar, txt)
+            assert words.get('simple')['lookups'] == 1
+            assert root.q.get()[0] == 'wordbook_changed'
+            kind, payload = root.q.get()
+            assert kind == 'lookup_done'
+            notify_changed(root)
+            reader.on_lookup_done(payload)
+            reader._show_para_vocab(0)
+            root.update()
+            assert reader.text.tag_ranges('pv_0') and reader._entries_for(0)[0]['word'] == 'simple'
+            sheet = reader._vocab_sheets[0][1]
+            assert '已收录生词本' in sheet.get('1.0', 'end')
+            assert reader.vocab is None and not store.load_vocab(meta['id'], 0, 'cet4')
+            manager = show_wordbook(root, meta, article)
+            root.update()
+            assert manager is show_wordbook(root, meta, article), '生词本窗口应复用'
+            manager.select_word('simple')
+            manager.texts['sense'].delete('1.0', 'end')
+            manager.texts['sense'].insert('1.0', '个人修改的释义')
+            manager.save_entry()
+            root.update()
+            assert '个人修改的释义' in sheet.get('1.0', 'end')
+            manager.new_entry()
+            manager.fields['word'].set('honest')
+            manager.texts['sense'].insert('1.0', '诚实的')
+            manager.save_entry()
+            root.update()
+            assert reader._entries_for(1)[0]['word'] == 'honest'
+            words.save(dict(word='elsewhere', sense='不在本文'))
+            notify_changed(root)
+            manager.only_article.set(True)
+            manager.refresh()
+            assert set(manager.tree.get_children()) == {'simple', 'honest'}
+            manager.query.set('诚实')
+            manager.refresh()
+            assert manager.tree.get_children() == ('honest',)
+            manager.select_word('honest')
+            with patch('kandu.ui_wordbook.messagebox.askyesno', return_value=True):
+                manager.delete_entry()
+            root.update()
+            assert not words.get('honest') and not reader._entries_for(1)
+            manager.query.set('')
+            manager.refresh()
+            manager.select_word('simple')
+            with patch('kandu.ui_wordbook.messagebox.askyesno', return_value=True):
+                manager.delete_entry()
+            root.update()
+            assert not reader._entries_for(0) and 'simple' not in sheet.get('1.0', 'end')
+            # 查词窗在结果回来前被关闭，仍然完成入库。
+            win.destroy()
+            with patch.object(core_dict, 'ensure_db'), patch.object(core_dict, 'lookup', return_value=hit):
+                reader._lookup_worker('simple', 0, win, bar, txt)
+            assert words.get('simple')
+            assert root.q.get()[0] == 'wordbook_changed'
+            reader.on_lookup_done(root.q.get()[1])
+            assert not errors, errors
+    finally:
+        root.destroy()
+
+
 def main():
     only = set(sys.argv[1:])
     if os.path.exists(SANDBOX):

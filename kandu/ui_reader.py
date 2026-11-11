@@ -8,6 +8,8 @@ from kandu import core_parsers as store
 from kandu import core_llm as llm
 from kandu import core_gen as gen
 from kandu import core_dict
+from kandu import core_wordbook as wordbook
+from kandu.ui_wordbook import show_wordbook
 from kandu import core_config as cfgmod
 from kandu.core_config import app_dir
 from kandu.ui_analysis import (make_sheet as make_analysis_sheet,
@@ -36,6 +38,8 @@ class ReaderFrame(tk.Frame):
         self.article_index = article_index
         self.article = None
         self.vocab = None
+        self._display_vocab = None
+        self._wordbook_matches = {}
         self.vocab_running = False
         self.analysis_busy = set()
         self._analysis_progress = {}
@@ -86,6 +90,8 @@ class ReaderFrame(tk.Frame):
         self.font_up_btn.pack(side="left")
         self.vocab_btn = self._button(tools, "生成生词表", self._vocab_btn, bg=GREEN, fg="white")
         self.vocab_btn.grid(row=0, column=3)
+        self.wordbook_btn = self._button(tools, '个人生词本', self._open_wordbook)
+        self.wordbook_btn.grid(row=0, column=4, padx=(8, 0))
 
         footer = tk.Frame(self, bg=PAPER, padx=28, pady=10)
         footer.pack(side="bottom", fill="x")
@@ -130,6 +136,7 @@ class ReaderFrame(tk.Frame):
 
         self.menu = tk.Menu(self, tearoff=0)
         self.menu.add_command(label="查词（本地词典）", command=self._menu_lookup)
+        self.menu.add_command(label='加入 / 查看个人生词本', command=self._open_wordbook)
         self.menu.add_separator()
         self.menu.add_command(label="解析选中内容", command=self._analyze_selection)
         self.menu.add_command(label="解析整段", command=self._analyze_whole_paragraph)
@@ -308,16 +315,18 @@ class ReaderFrame(tk.Frame):
         self.font_up_btn.config(state="disabled" if size >= 26 else "normal")
 
     def _total_words(self):
-        if not self.vocab:
+        vocab = self._display_vocab or self.vocab
+        if not vocab:
             return 0
-        return len(self.vocab.get("titleEntries", [])) + sum(
-            len(p.get("entries", [])) for p in self.vocab.get("paragraphs", [])
+        return len(vocab.get("titleEntries", [])) + sum(
+            len(p.get("entries", [])) for p in vocab.get("paragraphs", [])
         )
 
     def _entries_for(self, idx):
-        if not self.vocab:
+        vocab = self._display_vocab or self.vocab
+        if not vocab:
             return []
-        for p in self.vocab.get("paragraphs", []):
+        for p in vocab.get("paragraphs", []):
             if p.get("index") == idx:
                 return p.get("entries", [])
         return []
@@ -325,6 +334,8 @@ class ReaderFrame(tk.Frame):
     def _rebuild(self, keep_scroll=True):
         if self.article is None:
             return
+        self._wordbook_matches = wordbook.article_matches(self.article)
+        self._display_vocab = wordbook.overlay(self.vocab, self.article, self.app.settings['vocabLevel'], self._wordbook_matches)
         frac = self.text.yview()[0] if keep_scroll else 0.0
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
@@ -351,7 +362,7 @@ class ReaderFrame(tk.Frame):
 
         total = self._total_words()
         if self.vocab is None:
-            self.vocab_btn.config(text="生成生词表")
+            self.vocab_btn.config(text=f'生词表 {total} · 生成更多' if total else '生成生词表')
         elif self.vocab.get("failedChunks") or self._missing_paragraphs() is not None:
             miss = self._missing_paragraphs()
             self.vocab_btn.config(text=f"补缺生词表" + (f"（缺 {miss} 段）" if miss else ""))
@@ -368,6 +379,9 @@ class ReaderFrame(tk.Frame):
     # ---------- 生词表 ----------
     def _vocab_btn(self):
         if self.vocab_running:
+            return
+        if self.vocab is None and self._total_words():
+            self._show_full_vocab()
             return
         state = self._vocab_state()
         if state == "complete":
@@ -675,6 +689,13 @@ class ReaderFrame(tk.Frame):
     def _lookup_worker(self, word, para, win, bar, txt):
         core_dict.ensure_db(background=False)
         result = core_dict.lookup(word)
+        # 查词窗口关闭或切走文章后，后台结果仍然收录。
+        try:
+            wordbook.remember_lookup(word, result, self._word_source(para))
+        except ValueError:
+            pass
+        else:
+            self.app.emit('wordbook_changed')
         self.app.q.put(("lookup_done", (win, bar, txt, word, para, result)))
 
     def on_lookup_done(self, payload):
@@ -682,34 +703,59 @@ class ReaderFrame(tk.Frame):
         if not win.winfo_exists():
             return
         _render_lookup(txt, word, result)
-        if result and not result.get("miss"):
-            vocabulary_button(bar, text="收进本篇生词表",
-                       command=lambda: self._add_word_to_vocab(para, result)).pack(side="right", padx=8, pady=3)
+        key = (result or {}).get('lemma') or (result or {}).get('word') or word
+        try:
+            saved = wordbook.get(key)
+        except ValueError:
+            saved = None
+        if saved:
+            label = tk.Label(bar, text='已自动加入个人生词本', bg=PAPER, fg=GREEN, font=(FAMILY, 9))
+            label.pack(side='left', padx=8)
+            vocabulary_button(bar, text='查看 / 编辑', command=lambda: self._open_wordbook(saved['word'])).pack(side='right', padx=8, pady=3)
+            def remove():
+                wordbook.delete(saved['word'])
+                from kandu.ui_wordbook import notify_changed
+                notify_changed(self.app)
+                label.configure(text='已从个人生词本移除')
+                remove_btn.configure(state='disabled')
+            remove_btn = vocabulary_button(bar, text='移出生词本', command=remove)
+            remove_btn.pack(side='right', padx=4, pady=3)
 
     def _add_word_to_vocab(self, para, result):
-        level = self.app.settings["vocabLevel"]
-        vocab = self.vocab or {"level": level, "articleIndex": self.article_index,
-                               "titleEntries": [], "paragraphs": [], "idioms": []}
-        entry = {
-            "word": (result.get("word") or "").lower(),
-            "phonetic": result.get("phonetic", ""),
-            "pos": result.get("pos", ""),
-            "sense": result.get("translation", "").replace("\n", "；"),
-            "inText": "",
-            "root": "",
-            "term": False,
-        }
-        sections = {p["index"]: p for p in vocab["paragraphs"]}
-        sec = sections.setdefault(para, {"index": para, "startWords": "", "entries": []})
-        if all(e["word"] != entry["word"] for e in sec["entries"]):
-            sec["entries"].append(entry)
-        vocab["paragraphs"] = sorted(sections.values(), key=lambda x: x["index"])
-        from kandu.core_gen import vocab_normalize
-        normalized = vocab_normalize(vocab, self.article)
-        store.save_vocab(self.meta["id"], normalized)
-        self.vocab = normalized
+        saved = wordbook.remember_lookup(result.get('lookedUp') or result['word'], result, self._word_source(para))
+        from kandu.ui_wordbook import notify_changed
+        notify_changed(self.app)
+        self.status.config(text=f"已把「{saved['word']}」收进个人生词本")
+
+    def _word_source(self, para):
+        text = self.article['paragraphs'][para] if isinstance(para, int) and 0 <= para < len(self.article['paragraphs']) else self.article['title']
+        return dict(bookId=self.meta['id'], bookTitle=self.meta['fileName'], articleIndex=self.article_index,
+                    articleTitle=self.article['title'], paragraph=para if isinstance(para, int) else -1, context=text[:800])
+
+    def _open_wordbook(self, query=''):
+        if not query:
+            rng = self.text.tag_ranges('sel')
+            query = self.text.get(rng[0], rng[1]).strip() if rng else ''
+        try:
+            normalized = wordbook.normalize(query) if query else None
+            initial = wordbook.get(normalized) if normalized else None
+            if normalized and initial is None:
+                hit = core_dict.lookup(normalized) or {}
+                initial = dict(word=normalized, phonetic=hit.get('phonetic', ''), pos=hit.get('pos', ''),
+                               sense=hit.get('translation', '').replace('\\n', '\n'), source=self._word_source(self._last_click[0]))
+        except ValueError:
+            initial = None
+        return show_wordbook(self.app, self.meta, self.article, query=query, initial=initial)
+
+    def on_wordbook_changed(self):
+        if self.article is None:
+            return
         self._rebuild(keep_scroll=True)
-        self.status.config(text=f"已把「{entry['word']}」收进第 {para + 1} 段生词表")
+        for para, (win, txt, _) in list(self._vocab_sheets.items()):
+            if win.winfo_exists():
+                position = txt.index('@0,0')
+                _render_vocab(txt, self._display_vocab, para)
+                txt.yview(position)
 
     def _analysis_worker(self, cfg, para, sentence, key):
         try:
@@ -758,7 +804,7 @@ class ReaderFrame(tk.Frame):
 
     # ---------- 生词表弹层 ----------
     def _show_para_vocab(self, para):
-        if self.vocab is None:
+        if self.vocab is None and not self._entries_for(para):
             self.generate_vocab()
             return
         self._render_vocab_sheet(f"第 {para + 1} 段生词", only_para=para)
@@ -768,6 +814,7 @@ class ReaderFrame(tk.Frame):
         self._render_vocab_sheet(f"本篇生词表（{label}）", only_para=None)
 
     def _render_vocab_sheet(self, title, only_para):
+        self._display_vocab = wordbook.overlay(self.vocab, self.article, self.app.settings['vocabLevel'], self._wordbook_matches)
         entry = self._vocab_sheets.get(only_para)
         if entry and entry[0].winfo_exists():
             win, txt, bar = entry
@@ -787,10 +834,26 @@ class ReaderFrame(tk.Frame):
 
             win.bind("<Destroy>", forget, add="+")
         win._enrich_button = None
-        _render_vocab(txt, self.vocab, only_para)
+        _render_vocab(txt, self._display_vocab, only_para)
+        if not getattr(win, '_wordbook_controls', None):
+            def manage():
+                selection = txt.tag_ranges('sel')
+                query = txt.get(selection[0], selection[1]).strip() if selection else ''
+                initial = None
+                if query:
+                    display = self._display_vocab
+                    entries = display.get('titleEntries', []) + [e for p in display.get('paragraphs', []) for e in p.get('entries', [])]
+                    picked = next((e for e in entries if e['word'].lower() == query.lower()), None)
+                    if picked:
+                        initial = dict(picked, word=picked.get('wordbookWord') or picked['word'], source=self._word_source(only_para))
+                show_wordbook(self.app, self.meta, self.article, query=query, initial=initial)
+            win._wordbook_controls = vocabulary_button(bar, text='个人生词本 · 增删改查', command=manage)
+            win._wordbook_controls.pack(side='left', padx=8, pady=3)
+            win._generate_button = vocabulary_button(bar, text='生成 / 补缺全文生词', command=self.generate_vocab)
+            win._generate_button.pack(side='left', padx=4, pady=3)
         txt.update_idletasks()
         txt.yview(position)
-        pending = gen.vocab_context_pending(self.vocab)
+        pending = gen.vocab_context_pending(self.vocab or {})
         if pending:
             def enrich():
                 self.generate_vocab(enrich=True)

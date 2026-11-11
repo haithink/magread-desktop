@@ -237,11 +237,13 @@ def render_vocab(txt, vocab, only_para):
             txt.insert("end", "   " + entry["pos"], "meta")
         if entry.get("term"):
             txt.insert("end", "   术语", "term")
+        if entry.get('inWordbook'):
+            txt.insert('end', '   已收录生词本', 'term')
         txt.insert("end", "\n")
         offline = entry.get("senseSource") == "dictionary"
         if offline:
             txt.insert("end", "词典释义（待补充本文含义）\n", "warn")
-        txt.insert("end", "释义  " if offline else "本文义  ", "label")
+        txt.insert("end", '个人释义  ' if entry.get('senseSource') == 'wordbook' else ("释义  " if offline else "本文义  "), "label")
         txt.insert("end", entry.get("sense", "") + "\n", "sense")
         if entry.get("inText"):
             txt.insert("end", "原文  ", "label")
@@ -249,6 +251,9 @@ def render_vocab(txt, vocab, only_para):
         if entry.get("root"):
             txt.insert("end", "词根词源  ", "label")
             txt.insert("end", entry["root"] + "\n", "root")
+        if entry.get('note'):
+            txt.insert('end', '学习笔记  ', 'label')
+            txt.insert('end', entry['note'] + '\n', 'root')
         txt.insert("end", "\n")
 
     if only_para is None:
