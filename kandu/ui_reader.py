@@ -60,6 +60,12 @@ class ReaderFrame(tk.Frame):
         self._restore_position_after = None
         self._saved_position = None
         self._resume_position = None
+        self._find_after = None
+        self._find_visible = False
+        self._find_hits = []
+        self._find_current = -1
+        self._find_query = ""
+        self._find_bindings = []
 
         bar = tk.Frame(self, bg=GREEN, padx=20, pady=12)
         bar.pack(fill="x")
@@ -76,8 +82,8 @@ class ReaderFrame(tk.Frame):
         tools = tk.Frame(self, bg=PAPER, padx=28, pady=13)
         tools.pack(fill="x")
         tools.columnconfigure(1, weight=1)
-        tk.Label(tools, text="原文精读", bg=PAPER, fg=GREEN,
-                 font=(FAMILY, 11, "bold")).grid(row=0, column=0, padx=(0, 18))
+        self.find_btn = self._button(tools, "查找 Ctrl+F", self._show_find, bg=PAPER, fg=GREEN)
+        self.find_btn.grid(row=0, column=0, padx=(0, 10))
         tk.Label(tools, text="双击句子 · 句解    选中右键 · 查词 / 解析", bg=PAPER, fg=MUTED,
                  font=(FAMILY, 9), anchor="w", width=1).grid(row=0, column=1, sticky="ew")
         font_tools = tk.Frame(tools, bg="#e7ebe4", padx=3, pady=2)
@@ -138,6 +144,8 @@ class ReaderFrame(tk.Frame):
         self.text.bind("<Double-Button-1>", self._on_double_click)
         self.text.bind("<Button-3>", self._on_right_click)
         self.text.bind("<Return>", lambda e: self._on_double_click(e))
+        self._find_body = body
+        self._make_find_bar()
 
         self.menu = tk.Menu(self, tearoff=0)
         self.menu.add_command(label="查词（本地词典）", command=self._menu_lookup)
@@ -161,6 +169,148 @@ class ReaderFrame(tk.Frame):
         margin = max(24, (event.width - 920) // 2)
         self.page.grid_configure(padx=margin)
         self.status.configure(wraplength=max(160, event.width - 540))
+
+    # ---------- 当前文章文本查找 ----------
+    def _make_find_bar(self):
+        self.find_bar = tk.Frame(self, bg="#e7ebe4", padx=28, pady=7)
+        self.find_bar.columnconfigure(1, weight=1)
+        tk.Label(self.find_bar, text="查找正文", bg="#e7ebe4", fg=GREEN,
+                 font=(FAMILY, 9)).grid(row=0, column=0, padx=(0, 10))
+        self.find_var = tk.StringVar(self)
+        self.find_entry = tk.Entry(self.find_bar, textvariable=self.find_var, width=12,
+                                   font=(FAMILY, 10), relief="flat", bg=INK_PAPER, fg=INK)
+        self.find_entry.grid(row=0, column=1, sticky="ew", ipady=5)
+        self.find_count = tk.Label(self.find_bar, text="输入关键词", bg="#e7ebe4", fg=MUTED,
+                                   font=(FAMILY, 9), width=15)
+        self.find_count.grid(row=0, column=2, padx=8)
+        self.find_prev = self._button(self.find_bar, "↑ 上一个", lambda: self._find_step(-1), bg="#e7ebe4", padx=7)
+        self.find_prev.grid(row=0, column=3)
+        self.find_next = self._button(self.find_bar, "↓ 下一个", lambda: self._find_step(1), bg="#e7ebe4", padx=7)
+        self.find_next.grid(row=0, column=4)
+        self._button(self.find_bar, "×", self._hide_find, bg="#e7ebe4", padx=9).grid(row=0, column=5)
+        self.find_var.trace_add("write", self._queue_find)
+        self.find_entry.bind("<Return>", lambda e: self._find_step(1))
+        self.find_entry.bind("<Shift-Return>", lambda e: self._find_step(-1))
+        self.text.tag_configure("reader_find", background="#f0e3ac", foreground=INK)
+        self.text.tag_configure("reader_find_current", background="#d8bd69", foreground="#253d31")
+        top = self.winfo_toplevel()
+        for sequence, action in (("<Control-f>", self._show_find), ("<F3>", lambda: self._find_step(1)),
+                                 ("<Shift-F3>", lambda: self._find_step(-1)), ("<Escape>", self._hide_find)):
+            def handler(event, action=action):
+                # 只响应本阅读页的控件，不影响句解、词表和 AI 讨论等独立窗口。
+                if self.winfo_ismapped() and str(event.widget).startswith(str(self) + "."):
+                    return action()
+            binding = top.bind(sequence, handler, add="+")
+            self._find_bindings.append((sequence, binding))
+        self._find_controls()
+
+    def _show_find(self):
+        selected = self.text.tag_ranges("sel")
+        quote = self.text.get(*selected).strip() if selected else ""
+        if not self._find_visible:
+            self.find_bar.pack(fill="x", before=self._find_body)
+            self._find_visible = True
+        if quote and len(quote) <= 200 and "\n" not in quote:
+            self.find_var.set(quote)
+        elif self.find_var.get():
+            self._find_refresh(jump=False)
+        self.find_entry.focus_set()
+        self.find_entry.selection_range(0, "end")
+        return "break"
+
+    def _hide_find(self):
+        if not self._find_visible:
+            return
+        self._cancel_find()
+        self._find_visible = False
+        self.find_bar.pack_forget()
+        self.text.tag_remove("reader_find", "1.0", "end")
+        self.text.tag_remove("reader_find_current", "1.0", "end")
+        self._find_hits, self._find_current = [], -1
+        self._find_controls()
+        self.text.focus_set()
+        return "break"
+
+    def _cancel_find(self):
+        if self._find_after is not None:
+            self.after_cancel(self._find_after)
+            self._find_after = None
+
+    def _queue_find(self, *_):
+        self._cancel_find()
+        if self._find_visible:
+            self._find_after = self.after(120, self._find_refresh)
+
+    def _find_refresh(self, jump=True):
+        self._cancel_find()
+        query = self.find_var.get().strip()
+        previous = self._find_current if query == self._find_query else -1
+        self._find_query = query
+        self._find_hits, self._find_current = [], -1
+        self.text.tag_remove("reader_find", "1.0", "end")
+        self.text.tag_remove("reader_find_current", "1.0", "end")
+        if self._find_visible and query:
+            # 标题和正文参与查找；排除段落生词按钮、词数、预计时间等界面文字。
+            ranges = []
+            for tag in ("t_title", "t_subtitle", "t_body"):
+                indices = self.text.tag_ranges(tag)
+                ranges.extend(zip(indices[::2], indices[1::2]))
+            ranges.sort(key=lambda pair: tuple(map(int, str(pair[0]).split("."))))
+            count = tk.IntVar(self)
+            for start, stop in ranges:
+                cursor = start
+                while True:
+                    found = self.text.search(query, cursor, stopindex=stop, nocase=True, exact=True, count=count)
+                    if not found or count.get() <= 0:
+                        break
+                    # Tk 8.6 search 的 count 把 emoji 计为两个 UTF-16 单元，
+                    # Text 的 +Nc 则按完整字符移动；使用字面查询的字符数。
+                    end = self.text.index(f"{found}+{len(query)}c")
+                    self._find_hits.append((found, end))
+                    self.text.tag_add("reader_find", found, end)
+                    cursor = end
+            if self._find_hits:
+                if previous >= 0:
+                    self._find_current = min(previous, len(self._find_hits) - 1)
+                else:
+                    top = self.text.index("@0,0")
+                    self._find_current = next((i for i, hit in enumerate(self._find_hits)
+                                               if self.text.compare(hit[0], ">=", top)), 0)
+                self._find_highlight(jump)
+        self._find_controls()
+
+    def _find_highlight(self, jump):
+        self.text.tag_remove("reader_find_current", "1.0", "end")
+        if self._find_current >= 0:
+            start, end = self._find_hits[self._find_current]
+            self.text.tag_add("reader_find_current", start, end)
+            self.text.tag_raise("reader_find")
+            self.text.tag_raise("reader_find_current")
+            self.text.tag_raise("sel")
+            if jump:
+                self.text.see(start)
+
+    def _find_step(self, delta):
+        if not self._find_visible:
+            self._show_find()
+            if self.find_var.get():
+                self._find_refresh()
+            return "break"
+        if self._find_after is not None:
+            self._find_refresh()
+            return "break"
+        if self._find_hits:
+            self._find_current = (self._find_current + delta) % len(self._find_hits)
+            self._find_highlight(jump=True)
+        self._find_controls()
+        return "break"
+
+    def _find_controls(self):
+        total = len(self._find_hits)
+        self.find_count.configure(text=(f"{self._find_current + 1} / {total}" if total else
+                                        ("未找到匹配" if self.find_var.get().strip() else "输入关键词")))
+        for button in (self.find_prev, self.find_next):
+            button.configure(state="normal" if total else "disabled")
 
     def _on_text_scroll(self, first, last):
         self.vbar.set(first, last)
@@ -247,6 +397,9 @@ class ReaderFrame(tk.Frame):
 
     def destroy(self):
         self.save_reading_position()
+        self._cancel_find()
+        for sequence, binding in self._find_bindings:
+            self.winfo_toplevel().unbind(sequence, binding)
         for pending in (self._position_after, self._restore_position_after, self._analysis_tick_after):
             if pending is not None:
                 self.after_cancel(pending)
@@ -373,6 +526,8 @@ class ReaderFrame(tk.Frame):
                                    lambda e, k=i: self._show_para_vocab(k))
             self.text.insert("end", para + "\n", ("t_body", f"p_{i}"))
         self.text.configure(state="disabled")
+        if self._find_visible:
+            self._find_refresh(jump=False)
         self.text.update_idletasks()
         if position and not position['atStart']:
             if position['atEnd']:

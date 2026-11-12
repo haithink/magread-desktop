@@ -3267,6 +3267,137 @@ def test_discussion_ui_failures():
         root.destroy()
 
 
+@case("阅读正文查找忽略大小写、字面匹配、标题和中文且排除界面文字")
+def test_reader_find():
+    import tkinter as tk
+    from kandu.ui_reader import ReaderFrame
+    root = tk.Tk()
+    root.geometry("1180x800")
+    root.settings = dict(readerFontSize=13, sheetFontSize=11, vocabLevel="cet4", llms=[])
+    root.post = lambda *args: None
+    root.save_settings = lambda: None
+    article = dict(index=0, title="Chart a course", paragraphs=[
+        "Chart his path. A chart shows data. 😀 Chart again.",
+        "Literal [a+b]. A 中文 explanation. Another CHART."])
+    try:
+        reader = ReaderFrame(root, root, dict(META, id="T_FIND"), 0)
+        reader.pack(fill="both", expand=True)
+        reader.on_content_loaded((dict(articles=[article]), 0))
+        root.update()
+        reader._show_find()
+        root.update()
+        assert reader.find_bar.winfo_ismapped()
+        reader.find_var.set("cHaRt")
+        reader._find_refresh()
+        assert len(reader._find_hits) == 5, reader._find_hits
+        assert all(reader.text.get(*hit).lower() == "chart" for hit in reader._find_hits)
+        assert len(reader.text.tag_ranges("reader_find")) == 10
+        first = reader._find_current
+        reader._find_step(1)
+        assert reader._find_current == (first + 1) % 5
+        reader._find_step(-1)
+        assert reader._find_current == first
+        reader._find_current = 4
+        reader._find_step(1)
+        assert reader._find_current == 0 and reader.find_count.cget("text") == "1 / 5"
+        for query in ("[a+b]", "中文", "😀"):
+            reader.find_var.set(query)
+            reader._find_refresh()
+            assert len(reader._find_hits) == 1 and reader.text.get(*reader._find_hits[0]) == query, (query, reader._find_hits, [reader.text.get(*h) for h in reader._find_hits])
+        reader.find_var.set("ENGLISH READING")
+        reader._find_refresh()
+        assert not reader._find_hits and reader.find_count.cget("text") == "未找到匹配"
+        assert str(reader.find_next.cget("state")) == "disabled"
+        reader.find_var.set("")
+        reader._find_refresh()
+        assert not reader.text.tag_ranges("reader_find") and reader.find_count.cget("text") == "输入关键词"
+        start = reader._para_range(1)[0]
+        reader.text.tag_add("sel", start, f"{start}+7c")
+        reader._show_find()
+        assert reader.find_var.get() == "Literal"
+        reader._find_refresh()
+        assert reader.text.tag_ranges("sel"), "搜索不能破坏正文选区或选中提问"
+        reader._hide_find()
+        root.update()
+        assert not reader.find_bar.winfo_ismapped() and not reader.text.tag_ranges("reader_find_current")
+    finally:
+        root.destroy()
+
+
+@case("阅读查找刷新保持当前位置与结果、快捷键作用域及销毁清理")
+def test_reader_find_lifecycle():
+    import tkinter as tk
+    from kandu.ui_reader import ReaderFrame
+    root = tk.Tk()
+    root.geometry("1180x800")
+    root.settings = dict(readerFontSize=13, sheetFontSize=11, vocabLevel="cet4", llms=[])
+    root.post = lambda *args: None
+    root.save_settings = lambda: None
+    article = dict(index=0, title="Find in article", paragraphs=[
+        f"Paragraph {i}. A candid writer reads. " + "Simple supporting text. " * 40 for i in range(25)])
+    callbacks = []
+    root.report_callback_exception = lambda *args: callbacks.append(args)
+    original_binding = root.bind("<Control-f>")
+    try:
+        reader = ReaderFrame(root, root, dict(META, id="T_FIND_LIFE"), 0)
+        reader.pack(fill="both", expand=True)
+        reader.on_content_loaded((dict(articles=[article]), 0))
+        root.update()
+        reader.text.focus_force()
+        reader.text.event_generate("<Control-f>")
+        root.update()
+        assert reader._find_visible
+        reader.find_var.set("candid")
+        reader._find_refresh()
+        reader._find_current = 18
+        reader._find_highlight(jump=True)
+        root.update()
+        # 在搜索跳转位置继续阅读，刷新生词徽标时仍保留同一段落及当前搜索结果。
+        before = reader._capture_reading_position()
+        reader.vocab = dict(articleIndex=0, level="cet4", processedParagraphs=list(range(25)),
+                            paragraphs=[dict(index=i, entries=[dict(word="candid", sense="坦率的")]) for i in range(25)])
+        reader._rebuild()
+        root.update()
+        after = reader._capture_reading_position()
+        assert before["paragraphIndex"] == after["paragraphIndex"], (before, after)
+        assert len(reader._find_hits) == 25 and reader._find_current == 18
+        assert reader.text.get(*reader._find_hits[18]) == "candid"
+        reader._font(1)
+        root.update()
+        assert len(reader._find_hits) == 25 and reader._find_current == 18
+        reader.find_entry.focus_force()
+        reader.find_entry.event_generate("<Return>")
+        root.update()
+        assert reader._find_current == 19
+        reader.find_entry.event_generate("<Shift-Return>")
+        root.update()
+        assert reader._find_current == 18
+        reader.find_entry.event_generate("<Escape>")
+        root.update()
+        assert not reader._find_visible
+        # 独立窗口有自己的查找键，不打开或改变阅读页查找栏。
+        popup = tk.Toplevel(root)
+        entry = tk.Entry(popup)
+        entry.pack()
+        root.update()
+        entry.focus_force()
+        entry.event_generate("<Control-f>")
+        root.update()
+        assert not reader._find_visible
+        popup.destroy()
+        reader._show_find()
+        reader.find_var.set("pending")
+        pending = reader._find_after
+        assert pending
+        reader.destroy()
+        assert root.bind("<Control-f>") == original_binding
+        assert pending not in root.tk.call("after", "info")
+        root.update()
+        assert not callbacks, callbacks
+    finally:
+        root.destroy()
+
+
 def main():
     only = set(sys.argv[1:])
     if os.path.exists(SANDBOX):

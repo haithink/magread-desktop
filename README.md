@@ -3,7 +3,7 @@
 「刊读」Android App 的 Windows 桌面版：选择期刊目录，基于大模型辅助精读
 经济学人 / Wired 等英文原刊（EPUB / PDF）。
 
-版本历史与每版变更见 [变更记录](CHANGELOG.md)（当前 v0.8.16）。
+版本历史与每版变更见 [变更记录](CHANGELOG.md)（当前 v0.8.17）。
 
 ## 界面预览
 
@@ -63,7 +63,7 @@
 
 ## 下载 Windows 安装包
 
-**[下载刊读 v0.8.16（Windows 64 位，约 62 MiB）](https://github.com/haithink/magread-desktop/raw/refs/heads/main/downloads/Kandu-v0.8.16-win64.zip)**
+**[下载刊读 v0.8.17（Windows 64 位，约 62 MiB）](https://github.com/haithink/magread-desktop/raw/refs/heads/main/downloads/Kandu-v0.8.17-win64.zip)**
 
 免安装：解压后运行 `Kandu.exe`（`_internal` 依赖目录需与 exe 同级保留）。
 数据目录在 `%LOCALAPPDATA%\KanduDesktop`，与解压位置无关。
@@ -78,7 +78,8 @@
 3. **阅读** — 居中纸面与英文衬线排版，中英文标题、字数与预计阅读时间，阅读进度与回到开头；
    双击句子 → 句解（疑难词汇 / 语法成分对应 / 语境 / 参考译文）；选中后右键解析；
    段前「词 N」查看本段生词与重点短语，工具栏「生词表」看全篇；词条可一键收藏，正文与弹层字号可调；
-   「与 AI 讨论」围绕文章连续提问，支持选中引用、流式回答与自动保存会话
+   「与 AI 讨论」围绕文章连续提问，支持选中引用、流式回答与自动保存会话；
+   Ctrl+F 查找标题与正文，支持高亮、结果计数和前后定位
 4. **LLM 配置** — 多配置管理（新增/编辑/删除/★ 默认），OpenAI 兼容 / Anthropic 原生；
    支持粘贴 cc-switch JSON 自动识别；连通性测试；获取可用模型；
    生词表失败块**自动轮换其他已配置 LLM** 补缺
@@ -88,10 +89,12 @@
 数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache / article_states）。
 个人生词本保存在该目录的 `wordbook.sqlite3`，跨刊物共享，移除刊物或清理文章缓存不会删除收藏。
 
-v0.8.16 增加文章 AI 讨论：阅读页点击「与 AI 讨论」，或选中文字后右键「向 AI 提问」，输入问题后按 Ctrl+Enter 发送。
-每篇文章独立保存会话，关闭后可以继续追问；使用已有模型配置，支持切换模型、停止、重试和复制回答。
-长文章会选取当前段落附近及与问题相关的节选，窗口明确提示；本地保留完整历史，请求仅带入最近完整问答。
-会话保存在 `%LOCALAPPDATA%\KanduDesktop\discussions`，清理摘要、生词等生成缓存不会删除会话；正文变化后建立新的会话。
+v0.8.17 增加阅读页文本搜索：按 Ctrl+F 或点击「查找 Ctrl+F」，输入词语后高亮标题与正文中的匹配项，显示当前位置和总数。
+Enter / F3 查找下一个，Shift+Enter / Shift+F3 查找上一个，Esc 关闭；选中文字后打开可直接搜索选中内容。
+查找忽略大小写，支持中文和标点，全部本地执行，无需请求模型。生词徽标刷新后保留匹配和阅读位置。
+
+文章 AI 讨论：阅读页点击「与 AI 讨论」，或选中文字后右键「向 AI 提问」，Ctrl+Enter 发送。
+每篇文章独立保存会话，关闭后可继续追问；记录位于 `%LOCALAPPDATA%\KanduDesktop\discussions`，清理生成缓存不会删除会话。
 
 ### 生词表生成
 
