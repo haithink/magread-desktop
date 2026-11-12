@@ -8,6 +8,7 @@ from . import core_config as cfgmod
 from . import core_llm as llm
 from . import core_prompts as prompts
 from . import core_parsers as store
+from .core_vocab_rules import contextual_words, is_basic_contraction, normalize_apostrophes
 
 LEVEL_LABEL = {"cet4": "大学英语四级 CET-4", "cet6": "大学英语六级 CET-6", "toefl": "托福词汇 TOEFL", "gre": " GRE 词汇"}
 
@@ -135,16 +136,21 @@ def candidates(paragraph_texts, dict_set, lexicon=None):
     out = []
     seen = set()
     for text in paragraph_texts:
+        text = normalize_apostrophes(text)
+        contextual = contextual_words(text)
         for m in _TOKEN.finditer(text):
             raw = m.group(0).strip("'-")
-            if len(raw) < 3 or raw.lower() in ALWAYS_KNOWN or raw.lower() in BASIC_KNOWN or raw.lower() in dict_set:
+            if is_basic_contraction(raw):
+                continue
+            if len(raw) < 3 or (raw.lower() not in contextual and (
+                    raw.lower() in ALWAYS_KNOWN or raw.lower() in BASIC_KNOWN or raw.lower() in dict_set)):
                 continue
             hit = (lexicon or {}).get(raw.lower()) or {}
             base = hit.get("lemma") or hit.get("word") or raw.lower()
-            if base in dict_set or base in ALWAYS_KNOWN or base in BASIC_KNOWN:
+            if base not in contextual and (base in dict_set or base in ALWAYS_KNOWN or base in BASIC_KNOWN):
                 continue
             # 词典已识别的独立单词不能再因盲目去掉 s/ed/ing 而被误判已掌握。
-            if (not hit or hit.get("miss")) and any(f in dict_set for f in lemma_forms(raw)):
+            if base not in contextual and (not hit or hit.get("miss")) and any(f in dict_set for f in lemma_forms(raw)):
                 continue
             if base not in seen:
                 seen.add(base)
@@ -152,14 +158,14 @@ def candidates(paragraph_texts, dict_set, lexicon=None):
     return out
 
 
-VOCAB_COVERAGE_VERSION = 1
+VOCAB_COVERAGE_VERSION = 2
 
 
 def _vocab_lexicon(units):
     from . import core_dict
 
     words = [m.group().strip("'-").lower() for _, text in units
-             for m in _TOKEN.finditer(text.replace("’", "'"))]
+             for m in _TOKEN.finditer(normalize_apostrophes(text))]
     lexicon = core_dict.lookup_many(words)
     lexicon.update(core_dict.lookup_many([hit["lemma"] for hit in lexicon.values() if hit.get("lemma")]))
     return lexicon
@@ -169,13 +175,15 @@ def _required_candidates(text, candidate_words, lexicon):
     """可确认的普通超纲词必须保留；专名/缩略词/未收录词仍交给语境判断。"""
     required = {}
     for word in candidate_words:
+        if is_basic_contraction(word):
+            continue
         hit = lexicon.get(word) or {}
         translation = hit.get("translation", "")
         if not translation or re.search(r"人名|地名|姓氏|城市名|男子名|女子名", translation):
             continue
         required[word] = hit
     ordinary = set()
-    for match in _TOKEN.finditer(text.replace("’", "'")):
+    for match in _TOKEN.finditer(normalize_apostrophes(text)):
         raw = match.group().strip("'-")
         hit = lexicon.get(raw.lower()) or {}
         base = hit.get("lemma") or hit.get("word") or raw.lower()
@@ -188,7 +196,26 @@ def _required_candidates(text, candidate_words, lexicon):
         noun_only = re.match(r"^n\.", required[base].get("translation", "").strip())
         if raw.islower() or (sentence_start and not noun_only and raw[:1].isupper() and raw[1:].islower()):
             ordinary.add(base)
-    return {word: hit for word, hit in required.items() if word in ordinary}
+    required = {word: hit for word, hit in required.items() if word in ordinary}
+    for word, hint in contextual_words(text).items():
+        required[word] = dict(lexicon.get(word) or {}, **hint)
+    return required
+
+
+def _clean_vocab_contractions(vocab):
+    """清理模型和旧缓存中的基础缩写；个人生词本仍允许用户显式收藏。"""
+    def clean(entries):
+        return [entry for entry in entries if not is_basic_contraction(entry.get("word", ""))
+                or entry.get("inWordbook") or entry.get("senseSource") == "wordbook"]
+
+    title = clean(vocab.get("titleEntries", []))
+    paragraphs = [dict(section, entries=clean(section.get("entries", [])))
+                  for section in vocab.get("paragraphs", [])]
+    idioms = clean(vocab.get("idioms", []))
+    if (title == vocab.get("titleEntries", []) and paragraphs == vocab.get("paragraphs", [])
+            and idioms == vocab.get("idioms", [])):
+        return vocab
+    return dict(vocab, titleEntries=title, paragraphs=paragraphs, idioms=idioms)
 
 
 def _merge_vocab_entries(existing, generated):
@@ -210,7 +237,7 @@ def _backfill_vocab_section(section, text, required, lexicon):
             section["entries"].append({"word": word, "phonetic": hit.get("phonetic", ""),
                 "pos": hit.get("pos", ""), "sense": hit["translation"].replace("\\n", "；").replace("\n", "；"),
                 "root": "", "term": False, "inText": context,
-                "senseSource": "dictionary", "contextPending": True})
+                "senseSource": hit.get("senseSource", "dictionary"), "contextPending": True})
     return section
 
 
@@ -223,6 +250,7 @@ def audit_vocab_coverage(vocab, article, level):
     """离线补齐旧缓存遗漏，不调用模型，也不把尚未生成的段落标成完成。"""
     from . import core_dict
 
+    vocab = _clean_vocab_contractions(vocab)
     if vocab.get("coverageVersion") == VOCAB_COVERAGE_VERSION:
         return vocab
     core_dict.ensure_db(background=False)
@@ -491,7 +519,7 @@ def _is_censor(text: str) -> bool:
 
 def _vocab_context(word, text, lexicon):
     """从正文找词条的真实短语，省去模型重复抄写原文和段首。"""
-    text = re.sub(r"\s+", " ", text.replace("’", "'")).strip()
+    text = re.sub(r"\s+", " ", normalize_apostrophes(text)).strip()
     # 连字符/空格是排版差异，如 science-fiction 与 science fiction。
     context_token = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
     tokens = list(context_token.finditer(text))
@@ -499,7 +527,7 @@ def _vocab_context(word, text, lexicon):
     if exact:
         start, end = exact.span()
     else:
-        wanted = [m.group().lower() for m in context_token.finditer(word.replace("’", "'"))]
+        wanted = [m.group().lower() for m in context_token.finditer(normalize_apostrophes(word))]
         match = next((i for i in range(len(tokens) - len(wanted) + 1) if wanted and all(
             w in lemma_forms(tokens[i + j].group().lower()) or
             w == (lexicon.get(tokens[i + j].group().lower()) or {}).get("lemma")
@@ -615,7 +643,7 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
     for idx in cand:
         if enrich and idx in processed:
             cand[idx] = pending_words[idx]
-    required = {idx: _required_candidates(text, cand[idx], lexicon) for idx, text in units}
+    required = {idx: ({} if phrases_only else _required_candidates(text, cand[idx], lexicon)) for idx, text in units}
 
     rotation = [dict(cfg)]
     for p in llm_rotation or []:
@@ -790,8 +818,8 @@ def phrase_pending(vocab, article, only_para=None):
 def _parse_entry(el, seen):
     if not isinstance(el, dict):
         return None
-    word = (el.get("word") or "").strip().lower()
-    if not word:
+    word = normalize_apostrophes(el.get("word") or "").strip().lower()
+    if not word or is_basic_contraction(word):
         return None
     dedup = f"{word}|{(el.get('sense') or '')[:20]}"
     if dedup in seen:
@@ -921,6 +949,7 @@ def _norm_text(s: str) -> str:
 def vocab_normalize(vocab: dict, article: dict) -> dict:
     """词条级 inText 反查段落 → 小节级 startWords → 原编号兜底；
     小节头开头词一律取正文真实开头。"""
+    vocab = _clean_vocab_contractions(vocab)
     paragraphs = article["paragraphs"]
     if not vocab.get("paragraphs") or not paragraphs:
         return vocab

@@ -264,9 +264,12 @@ def render_vocab(txt, vocab, only_para):
                 binding = txt.tag_bind(tag, sequence, callback)
                 txt._vocab_collect_bindings.append((tag, sequence, binding))
         offline = entry.get("senseSource") == "dictionary"
+        context_rule = entry.get("senseSource") == "context_rule"
         if offline:
             txt.insert("end", "词典释义（待补充本文含义）\n", "warn")
-        txt.insert("end", '个人释义  ' if entry.get('senseSource') == 'wordbook' else ("释义  " if offline else "本文义  "), "label")
+        elif context_rule:
+            txt.insert("end", "本地搭配提示（可补充本文含义）\n", "warn")
+        txt.insert("end", '个人释义  ' if entry.get('senseSource') == 'wordbook' else ("释义  " if offline or context_rule else "本文义  "), "label")
         txt.insert("end", entry.get("sense", "") + "\n", "sense")
         if entry.get("inText"):
             txt.insert("end", "原文  ", "label")

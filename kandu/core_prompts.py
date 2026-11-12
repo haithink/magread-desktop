@@ -28,9 +28,13 @@ def vocab_system(level_label: str) -> str:
     return (
         "你是英语外刊精读助教。学生已掌握「" + level_label + "」。"
         "本地已按学生掌握的词表筛出候选词，不可再按自己的常用程度或主观难度删词。"
-        "标注为必须收录的词均为已核对的普通超纲词，必须逐词给出本文义，不可漏掉。"
+        "标注为必须收录的词为已核对的普通超纲词或需要解释语境用法的已知词，必须逐词给出本文义，不可漏掉。"
         "其他候选可排除人名、地名、机构名，"
         "保留超纲词与术语（含缩略语），并结合正文补充漏掉的词组和熟词僻义。"
+        "He'd、she'd、you'd、it's、we've 等基础人称/助动词缩写不是生词，不单独收录；"
+        "所有格不是基础缩写，不能一概删除含撇号的词。已知词只代表掌握基础义，"
+        "仍须检查词性变化、比喻用法和搭配义，例如 chart one's path 中 chart 是规划道路，"
+        "stubborn determination 中 stubborn 强调执拗而坚定，不可仅因在四级表中而漏掉。"
         "必须独立检查重点短语，不受四级/六级单词表或本地候选限制：包括常用和不常见的习语、"
         "短语动词、固定搭配及影响句意的表达；即使组成单词全都认识也要解释。"
         "例如 fall for、in light of、take for granted。只收原文实际出现且有助于理解的表达，"
@@ -74,6 +78,10 @@ def vocab_user(title: str, title_index: int, units, candidates, local_phonetics=
         out.append("本地候选：" + (", ".join(words) if words else "无；仍需检查熟词僻义和词组"))
         if required and required.get(index):
             out.append("必须收录（逐词给出本文义，不可遗漏）：" + ", ".join(required[index]))
+            hints = [word + "：" + hit["translation"] for word, hit in required[index].items()
+                     if hit.get("senseSource") == "context_rule"]
+            if hints:
+                out.append("本地搭配提示（须结合本句核对）：" + "；".join(hints))
     if local_phonetics:
         out.append("这些词已有本地音标，勿重复生成：" + ", ".join(sorted(local_phonetics)))
     return "\n".join(out)

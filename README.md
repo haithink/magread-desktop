@@ -3,7 +3,7 @@
 「刊读」Android App 的 Windows 桌面版：选择期刊目录，基于大模型辅助精读
 经济学人 / Wired 等英文原刊（EPUB / PDF）。
 
-版本历史与每版变更见 [变更记录](CHANGELOG.md)（当前 v0.8.14）。
+版本历史与每版变更见 [变更记录](CHANGELOG.md)（当前 v0.8.15）。
 
 ## 界面预览
 
@@ -63,7 +63,7 @@
 
 ## 下载 Windows 安装包
 
-**[下载刊读 v0.8.14（Windows 64 位，约 63 MiB）](https://github.com/haithink/magread-desktop/raw/refs/heads/main/downloads/Kandu-v0.8.14-win64.zip)**
+**[下载刊读 v0.8.15（Windows 64 位，约 62 MiB）](https://github.com/haithink/magread-desktop/raw/refs/heads/main/downloads/Kandu-v0.8.15-win64.zip)**
 
 免安装：解压后运行 `Kandu.exe`（`_internal` 依赖目录需与 exe 同级保留）。
 数据目录在 `%LOCALAPPDATA%\KanduDesktop`，与解压位置无关。
@@ -87,11 +87,8 @@
 数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache / article_states）。
 个人生词本保存在该目录的 `wordbook.sqlite3`，跨刊物共享，移除刊物或清理文章缓存不会删除收藏。
 
-v0.8.14 在段落及全篇生词表中为每个词条增加「加入个人生词本」，直接保存音标、本文释义、词源和原文来源，无需再次请求模型。
-已收藏的词条可点击「编辑收藏」。新增「重点短语」分组，解释常用表达、习语、短语动词及固定搭配，组成词已掌握也会独立检查。
-新生成的生词表会同时检查短语；旧缓存可点击「补充短语解释」，段落窗口只处理本段，全篇窗口仅处理尚未检查的段落，结果自动保存。
-没有重点短语的段落也会记录已检查；失败段落保留重试入口，原有单词释义继续保留。
-修复右键查词自动收藏后正文位置回退：刷新前后按段落、段内字符与行内偏移保持阅读位置，避免生词徽标改变高度造成偏移。
+v0.8.15 修复 `He’d` 等基础缩写被列为生词，并为 `chart his own path`、`stubborn determination` 等搭配增加语境核对与离线补漏。
+模型漏掉时会明确显示「本地搭配提示」，可继续补充本文释义。打开旧生词表时自动清理和补漏，无需重新生成全文。
 
 ### 生词表生成
 

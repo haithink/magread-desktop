@@ -173,6 +173,125 @@ def test_vocab_compact():
     assert any(e["word"] == "interest rate" for e in result["paragraphs"][1]["entries"])
 
 
+@case("基础缩写统一过滤且保留所有格和完整短语")
+def test_vocab_contractions():
+    from kandu.core_vocab_rules import is_basic_contraction
+    contractions = ["He'd", "He’d", "heʼd", "she‘d", "you＇d", "we'd", "they'd", "it's", "WHO'S", "could've"]
+    core_dict.ensure_db(background=False)
+    for word in contractions:
+        assert is_basic_contraction(word), word
+        assert not gen.candidates([word], set(), gen._vocab_lexicon([(0, word)])), word
+        assert not gen._vocab_sections({"paragraphs": [{"index": 0, "entries": [
+            [word, "缩写", "基础缩写", "", False, ""]]}]}, [(0, word)], {})[0]["entries"]
+    for word in ["author's", "o'reilly's", "rock'n'roll", "he'd rather"]:
+        assert not is_basic_contraction(word), word
+    assert "author" in gen.candidates(["author's"], set(), gen._vocab_lexicon([(0, "author's")]))
+    entries = gen._vocab_sections({"paragraphs": [{"index": 0, "entries": [
+        ["he’d rather", "phr.", "他宁愿", "", False, ""]]}]}, [(0, "He’d rather read.")], {})[0]["entries"]
+    assert entries[0]["word"] == "he'd rather", entries
+
+
+@case("四级已知词搭配义补漏、词形变化与普通用法区分")
+def test_vocab_context_rules():
+    from kandu.core_vocab_rules import contextual_words
+    core_dict.ensure_db(background=False)
+    cfgmod.ensure_wordlists()
+    known = cfgmod.wordset("cet4")
+    assert {"chart", "stubborn"} <= known
+    text = "He’d also developed a stubborn, even angry determination to chart his own path through the world."
+    lexicon = gen._vocab_lexicon([(0, text)])
+    candidates = gen.candidates([text], known, lexicon)
+    assert {"chart", "stubborn"} <= set(candidates) and "he'd" not in candidates, candidates
+    required = gen._required_candidates(text, candidates, lexicon)
+    assert {"chart", "stubborn"} <= required.keys()
+    assert all(required[w]["senseSource"] == "context_rule" for w in ("chart", "stubborn"))
+    for text in ["She charted her own course.", "Charting a new path takes time.", "He charts his future."]:
+        lexicon = gen._vocab_lexicon([(0, text)])
+        candidates = gen.candidates([text], known, lexicon)
+        assert "chart" in candidates, (text, candidates)
+        assert "chart" in gen._required_candidates(text, candidates, lexicon)
+    for text in ["A stubborn child studied a bar chart.", "The chart of our future is blue.",
+                 "He was stubborn. Determination mattered.", "The chart is clear. His path is long."]:
+        assert not contextual_words(text), text
+    assert not gen.candidates(["A stubborn child studied a bar chart."], known,
+                              gen._vocab_lexicon([(0, "A stubborn child studied a bar chart.")])), "普通已知用法不应一律变成生词"
+
+
+@case("语境补漏与旧缓存迁移不增加模型请求且保留个人收藏")
+def test_vocab_context_cache():
+    core_dict.ensure_db(background=False)
+    text = "He’d also developed a stubborn, even angry determination to chart his own path through the world."
+    art = dict(index=0, title="A story", paragraphs=[text, "An unprocessed paragraph."])
+    old = dict(articleIndex=0, level="cet4", coverageVersion=1, titleEntries=[],
+               processedParagraphs=[-1, 0], phraseProcessedParagraphs=[-1, 0],
+               chunkFailures={"1": ["old"]}, paragraphs=[dict(index=0, startWords=text[:30], entries=[
+                   dict(word="he’d", sense="he had 的缩写"),
+                   dict(word="path", sense="已有本文义", note="原有笔记")])])
+    original = J.loads(J.dumps(old))
+    with patch.object(llm, "chat", side_effect=AssertionError("缓存补漏不能调用模型")):
+        audited = gen.audit_vocab_coverage(old, art, "cet4")
+        assert gen.audit_vocab_coverage(audited, art, "cet4") == audited
+    assert old == original, "迁移不能原位改动原始缓存"
+    assert audited["coverageVersion"] == gen.VOCAB_COVERAGE_VERSION
+    assert audited["processedParagraphs"] == [-1, 0] and audited["chunkFailures"] == {"1": ["old"]}
+    assert audited["phraseProcessedParagraphs"] == [-1, 0]
+    assert all(p["index"] != 1 for p in audited["paragraphs"])
+    entries = {e["word"]: e for e in audited["paragraphs"][0]["entries"]}
+    assert "he’d" not in entries and "he'd" not in entries
+    assert entries["path"]["note"] == "原有笔记" and entries["path"]["sense"] == "已有本文义"
+    for word in ["chart", "stubborn"]:
+        assert entries[word]["contextPending"] and entries[word]["senseSource"] == "context_rule"
+        assert entries[word]["phonetic"] and not entries[word]["root"]
+    assert "规划" in entries["chart"]["sense"] and "坚定" in entries["stubborn"]["sense"]
+    # 即使模型遗漏或又给出缩写，也只用同一次请求的结果加本地兜底。
+    meta = dict(META, id="T_CONTEXT_RULES")
+    art = dict(art, paragraphs=[text])
+    def fake(cfg, system, user, **kwargs):
+        must = next(line for line in user.splitlines() if line.startswith("必须收录"))
+        assert "chart" in must and "stubborn" in must and "he'd" not in must
+        assert "本地搭配提示" in user and "基础人称/助动词缩写" in system
+        return J.dumps({"paragraphs": [dict(index=-1, entries=[]), dict(index=0, entries=[
+            ["he’d", "缩写", "he had", "", False, ""]])]})
+    with patch.object(llm, "chat", side_effect=fake) as chat:
+        generated = gen.generate_vocab(meta, art, "cet4", dict(name="test"))
+        assert chat.call_count == 1
+    assert {e["word"] for e in generated["paragraphs"][0]["entries"]} >= {"chart", "stubborn"}
+    assert not generated["failedChunks"] and generated["processedParagraphs"] == [-1, 0]
+    def enrich(cfg, system, user, **kwargs):
+        assert "### 段落 -1" not in user
+        return J.dumps({"paragraphs": [dict(index=0, entries=[
+            ["chart", "v.", "开辟自己的人生道路", "", False, ""],
+            ["stubborn", "adj.", "执拗而坚定的", "", False, ""]])]})
+    with patch.object(llm, "chat", side_effect=enrich) as chat:
+        enriched = gen.generate_vocab(meta, art, "cet4", dict(name="test"), enrich=True)
+        assert chat.call_count == 1
+    assert gen.vocab_context_pending(enriched) == 0
+    assert all(not e.get("senseSource") for p in enriched["paragraphs"] for e in p["entries"])
+    # 用户显式收藏的基础缩写仍允许展示；本地过滤不删除生词本记录。
+    personal = dict(generated, titleEntries=[dict(word="he’d", sense="个人笔记", senseSource="wordbook")])
+    assert gen.vocab_normalize(personal, art)["titleEntries"] == personal["titleEntries"]
+
+
+@case("本地语境提示在生词窗口明确标记来源")
+def test_vocab_context_ui():
+    import tkinter as tk
+    from types import SimpleNamespace
+    from kandu import ui_vocabulary as sheets
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        app = SimpleNamespace(settings={"sheetFontSize": 11}, save_settings=lambda: None)
+        win, txt, _ = sheets.make_sheet(root, app, "段落生词", "本地语境提示")
+        sheets.render_vocab(txt, dict(paragraphs=[dict(index=0, entries=[
+            dict(word="chart", sense="规划、开辟（道路或方向）", senseSource="context_rule", contextPending=True)
+        ])]), 0)
+        content = txt.get("1.0", "end")
+        assert "本地搭配提示（可补充本文含义）" in content and "规划" in content
+        assert "词典释义" not in content
+    finally:
+        root.destroy()
+
+
 @case("超纲漏词覆盖、专名区分、词形误筛与离线兜底")
 def test_vocab_coverage():
     core_dict.ensure_db(background=False)
