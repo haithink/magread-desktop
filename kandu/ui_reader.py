@@ -41,6 +41,8 @@ class ReaderFrame(tk.Frame):
         self._display_vocab = None
         self._wordbook_matches = {}
         self.vocab_running = False
+        self._phrases_running = False
+        self._phrase_target = None
         self.analysis_busy = set()
         self._analysis_progress = {}
         self._analysis_tick_after = None
@@ -334,9 +336,17 @@ class ReaderFrame(tk.Frame):
     def _rebuild(self, keep_scroll=True):
         if self.article is None:
             return
+        # 生词标记会改变布局，Tk 长段落的高度也会重新估算；百分比无法保持正文位置。
+        position = self._capture_reading_position() if keep_scroll else None
+        top = self.text.index("@0,0")
+        line = self.text.dlineinfo(top)
+        top_y = line[1] if line else 0
+        was_ready = self._position_ready
         self._wordbook_matches = wordbook.article_matches(self.article)
         self._display_vocab = wordbook.overlay(self.vocab, self.article, self.app.settings['vocabLevel'], self._wordbook_matches)
-        frac = self.text.yview()[0] if keep_scroll else 0.0
+        self._position_ready = False
+        in_heading = self.text.compare(top, '<', self._para_range(0)[0]) if position else False
+        on_badge = position and f"pv_{position['paragraphIndex']}" in self.text.tag_names(top)
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self._apply_typography()
@@ -358,7 +368,26 @@ class ReaderFrame(tk.Frame):
                                    lambda e, k=i: self._show_para_vocab(k))
             self.text.insert("end", para + "\n", ("t_body", f"p_{i}"))
         self.text.configure(state="disabled")
-        self.text.yview_moveto(frac)
+        self.text.update_idletasks()
+        if position and not position['atStart']:
+            if position['atEnd']:
+                self.text.yview_moveto(1)
+            else:
+                paragraph = position['paragraphIndex']
+                target = f"{self._para_range(paragraph)[0]}+{position['paragraphOffset']}c"
+                if on_badge and self.text.tag_ranges(f'pv_{paragraph}'):
+                    target = self.text.tag_ranges(f'pv_{paragraph}')[0]
+                elif in_heading:
+                    target = top
+                self.text.yview(target)
+                self.text.update_idletasks()
+                line = self.text.dlineinfo(target)
+                if line:
+                    self.text.yview_scroll(line[1] - top_y, "pixels")
+        else:
+            self.text.yview_moveto(0)
+        self._position_ready = was_ready
+        self._on_text_scroll(*self.text.yview())
 
         total = self._total_words()
         if self.vocab is None:
@@ -414,7 +443,7 @@ class ReaderFrame(tk.Frame):
         missing = sum(1 for i in range(len(self.article["paragraphs"])) if i not in processed)
         return missing or None
 
-    def generate_vocab(self, cfg=None, enrich=False):
+    def generate_vocab(self, cfg=None, enrich=False, phrases_only=False, only_para=None):
         if self.article is None or self.vocab_running:
             return
         cfg = dict(cfg or cfgmod.get_llm(self.app.settings))
@@ -423,11 +452,14 @@ class ReaderFrame(tk.Frame):
             self.status.config(text=f"⚠ {invalid}（设置里配置）")
             return
         self.vocab_running = True
+        self._phrases_running = phrases_only
+        self._phrase_target = only_para
         self.vocab_btn.config(state="disabled")
-        self.status.config(text=f"生词表生成中… 准备中（{cfg.get('name', '默认')}）")
-        self.app.post(self._vocab_worker, cfg, enrich)
+        self._refresh_vocab_actions()
+        self.status.config(text=f"{'短语解释' if phrases_only else '生词表'}生成中… 准备中（{cfg.get('name', '默认')}）")
+        self.app.post(self._vocab_worker, cfg, enrich, phrases_only, only_para)
 
-    def _vocab_worker(self, cfg, enrich=False):
+    def _vocab_worker(self, cfg, enrich=False, phrases_only=False, only_para=None):
         def progress(done, total, llm_name=None):
             self.app.emit("vocab_progress", {"done": done, "total": total, "llm": llm_name})
 
@@ -439,7 +471,7 @@ class ReaderFrame(tk.Frame):
             vocab = gen.generate_vocab(
                 self.meta, self.article, self.app.settings["vocabLevel"], cfg,
                 on_progress=progress, on_chars=chars, llm_rotation=rotation,
-                enrich=enrich,
+                enrich=enrich, phrases_only=phrases_only, only_para=only_para,
             )
             self.app.emit("vocab_done", vocab)
         except Exception as e:
@@ -447,19 +479,43 @@ class ReaderFrame(tk.Frame):
 
     def on_vocab_progress(self, p):
         llm = p.get("llm")
-        self.status.config(text=f"生词表生成中… 已完成 {p['done']}/{p['total']} 块"
+        self.status.config(text=f"{'短语解释' if self._phrases_running else '生词表'}生成中… 已完成 {p['done']}/{p['total']} 块"
                                 + (f" · {llm}" if llm else ""))
+        self._update_vocab_sheet_progress()
 
     def on_vocab_chars(self, n):
         if n > 0:
             head = self.status.cget("text").split(" · ")[0]
             self.status.config(text=f"{head} · 已接收 {n} 字")
+            self._update_vocab_sheet_progress()
+
+    def _update_vocab_sheet_progress(self):
+        for para, (win, txt, _) in list(self._vocab_sheets.items()):
+            if win.winfo_exists() and (not self._phrases_running or self._phrase_target is None
+                                      or para in (None, self._phrase_target)):
+                txt._vocab_status.configure(text=self.status.cget('text'))
 
     def on_vocab_done(self, vocab):
+        phrases_only = self._phrases_running
+        self._phrases_running = False
         self.vocab_running = False
         self.vocab_btn.config(state="normal")
         self.vocab = vocab
         self._rebuild(keep_scroll=True)
+        self._refresh_vocab_sheets()
+        self._refresh_vocab_actions()
+        if phrases_only:
+            failed = vocab.get('failedPhraseChunks', 0)
+            count = sum(gen.is_phrase(e) for p in self._display_vocab.get('paragraphs', [])
+                        if self._phrase_target is None or p['index'] == self._phrase_target for e in p['entries'])
+            if self._phrase_target is None:
+                count += sum(gen.is_phrase(e) for e in self._display_vocab.get('titleEntries', []))
+            self.status.config(text=f'短语解释部分完成：{failed} 块待重试' if failed else f'已检查短语，收录 {count} 条（已缓存）')
+            if failed:
+                for items in vocab.get('phraseErrors', {}).values():
+                    for item in items:
+                        self.app._log_error(f"短语解释：{item.get('error', '')}")
+            return
         failed = vocab.get("failedChunks") or 0
         hint = "（部分内容可能触发模型安全过滤）" if vocab.get("censorHint") else ""
         if failed:
@@ -480,10 +536,14 @@ class ReaderFrame(tk.Frame):
         self._show_full_vocab()
 
     def on_vocab_error(self, msg):
+        phrases_only, target = self._phrases_running, self._phrase_target
+        self._phrases_running = False
         self.vocab_running = False
         self.vocab_btn.config(state="normal")
+        self._refresh_vocab_actions()
+        self._refresh_vocab_sheets()
         self.status.config(text=f"生词表出错：{msg}")
-        self._offer_other_llm(lambda cfg: self.generate_vocab(cfg))
+        self._offer_other_llm(lambda cfg: self.generate_vocab(cfg, phrases_only=phrases_only, only_para=target))
 
     def _offer_other_llm(self, retry, failed_name=None):
         """默认 LLM 失败时，若配置了其他 LLM 则弹出选择框供换用重试。"""
@@ -751,11 +811,38 @@ class ReaderFrame(tk.Frame):
         if self.article is None:
             return
         self._rebuild(keep_scroll=True)
+        self._refresh_vocab_sheets()
+
+    def _refresh_vocab_sheets(self):
         for para, (win, txt, _) in list(self._vocab_sheets.items()):
             if win.winfo_exists():
                 position = txt.index('@0,0')
                 _render_vocab(txt, self._display_vocab, para)
                 txt.yview(position)
+
+    def _collect_vocab_entry(self, entry, para):
+        try:
+            key = entry.get('wordbookWord') or entry['word']
+            saved = wordbook.get(key)
+            if saved:
+                show_wordbook(self.app, self.meta, self.article, query=saved['word'], initial=saved)
+                return
+            saved = wordbook.remember_entry(entry, self._word_source(para))
+        except (ValueError, OSError) as error:
+            self.status.configure(text=f'收藏失败：{error}')
+            return
+        from kandu.ui_wordbook import notify_changed
+        notify_changed(self.app)
+        self.status.configure(text=f"已把「{saved['word']}」加入个人生词本")
+
+    def _refresh_vocab_actions(self):
+        for para, (win, _, _) in list(self._vocab_sheets.items()):
+            if not win.winfo_exists() or not hasattr(win, '_phrase_button'):
+                continue
+            pending = gen.phrase_pending(self.vocab, self.article, para)
+            win._phrase_button.configure(text='补充短语解释' if pending else '短语已检查',
+                                         state='normal' if pending and not self.vocab_running else 'disabled')
+            win._generate_button.configure(state='disabled' if self.vocab_running else 'normal')
 
     def _analysis_worker(self, cfg, para, sentence, key):
         try:
@@ -834,6 +921,7 @@ class ReaderFrame(tk.Frame):
 
             win.bind("<Destroy>", forget, add="+")
         win._enrich_button = None
+        txt._vocab_on_collect = self._collect_vocab_entry
         _render_vocab(txt, self._display_vocab, only_para)
         if not getattr(win, '_wordbook_controls', None):
             def manage():
@@ -851,6 +939,15 @@ class ReaderFrame(tk.Frame):
             win._wordbook_controls.pack(side='left', padx=8, pady=3)
             win._generate_button = vocabulary_button(bar, text='生成 / 补缺全文生词', command=self.generate_vocab)
             win._generate_button.pack(side='left', padx=4, pady=3)
+            # 单独一行，窄窗口也能看到所有操作。
+            phrase_row = tk.Frame(win, bg=PAPER)
+            phrase_row.pack(before=bar, side='bottom', fill='x', padx=24, pady=(0, 4))
+            win._phrase_button = vocabulary_button(phrase_row, text='补充短语解释',
+                command=lambda: self.generate_vocab(phrases_only=True, only_para=only_para))
+            win._phrase_button.pack(side='left', pady=3)
+            tk.Label(phrase_row, text='常用表达、习语、短语动词 · 独立于词汇等级', bg=PAPER,
+                     fg=MUTED, font=(FAMILY, 9)).pack(side='left', padx=10)
+        self._refresh_vocab_actions()
         txt.update_idletasks()
         txt.yview(position)
         pending = gen.vocab_context_pending(self.vocab or {})

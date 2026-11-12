@@ -154,6 +154,8 @@ class WordbookWindow(tk.Toplevel):
             event.widget.edit_modified(False)
 
     def refresh(self):
+        if self._search_after is not None:
+            self.after_cancel(self._search_after)
         self._search_after = None
         all_rows = words.list_words()
         query = self.query.get().strip().casefold()

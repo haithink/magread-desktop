@@ -512,7 +512,7 @@ def _vocab_context(word, text, lexicon):
     return text[tokens[max(0, first - 3)].start():tokens[min(len(tokens) - 1, last + 3)].end()] if tokens else ""
 
 
-def _vocab_sections(obj, chunk, lexicon):
+def _vocab_sections(obj, chunk, lexicon, phrases_only=False):
     """展开紧凑结果；缺段/坏结构不得标成完成，兼容旧对象格式响应。"""
     expected = dict(chunk)
     sections, errors, relocated = {}, {}, []
@@ -552,6 +552,9 @@ def _vocab_sections(obj, chunk, lexicon):
                 continue
             entry = _parse_entry(raw, seen)
             if entry:
+                if phrases_only and not is_phrase(entry):
+                    errors[idx] = "短语补充返回了单个单词，请重试"
+                    continue
                 entry["inText"] = _vocab_context(entry["word"], expected[idx], lexicon)
                 if not entry["inText"]:
                     matches = [(i, _vocab_context(entry["word"], text, lexicon))
@@ -578,7 +581,7 @@ def _vocab_sections(obj, chunk, lexicon):
 
 
 def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, llm_rotation=None, max_workers=2,
-                   enrich=False):
+                   enrich=False, phrases_only=False, only_para=None):
     """本地筛词/音标 + 紧凑语境释义；最多两个请求并行，主线程逐块落盘。"""
     started = time.perf_counter()
     existing = store.load_vocab(meta["id"], article["index"], level) or {}
@@ -588,12 +591,17 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
             store.save_vocab(meta["id"], audited)
         existing = audited
     processed = set(existing.get("processedParagraphs", []))
+    phrase_processed = set(existing.get("phraseProcessedParagraphs", []))
     old_sections = {p["index"]: p for p in existing.get("paragraphs", [])}
     old_sections[-1] = {"entries": existing.get("titleEntries", [])}
     pending_words = {idx: [e["word"] for e in section["entries"] if e.get("contextPending")]
                      for idx, section in old_sections.items()}
     units = [(-1, article["title"]), *enumerate(article["paragraphs"])]
-    units = [(idx, text) for idx, text in units if idx not in processed or (enrich and pending_words.get(idx))]
+    if phrases_only:
+        units = [(idx, text) for idx, text in units
+                 if idx not in phrase_processed and (only_para is None or idx == only_para)]
+    else:
+        units = [(idx, text) for idx, text in units if idx not in processed or (enrich and pending_words.get(idx))]
     if not units:
         return vocab_normalize(existing, article)
 
@@ -602,7 +610,8 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
     dict_set = cfgmod.wordset(level)
     core_dict.ensure_db(background=False)
     lexicon = _vocab_lexicon(units)
-    cand = {idx: candidates([text.replace("’", "'")], dict_set, lexicon) for idx, text in units}
+    cand = {idx: ([] if phrases_only else candidates([text.replace("’", "'")], dict_set, lexicon))
+            for idx, text in units}
     for idx in cand:
         if enrich and idx in processed:
             cand[idx] = pending_words[idx]
@@ -612,7 +621,9 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
     for p in llm_rotation or []:
         if all(p.get("name") != r.get("name") for r in rotation):
             rotation.append(dict(p))
-    chunk_failures = {k: list(v) for k, v in existing.get("chunkFailures", {}).items()}
+    failure_key = "phraseFailures" if phrases_only else "chunkFailures"
+    error_key = "phraseErrors" if phrases_only else "chunkErrors"
+    chunk_failures = {k: list(v) for k, v in existing.get(failure_key, {}).items()}
     tried_by_index = {}
     for key, names in chunk_failures.items():
         for idx in map(int, key.split(",")):
@@ -639,14 +650,14 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
     merged_sections = {p["index"]: p for p in existing.get("paragraphs", [])}
     merged_title = list(existing.get("titleEntries", []))
     merged_idioms = list(existing.get("idioms", []))
-    chunk_errors = dict(existing.get("chunkErrors", {}))
+    chunk_errors = dict(existing.get(error_key, {}))
     completed = failed_chunks = 0
     censor_hit = False
     lock = threading.Lock()
     received = {}
     stats = {"chunks": len(chunks), "requests": 0, "inputChars": 0, "outputChars": 0,
              "workers": min(max(1, max_workers), 2, len(chunks))}
-    system = prompts.vocab_system(level_label(level))
+    system = prompts.phrases_system() if phrases_only else prompts.vocab_system(level_label(level))
 
     def run_chunk(chunk, configs):
         key = ",".join(str(idx) for idx, _ in chunk)
@@ -664,9 +675,12 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                 break
             name = config.get("name", "?")
             local_words = {w for idx, _ in remaining for w in cand[idx] if (lexicon.get(w) or {}).get("phonetic")}
-            user = prompts.vocab_user(article["title"], -1, remaining, cand, local_words, required)
+            user = (f"文章标题：{article['title'][:80]}\n" + "\n\n".join(
+                f"### 段落 {idx}\n{text}" for idx, text in remaining)) if phrases_only else prompts.vocab_user(
+                    article["title"], -1, remaining, cand, local_words, required)
             candidate_count = sum(len(cand[idx]) for idx, _ in remaining)
-            budget = min(8192, max(2048, 512 + candidate_count * 110))
+            budget = min(8192, max(2048, 512 + candidate_count * 110
+                                  + sum(len(text) for _, text in remaining) // 3))
             request_cfg = dict(config)
             if "deepseek" in (config.get("model") or "").lower():
                 request_cfg["thinkingMode"] = "disabled"
@@ -681,7 +695,7 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                     stats["outputChars"] += len(raw)
                 import json
                 # 不把修补后的半截 JSON 当作完整生词结果。
-                result = _vocab_sections(json.loads(_extract_json(raw)), remaining, lexicon)
+                result = _vocab_sections(json.loads(_extract_json(raw)), remaining, lexicon, phrases_only=phrases_only)
                 collected.update(result)
                 remaining = []
             except VocabValidationError as error:
@@ -699,12 +713,13 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
         return key, collected, failures, censor, remaining, details
 
     def save():
-        draft = {"level": level, "articleIndex": article["index"], "titleEntries": merged_title,
+        draft = {**existing, "level": level, "articleIndex": article["index"], "titleEntries": merged_title,
                  "paragraphs": sorted(merged_sections.values(), key=lambda p: p["index"]),
                  "idioms": list({i["word"].lower(): i for i in merged_idioms}.values()),
-                 "processedParagraphs": sorted(processed), "chunkFailures": chunk_failures,
-                 "chunkErrors": chunk_errors,
-                 "failedChunks": failed_chunks, "censorHint": censor_hit,
+                 "processedParagraphs": sorted(processed), "phraseProcessedParagraphs": sorted(phrase_processed),
+                 failure_key: chunk_failures, error_key: chunk_errors,
+                 ("failedPhraseChunks" if phrases_only else "failedChunks"): failed_chunks,
+                 "censorHint": censor_hit,
                  "generationStats": dict(stats, elapsedMs=round((time.perf_counter() - started) * 1000))}
         if core_dict.STATE["ready"]:
             draft["coverageVersion"] = VOCAB_COVERAGE_VERSION
@@ -738,11 +753,14 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                         merged_title = section["entries"]
                     else:
                         merged_sections[idx] = section
-                processed.update(sections)
+                if not phrases_only:
+                    processed.update(sections)
+                phrase_processed.update(sections)
+                finished = phrase_processed if phrases_only else processed
                 chunk_failures = {k: v for k, v in chunk_failures.items()
-                                  if not all(int(i) in processed for i in k.split(","))}
+                                  if not all(int(i) in finished for i in k.split(","))}
                 chunk_errors = {k: v for k, v in chunk_errors.items()
-                                if not all(int(i) in processed for i in k.split(","))}
+                                if not all(int(i) in finished for i in k.split(","))}
             if remaining:
                 failed_chunks += 1
                 remaining_key = ",".join(str(i) for i, _ in remaining)
@@ -757,6 +775,16 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                     on_progress(completed, len(chunks), None)
             save()
     return save()
+
+
+def is_phrase(entry):
+    return len(entry.get("word", "").split()) > 1
+
+
+def phrase_pending(vocab, article, only_para=None):
+    checked = set((vocab or {}).get("phraseProcessedParagraphs", []))
+    indices = [-1, *range(len(article["paragraphs"]))] if only_para is None else [only_para]
+    return sum(idx not in checked for idx in indices)
 
 
 def _parse_entry(el, seen):

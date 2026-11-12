@@ -2644,7 +2644,7 @@ def test_wordbook_ui():
             with patch('kandu.ui_wordbook.messagebox.askyesno', return_value=True):
                 manager.delete_entry()
             root.update()
-            assert not reader._entries_for(0) and 'simple' not in sheet.get('1.0', 'end')
+            assert not reader._entries_for(0) and 'simple' not in sheet.get('1.0', 'end'), (reader._entries_for(0), sheet.get('1.0', 'end'), errors)
             # 查词窗在结果回来前被关闭，仍然完成入库。
             win.destroy()
             with patch.object(core_dict, 'ensure_db'), patch.object(core_dict, 'lookup', return_value=hit):
@@ -2652,6 +2652,176 @@ def test_wordbook_ui():
             assert words.get('simple')
             assert root.q.get()[0] == 'wordbook_changed'
             reader.on_lookup_done(root.q.get()[1])
+            assert not errors, errors
+    finally:
+        root.destroy()
+
+
+@case('重点短语独立识别、旧缓存按段补充与失败重试')
+def test_phrase_enrichment():
+    import copy
+    article = dict(index=0, title='A simple story', paragraphs=[
+        'They fell for it in the end.', 'We take care of them.', 'We read a book.'])
+    meta = dict(META, id='T_PHRASES')
+    old = dict(level='cet4', articleIndex=0, coverageVersion=gen.VOCAB_COVERAGE_VERSION,
+               processedParagraphs=[-1, 0, 1, 2], titleEntries=[], idioms=[],
+               paragraphs=[dict(index=0, startWords=article['paragraphs'][0], entries=[
+                   dict(word='end', sense='原有本文义', note='保留数据', inText='in the end')])])
+    store.save_vocab(meta['id'], old)
+    calls = []
+    def fake(cfg, system, user, **kwargs):
+        calls.append(user)
+        assert '不受四级/六级单词表限制' in system and '本地候选' not in user
+        indices = [int(i) for i in re.findall(r'### 段落 (-?\d+)', user)]
+        return J.dumps(dict(paragraphs=[dict(index=i, entries=(
+            [['fell for', 'phr.', '上当；信以为真', 'fall for 的过去式', False, ''],
+             ['in the end', 'phr.', '最终', '', False, '']] if i == 0 else
+            [['take care of', 'phr.', '照顾', '', False, '']] if i == 1 else [])) for i in indices]))
+    with patch.object(llm, 'chat', fake):
+        result = gen.generate_vocab(meta, article, 'cet4', dict(name='test'), phrases_only=True, only_para=0)
+        assert len(calls) == 1 and '### 段落 1' not in calls[0], '段落补充不能请求全文'
+        assert result['phraseProcessedParagraphs'] == [0] and result['processedParagraphs'] == [-1, 0, 1, 2]
+        entries = result['paragraphs'][0]['entries']
+        assert next(e for e in entries if e['word'] == 'end')['note'] == '保留数据'
+        assert len([e for e in entries if gen.is_phrase(e)]) == 2
+        assert all(e['inText'] in article['paragraphs'][0] for e in entries)
+        assert gen.phrase_pending(result, article, 0) == 0
+        gen.generate_vocab(meta, article, 'cet4', dict(name='test'), phrases_only=True, only_para=0)
+        assert len(calls) == 1, '已检查的段落（包括无短语）不应重复请求'
+        result = gen.generate_vocab(meta, article, 'cet4', dict(name='test'), phrases_only=True)
+        assert len(calls) == 2 and '### 段落 0\n' not in calls[1]
+        assert result['phraseProcessedParagraphs'] == [-1, 0, 1, 2]
+        assert gen.phrase_pending(result, article) == 0
+        gen.generate_vocab(meta, article, 'cet4', dict(name='test'), phrases_only=True)
+        assert len(calls) == 2
+    # 不存在的短语和错误返回的单词不能把段落标为已检查；有效兄弟段落应保留。
+    meta = dict(meta, id='T_PHRASES_RETRY')
+    store.save_vocab(meta['id'], copy.deepcopy(old))
+    def bad(cfg, system, user, **kwargs):
+        return J.dumps(dict(paragraphs=[dict(index=-1, entries=[]), dict(index=0, entries=[
+            ['imaginary phrase', 'phr.', '不存在', '', False, '']]), dict(index=1, entries=[
+            ['care', 'n.', '单词不算短语', '', False, '']]), dict(index=2, entries=[])]))
+    with patch.object(llm, 'chat', bad):
+        result = gen.generate_vocab(meta, article, 'cet4', dict(name='test'), phrases_only=True)
+    assert result['phraseProcessedParagraphs'] == [-1, 2]
+    assert result['failedPhraseChunks'] == 1 and '0,1' in result['phraseFailures']
+    assert result['processedParagraphs'] == [-1, 0, 1, 2], '短语失败不能污染已完成的单词生词表'
+    calls.clear()
+    with patch.object(llm, 'chat', fake):
+        result = gen.generate_vocab(meta, article, 'cet4', dict(name='test'), phrases_only=True)
+    assert result['failedPhraseChunks'] == 0 and not result['phraseFailures']
+    assert '### 段落 -1\n' not in calls[0] and '### 段落 2\n' not in calls[0]
+    # 新生成的普通生词表同时检查短语，之后无需额外请求。
+    meta = dict(meta, id='T_PHRASES_NEW')
+    def normal(cfg, system, user, **kwargs):
+        assert '必须独立检查重点短语' in system
+        return J.dumps(dict(paragraphs=[dict(index=-1, entries=[]), dict(index=0, entries=[
+            ['fell for', 'phr.', '上当', '', False, '']])]))
+    with patch.object(llm, 'chat', normal):
+        result = gen.generate_vocab(meta, dict(article, paragraphs=article['paragraphs'][:1]), 'cet4', dict(name='test'))
+    assert result['phraseProcessedParagraphs'] == [-1, 0]
+
+
+@case('段落词条和短语一键收藏、编辑与查词后正文位置稳定')
+def test_vocab_collect_and_position():
+    import tkinter as tk
+    from pathlib import Path
+    from kandu.ui_reader import ReaderFrame
+    from kandu.ui_wordbook import notify_changed
+    from kandu import core_wordbook as words
+    root = tk.Tk()
+    root.geometry('1120x740')
+    root.settings = dict(readerFontSize=13, sheetFontSize=11, vocabLevel='cet4', llms=[])
+    root.post = lambda *args: None
+    root.save_settings = lambda: None
+    errors = []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    article = dict(index=0, title='Reading positions', paragraphs=[
+        f'Paragraph {i}. ' + ('A candid writer takes care of the books and reads them in the end. ' * 18)
+        for i in range(36)])
+    meta = dict(META, id='T_WB_ANCHOR')
+    try:
+        with patch.object(cfgmod, 'app_dir', return_value=Path(SANDBOX) / 'wb_anchor'), patch.object(core_dict, 'lookup_many', return_value={}):
+            cfgmod.app_dir().mkdir(parents=True)
+            reader = ReaderFrame(root, root, meta, 0)
+            root.current = reader
+            reader.pack(fill='both', expand=True)
+            reader.on_content_loaded((dict(articles=[article]), 0))
+            root.update()
+            reader.text.yview(f'{reader._para_range(21)[0]}+400c')
+            root.update()
+            before = reader._capture_reading_position()
+            # 模拟右键查词成功，前面所有段落都出现同一个收藏词，新增 36 个徽标。
+            words.remember_lookup('candid', dict(word='candid', translation='坦率的'), reader._word_source(21))
+            notify_changed(root)
+            root.update()
+            after = reader._capture_reading_position()
+            assert (after['paragraphIndex'], after['paragraphOffset']) == (before['paragraphIndex'], before['paragraphOffset']), (before, after)
+            for _ in range(35):
+                time.sleep(.04)
+                root.update()
+            history = store.load_reading_history(meta['id'])['0']
+            assert history['paragraphIndex'] == before['paragraphIndex'] and abs(history['progress'] - before['progress']) < .001, (before, after, history, reader._capture_reading_position())
+            reader.vocab = dict(articleIndex=0, level='cet4', paragraphs=[dict(index=21, entries=[
+                dict(word='writer', phonetic='raɪtər', pos='n.', sense='本文的作者', root='write + -er'),
+                dict(word='takes care of', pos='phr.', sense='照顾；照料', root='take care of 的第三人称形式', inText='takes care of the books')])])
+            reader._rebuild()
+            root.update()
+            assert reader._capture_reading_position()['paragraphIndex'] == before['paragraphIndex']
+            reader._show_para_vocab(21)
+            root.update()
+            win, txt, _ = reader._vocab_sheets[21]
+            assert '重点短语' in txt.get('1.0', 'end') and '照顾；照料' in txt.get('1.0', 'end')
+            # 点击真实文本链接，使用词条自身段落，不能取当前选中文字或全篇窗口索引。
+            def click_collect(word):
+                start = txt.search(word, '1.0', exact=True)
+                assert start
+                tags = [t for t in txt.tag_names() if t.startswith('collect_') and txt.compare(txt.tag_ranges(t)[0], '>', start)]
+                tag = min(tags, key=lambda t: tuple(map(int, str(txt.tag_ranges(t)[0]).split('.'))))
+                index = txt.tag_ranges(tag)[0]
+                txt.see(index)
+                root.update()
+                x, y, w, h = txt.bbox(index)
+                txt.event_generate('<Motion>', x=x + 2, y=y + h // 2)
+                txt.event_generate('<Button-1>', x=x + 2, y=y + h // 2)
+                root.update()
+            click_collect('writer')
+            saved = words.get('writer')
+            assert saved and saved['sense'] == '本文的作者' and saved['phonetic'] == 'raɪtər'
+            assert saved['source']['paragraph'] == 21 and saved['source']['articleTitle'] == article['title']
+            assert '已收录生词本' in txt.get('1.0', 'end')
+            click_collect('writer')
+            assert root._wordbook_window.original == 'writer', '已收藏入口应打开对应词条编辑'
+            root._wordbook_window.destroy()
+            click_collect('takes care of')
+            saved = words.get('takes care of')
+            assert saved and saved['sense'] == '照顾；照料'
+            words.save(dict(saved, sense='手动修改', note='个人笔记'))
+            words.remember_entry(dict(word='takes care of', sense='模型释义'), {})
+            assert words.get('takes care of')['sense'] == '手动修改' and words.get('takes care of')['note'] == '个人笔记'
+            assert reader._capture_reading_position()['paragraphIndex'] == before['paragraphIndex']
+            reader._show_full_vocab()
+            full = reader._vocab_sheets[None][1]
+            assert '＋ 加入个人生词本' in full.get('1.0', 'end') or '编辑收藏' in full.get('1.0', 'end')
+            # 删除个人收藏后同步更新，正文当前位置仍不后退。
+            words.delete('candid')
+            notify_changed(root)
+            root.update()
+            assert reader._capture_reading_position()['paragraphIndex'] == before['paragraphIndex']
+            # 段落补充按钮传递本段编号，处理中禁用，进度和结果直接更新原窗口。
+            cfg = dict(name='test', baseUrl='https://example.invalid', apiKey='test', model='test')
+            with patch.object(cfgmod, 'get_llm', return_value=cfg), patch.object(root, 'post') as post:
+                win._phrase_button.invoke()
+            assert post.call_args.args[2:] == (False, True, 21)
+            assert str(win._phrase_button.cget('state')) == 'disabled' and reader._phrases_running
+            reader.on_vocab_progress(dict(done=0, total=1, llm='test'))
+            reader.on_vocab_chars(80)
+            assert '短语解释' in txt._vocab_status.cget('text') and '80' in txt._vocab_status.cget('text')
+            reader.on_vocab_done(dict(reader.vocab, phraseProcessedParagraphs=[21]))
+            root.update()
+            assert reader._vocab_sheets[21][0] is win and not reader.vocab_running
+            assert win._phrase_button.cget('text') == '短语已检查' and str(win._phrase_button.cget('state')) == 'disabled'
+            assert '重点短语' in txt.get('1.0', 'end') and '可选中复制' in txt._vocab_status.cget('text')
             assert not errors, errors
     finally:
         root.destroy()

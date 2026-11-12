@@ -33,6 +33,10 @@
 
 [![真实文章的段落生词窗口](docs/screenshots/desktop-paragraph-vocabulary.png)](docs/screenshots/desktop-paragraph-vocabulary.png)
 
+**重点短语：常用表达和习语按本文语境解释，每个单词与短语都可以一键加入个人生词本。**
+
+[![真实文章的重点短语解释与收藏入口](docs/screenshots/desktop-phrases.png)](docs/screenshots/desktop-phrases.png)
+
 **个人生词本：右键查词自动收藏，跨刊物保留；可搜索、编辑释义与笔记、删除词条。**
 
 [![个人生词本与词条编辑](docs/screenshots/desktop-wordbook.png)](docs/screenshots/desktop-wordbook.png)
@@ -57,7 +61,7 @@
 
 ## 下载 Windows 安装包
 
-**[下载刊读 v0.5.0（Windows 64 位，约 62 MiB）](https://github.com/haithink/magread-desktop/raw/refs/heads/main/downloads/Kandu-v0.5.0-win64.zip)**
+**[下载刊读 v0.8.14（Windows 64 位，约 63 MiB）](https://github.com/haithink/magread-desktop/raw/refs/heads/main/downloads/Kandu-v0.8.14-win64.zip)**
 
 免安装：解压后运行 `Kandu.exe`（`_internal` 依赖目录需与 exe 同级保留）。
 数据目录在 `%LOCALAPPDATA%\KanduDesktop`，与解压位置无关。
@@ -71,7 +75,7 @@
    可逐篇标记未读 / 已读 / 不感兴趣，按状态筛选、搜索中英文标题与摘要
 3. **阅读** — 居中纸面与英文衬线排版，中英文标题、字数与预计阅读时间，阅读进度与回到开头；
    双击句子 → 句解（疑难词汇 / 语法成分对应 / 语境 / 参考译文）；选中后右键解析；
-   段前「词 N」查看本段生词，工具栏「生词表」看全篇；正文与弹层字号可调
+   段前「词 N」查看本段生词与重点短语，工具栏「生词表」看全篇；词条可一键收藏，正文与弹层字号可调
 4. **LLM 配置** — 多配置管理（新增/编辑/删除/★ 默认），OpenAI 兼容 / Anthropic 原生；
    支持粘贴 cc-switch JSON 自动识别；连通性测试；获取可用模型；
    生词表失败块**自动轮换其他已配置 LLM** 补缺
@@ -80,6 +84,12 @@
 
 数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache / article_states）。
 个人生词本保存在该目录的 `wordbook.sqlite3`，跨刊物共享，移除刊物或清理文章缓存不会删除收藏。
+
+v0.8.14 在段落及全篇生词表中为每个词条增加「加入个人生词本」，直接保存音标、本文释义、词源和原文来源，无需再次请求模型。
+已收藏的词条可点击「编辑收藏」。新增「重点短语」分组，解释常用表达、习语、短语动词及固定搭配，组成词已掌握也会独立检查。
+新生成的生词表会同时检查短语；旧缓存可点击「补充短语解释」，段落窗口只处理本段，全篇窗口仅处理尚未检查的段落，结果自动保存。
+没有重点短语的段落也会记录已检查；失败段落保留重试入口，原有单词释义继续保留。
+修复右键查词自动收藏后正文位置回退：刷新前后按段落、段内字符与行内偏移保持阅读位置，避免生词徽标改变高度造成偏移。
 
 v0.8.13 增加个人生词本：正文右键「查词」自动收藏英文单词或短语，重复查询会合并词条并保留手工释义和笔记。
 首页和阅读页提供独立管理窗口，支持搜索单词 / 中文释义 / 笔记、仅看本篇出现的词、新增、编辑、删除、词典补全。

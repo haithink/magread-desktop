@@ -117,6 +117,22 @@ def delete(word):
         return db.execute('DELETE FROM words WHERE word=?', (normalize(word),)).rowcount > 0
 
 
+def remember_entry(entry, source):
+    """收藏生成的词条或短语；保留本文义，不请求词典或模型，不覆盖个人编辑。"""
+    raw = normalize(entry.get('word'))
+    key = normalize(entry.get('wordbookWord') or raw)
+    now = time.time_ns() // 1_000_000
+    with connection() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT * FROM words WHERE word=?', (key,)).fetchone()
+        r = _record(row) or dict(word=key, aliases=[], source=source, created_at=now, lookups=0)
+        for field in ('phonetic', 'pos', 'sense', 'root', 'note'):
+            r[field] = r.get(field) or str(entry.get(field) or '').strip()[:12000]
+        r['aliases'] = list(dict.fromkeys([*r['aliases'], raw]))
+        _write(db, dict(r, updated_at=now))
+    return get(key)
+
+
 def article_matches(article, records=None):
     """词边界、大小写与词典原形匹配；不会把 cat 匹配到 education。"""
     records = list_words() if records is None else records

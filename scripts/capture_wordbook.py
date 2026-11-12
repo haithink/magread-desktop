@@ -103,5 +103,37 @@ with tempfile.TemporaryDirectory(prefix='kandu-wordbook-capture-') as sandbox:
             output = repo / 'docs/screenshots/desktop-wordbook.png'
             capture(manager, output)
             print('Captured wordbook from actual article and dictionary:', output)
+            manager.destroy()
+
+            # 直接使用真实文章已有的模型缓存，所有收藏与阅读进度写入临时目录。
+            from kandu import core_parsers as store
+            from kandu.ui_reader import ReaderFrame
+            cached = json.loads((personal / 'cache' / meta['id'] / 'vocab_63_cet4.json').read_text(encoding='utf-8'))
+            store.save_vocab(meta['id'], cached)
+            root.settings = dict(readerFontSize=13, sheetFontSize=11, vocabLevel='cet4', llms=[])
+            root.post = lambda *args: None
+            root.save_settings = lambda: None
+            root.geometry('1180x800+30+30')
+            root.deiconify()
+            reader = ReaderFrame(root, root, meta, article['index'])
+            root.current = reader
+            reader.pack(fill='both', expand=True)
+            reader.on_content_loaded((dict(articles=[article]), article['index']))
+            root.update()
+            reader._show_para_vocab(3)
+            win, txt, _ = reader._vocab_sheets[3]
+            win.geometry('900x820+40+30')
+            for _ in range(5):
+                root.update()
+                time.sleep(.04)
+            capture(win, repo / 'docs/screenshots/desktop-paragraph-vocabulary.png')
+            phrase = next(e for e in reader._entries_for(3) if e['word'] == 'in spades')
+            reader._collect_vocab_entry(phrase, 3)
+            txt.yview(txt.search('重点短语', '1.0'))
+            for _ in range(5):
+                root.update()
+                time.sleep(.04)
+            capture(win, repo / 'docs/screenshots/desktop-phrases.png')
+            print('Captured paragraph vocabulary and phrases from actual cached definitions')
     finally:
         root.destroy()

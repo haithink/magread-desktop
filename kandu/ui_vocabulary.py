@@ -31,6 +31,7 @@ def config_tags(txt, size=11):
     txt.tag_configure("term", font=(FAMILY, max(8, size - 2), "bold"), foreground="#9a7139")
     txt.tag_configure("quote", font=("Georgia", size), foreground="#577268", spacing2=5, spacing3=8)
     txt.tag_configure("warn", foreground="#9a7139", font=(FAMILY, max(9, size - 1)), spacing3=8)
+    txt.tag_configure("collect", foreground=GREEN, underline=True, font=(FAMILY, max(9, size - 1)))
     txt.tag_configure("search_hit", background="#f2e3af")
     txt.tag_configure("search_current", background="#dfc77b", foreground=GREEN)
     txt.tag_raise("sel")
@@ -188,6 +189,13 @@ def _search(txt, jump=True):
 
 
 def _reset(txt):
+    for tag, sequence, binding in getattr(txt, '_vocab_collect_bindings', []):
+        txt.tag_unbind(tag, sequence, binding)
+    txt._vocab_collect_bindings = []
+    for tag in txt.tag_names():
+        if str(tag).startswith('collect_'):
+            txt.tag_delete(tag)
+    txt.configure(cursor='arrow')
     txt.configure(state="normal")
     txt.delete("1.0", "end")
     for mark in txt.mark_names():
@@ -224,12 +232,16 @@ def _finish(txt, summary):
 
 
 def render_vocab(txt, vocab, only_para):
+    from kandu.core_gen import is_phrase
     _reset(txt)
     count = 0
+    phrase_count = 0
 
-    def entry_block(entry):
-        nonlocal count
+    def entry_block(entry, para):
+        nonlocal count, phrase_count
         count += 1
+        phrase = is_phrase(entry)
+        phrase_count += phrase
         _word(txt, entry["word"])
         if entry.get("phonetic"):
             txt.insert("end", "   /" + entry["phonetic"].strip("/") + "/", "phonetic")
@@ -240,6 +252,17 @@ def render_vocab(txt, vocab, only_para):
         if entry.get('inWordbook'):
             txt.insert('end', '   已收录生词本', 'term')
         txt.insert("end", "\n")
+        on_collect = getattr(txt, '_vocab_on_collect', None)
+        if on_collect:
+            tag = f'collect_{count}'
+            txt.insert('end', '编辑收藏' if entry.get('inWordbook') else '＋ 加入个人生词本', ('collect', tag))
+            txt.insert('end', '\n')
+            for sequence, callback in (
+                ('<Button-1>', lambda event, e=entry, p=para: on_collect(e, p)),
+                ('<Enter>', lambda event: txt.configure(cursor='hand2')),
+                ('<Leave>', lambda event: txt.configure(cursor='arrow'))):
+                binding = txt.tag_bind(tag, sequence, callback)
+                txt._vocab_collect_bindings.append((tag, sequence, binding))
         offline = entry.get("senseSource") == "dictionary"
         if offline:
             txt.insert("end", "词典释义（待补充本文含义）\n", "warn")
@@ -249,7 +272,7 @@ def render_vocab(txt, vocab, only_para):
             txt.insert("end", "原文  ", "label")
             txt.insert("end", entry["inText"] + "\n", "quote")
         if entry.get("root"):
-            txt.insert("end", "词根词源  ", "label")
+            txt.insert("end", "用法 / 来源  " if phrase else "词根词源  ", "label")
             txt.insert("end", entry["root"] + "\n", "root")
         if entry.get('note'):
             txt.insert('end', '学习笔记  ', 'label')
@@ -260,7 +283,7 @@ def render_vocab(txt, vocab, only_para):
         if vocab.get("titleEntries"):
             _section(txt, "标题生词")
             for entry in vocab["titleEntries"]:
-                entry_block(entry)
+                entry_block(entry, -1)
         if vocab.get("idioms"):
             _section(txt, "熟词僻义")
             for entry in vocab["idioms"]:
@@ -275,14 +298,21 @@ def render_vocab(txt, vocab, only_para):
         entries = paragraph.get("entries", [])
         if not entries and only_para is None:
             continue
-        _section(txt, f"第 {paragraph['index'] + 1} 段  /  {len(entries)} 词")
+        words = [e for e in entries if not is_phrase(e)]
+        phrases = [e for e in entries if is_phrase(e)]
+        _section(txt, f"第 {paragraph['index'] + 1} 段  /  {len(words)} 词 · {len(phrases)} 短语")
         if paragraph.get("startWords"):
             txt.insert("end", paragraph["startWords"].rstrip("…") + "…\n", "meta")
-        for entry in entries:
-            entry_block(entry)
+        for entry in words:
+            entry_block(entry, paragraph['index'])
+        if phrases:
+            txt.insert('end', '重点短语  /  PHRASES\n', 'h1')
+            txt.insert('end', '按整段语境解释，包含常用表达和习语\n', 'meta')
+            for entry in phrases:
+                entry_block(entry, paragraph['index'])
     if not count:
         txt.insert("end", "本段没有收录生词\n" if only_para is not None else "本篇尚未收录生词\n", "meta")
-    _finish(txt, f"{count} 个词条  ·  可选中复制")
+    _finish(txt, f"{count} 个词条（含 {phrase_count} 个短语）  ·  可选中复制")
 
 
 def render_lookup(txt, word, result):
