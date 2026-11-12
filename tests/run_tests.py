@@ -2946,6 +2946,327 @@ def test_vocab_collect_and_position():
         root.destroy()
 
 
+@case("文章讨论持久化、内容隔离、缓存清理与原子写入失败")
+def test_discussion_storage():
+    from kandu import core_discussion as discussion
+    meta = dict(META, id="T_DISCUSS_STORE")
+    article = dict(index=3, title="Article A", paragraphs=["A precise explanation."])
+    messages = [dict(role="user", content="为什么？", quote="A precise explanation.", paragraph=0,
+                     status="complete", createdAt=1, apiKey="must-not-save"),
+                dict(role="assistant", content="已经收到的内容", status="pending", createdAt=2, model="test")]
+    discussion.save(meta, article, messages)
+    path = discussion.history_path(meta, article)
+    assert path.parent.name == "discussions" and "must-not-save" not in path.read_text(encoding="utf-8")
+    loaded = discussion.load(meta, article)
+    assert loaded[0]["quote"] == messages[0]["quote"] and loaded[1]["status"] == "stopped"
+    assert loaded[1]["content"] == "已经收到的内容" and messages[1]["status"] == "pending"
+    assert discussion.load(meta, dict(article, index=9)) == loaded, "文章序号变化不能丢失会话"
+    assert discussion.load(meta, dict(article, paragraphs=["Different text."])) == []
+    assert discussion.load(dict(meta, id="T_OTHER_BOOK"), article) == []
+    store.purge_book_cache(meta["id"])
+    assert discussion.load(meta, article) == loaded, "清理生成缓存不能删除讨论"
+    original = path.read_bytes()
+    with patch("os.replace", side_effect=OSError("disk unavailable")):
+        try:
+            discussion.save(meta, article, [])
+        except OSError:
+            pass
+        else:
+            raise AssertionError("保存失败必须暴露给界面")
+    assert path.read_bytes() == original
+    path.write_text('{"broken":', encoding="utf-8")
+    try:
+        discussion.load(meta, article)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("损坏的会话不能静默当成空会话覆盖")
+    assert path.read_text(encoding="utf-8") == '{"broken":'
+
+
+@case("文章讨论上下文、连续追问和长文章有界截取")
+def test_discussion_context():
+    from kandu import core_discussion as discussion
+    article = dict(index=0, title="Evidence", paragraphs=["First evidence.", "Second example."])
+    history = [dict(role="user", content="第一个问题", quote="First evidence.", paragraph=0, status="complete"),
+               dict(role="assistant", content="第一个回答", status="complete"),
+               dict(role="user", content="失败的问题", status="complete"),
+               dict(role="assistant", content="不完整回答", status="error")]
+    system, messages, excerpted = discussion.build_request(META, article, history, "继续解释", "Second example.", 1)
+    assert not excerpted and "First evidence." in system and "Second example." in system
+    assert [m["role"] for m in messages] == ["user", "assistant", "user"]
+    assert messages[1]["content"] == "第一个回答" and "第 2 段" in messages[-1]["content"]
+    assert "失败的问题" not in str(messages) and "不完整回答" not in str(messages)
+    assert len(discussion.request_messages(history, "question", limit=10)) == 1
+    paragraphs = [f"Paragraph {i}. " + "Some general background. " * 80 for i in range(100)]
+    paragraphs[87] = "A rare quasar is the relevant source. " * 50
+    long_article = dict(article, paragraphs=paragraphs)
+    context, excerpted = discussion.article_context(long_article, "What is the quasar?", 50, limit=6000)
+    assert excerpted and len(context) <= 6000 and "[第 51 段]" in context and "quasar" in context
+    context, excerpted = discussion.article_context(dict(article, paragraphs=["A" * 50000]), "why", 0, limit=5000)
+    assert excerpted and len(context) <= 5000 and "省略" in context
+    system, _, excerpted = discussion.build_request(META, long_article, [], "why", paragraph=50)
+    assert excerpted and "仅提供文章节选" in system
+
+
+@case("讨论双协议多轮消息、流式正文、普通JSON与禁止隐式重发")
+def test_discussion_transport():
+    cfg = dict(baseUrl="http://local.test", apiKey="fake-discussion-key", model="deepseek-chat")
+    messages = [dict(role="user", content="question 1"), dict(role="assistant", content="answer 1"),
+                dict(role="user", content="follow-up question")]
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "text/event-stream"}
+        def __init__(self, frames=None, body=None):
+            self.frames = frames or []
+            self.text = J.dumps(body) if body else ""
+            if body: self.headers = {"Content-Type": "application/json"}
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def iter_lines(self, **kwargs):
+            for frame in self.frames:
+                yield ("data: " + J.dumps(frame, ensure_ascii=False)).encode("utf-8")
+    for provider in ["openai", "anthropic"]:
+        frames = ([dict(choices=[dict(delta=dict(content="先看原文"))]),
+                   dict(choices=[dict(delta=dict(content="再解释。"), finish_reason="stop")])]
+                  if provider == "openai" else [dict(type="content_block_delta", delta=dict(text="先看原文")),
+                   dict(type="content_block_delta", delta=dict(text="再解释。")), dict(type="message_stop")])
+        updates = []
+        with patch.object(llm.requests, "post", return_value=Response(frames)) as post:
+            assert llm.conversation(dict(cfg, provider=provider), "system instruction", messages, on_text=updates.append) == "先看原文再解释。"
+        assert post.call_count == 1 and updates[0] == "先看原文" and updates[-1] == "先看原文再解释。"
+        payload = post.call_args.kwargs["json"]
+        assert payload["thinking"] == dict(type="disabled")
+        assert payload["messages"] == messages if provider == "anthropic" else payload["messages"][1:] == messages
+    assert "thinkingMode" not in cfg
+    body = dict(choices=[dict(message=dict(content="普通 JSON 回答"), finish_reason="stop")])
+    with patch.object(llm.requests, "post", return_value=Response(body=body)) as post:
+        assert llm.conversation(cfg, "s", messages) == "普通 JSON 回答"
+        assert post.call_count == 1
+    body = dict(choices=[dict(message=dict(content="partial"), finish_reason="length")])
+    with patch.object(llm.requests, "post", return_value=Response(body=body)) as post:
+        updates = []
+        try: llm.conversation(cfg, "s", messages, on_text=updates.append)
+        except llm.LlmError as error: assert "长度" in str(error)
+        else: raise AssertionError("截断回答不能标记为完整")
+        assert updates[-1] == "partial" and post.call_count == 1
+    partial = [dict(choices=[dict(delta=dict(content="只收到一半"))])]
+    with patch.object(llm.requests, "post", return_value=Response(partial)) as post:
+        try: llm.conversation(cfg, "s", messages)
+        except llm.LlmError as error: assert "中断" in str(error)
+        else: raise AssertionError("断流不得当成完整回答")
+        assert post.call_count == 1
+    with patch.object(llm.requests, "post", side_effect=llm.requests.Timeout("timeout fake-discussion-key")) as post:
+        try: llm.conversation(cfg, "s", messages)
+        except llm.LlmError as error: assert cfg["apiKey"] not in str(error)
+        else: raise AssertionError("超时必须报错")
+        assert post.call_count == 1, "讨论超时不得偷偷重发整个请求"
+    assert llm._public_text("<think>private thinking") == ""
+    assert llm._public_text("<think>private thinking</think>回答") == "回答"
+
+
+@case("讨论取消等待与接收、停止后不继续请求")
+def test_discussion_cancel():
+    cfg = dict(baseUrl="http://local.test", apiKey="fake", model="test")
+    messages = [dict(role="user", content="q")]
+    control = llm.RequestControl()
+    control.cancel()
+    with patch.object(llm.requests, "post") as post:
+        try: llm.conversation(cfg, "s", messages, control=control)
+        except llm.RequestCancelled: pass
+        else: raise AssertionError("已取消不能发送请求")
+        post.assert_not_called()
+    entered, released, closed = threading.Event(), threading.Event(), threading.Event()
+    class Response:
+        status_code = 200
+        headers = {"Content-Type": "text/event-stream"}
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def close(self):
+            closed.set()
+            released.set()
+        def iter_lines(self, **kwargs):
+            entered.set()
+            released.wait(3)
+            yield b'data: {"choices":[{"delta":{"content":"late"},"finish_reason":"stop"}]}'
+    errors, updates = [], []
+    control = llm.RequestControl()
+    def worker():
+        try: llm.conversation(cfg, "s", messages, control=control, on_text=updates.append)
+        except Exception as error: errors.append(error)
+    with patch.object(llm.requests, "post", return_value=Response()) as post:
+        thread = threading.Thread(target=worker)
+        thread.start()
+        assert entered.wait(2)
+        control.cancel()
+        thread.join(2)
+        assert not thread.is_alive() and closed.is_set() and not updates
+        assert isinstance(errors[0], llm.RequestCancelled) and post.call_count == 1
+
+
+@case("讨论窗口连续追问、去重、停止重试、保存恢复与关闭保护")
+def test_discussion_ui():
+    import tkinter as tk
+    from kandu import core_discussion as discussion
+    from kandu.ui_discussion import show_discussion
+    root = tk.Tk()
+    root.withdraw()
+    root.settings = dict(llms=[dict(name="test", baseUrl="http://local.test", apiKey="fake", model="test")], defaultLlm="test")
+    article = dict(index=0, title="Discussion UI", paragraphs=["A candid explanation."])
+    meta = dict(META, id="T_DISCUSS_UI")
+    callbacks = []
+    root.report_callback_exception = lambda *args: callbacks.append(args)
+    def pump(condition, timeout=3):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            root.update()
+            if condition(): return
+            time.sleep(.02)
+        raise AssertionError("UI condition timed out")
+    calls = []
+    gate = threading.Event()
+    def fake(cfg, system, messages, on_text, control):
+        calls.append(messages)
+        if len(calls) == 3:
+            on_text("保留半段回答")
+            gate.wait(2)
+            return "过期回答不得覆盖重试"
+        on_text("正在解释")
+        return f"回答 {len(calls)}"
+    try:
+        win = show_discussion(root, meta, article, "A candid explanation.", 0)
+        pump(lambda: win.loaded)
+        assert show_discussion(root, meta, article) is win
+        win.set_context("A candid explanation.", 0)
+        with patch.object(llm, "conversation", side_effect=fake):
+            win.prompt.insert("1.0", "解释一下")
+            win.send()
+            win.send()
+            pump(lambda: not win.busy)
+            assert len(calls) == 1 and "回答 1" in win.transcript.get("1.0", "end")
+            assert "<quote>" in calls[0][-1]["content"]
+            win.prompt.insert("1.0", "再举例")
+            win.send()
+            pump(lambda: not win.busy)
+            assert len(calls[1]) == 3 and calls[1][1]["content"] == "回答 1"
+            win.prompt.insert("1.0", "继续")
+            win.send()
+            pump(lambda: win.messages[-1]["content"] == "保留半段回答")
+            win.stop()
+            assert not win.busy and win.messages[-1]["status"] == "stopped"
+            win.send(retry=True)
+            pump(lambda: not win.busy)
+            assert win.messages[-1]["content"] == "回答 4" and len(win.messages) == 6
+            gate.set()
+            for _ in range(8): root.update(); time.sleep(.02)
+            assert "过期回答" not in win.transcript.get("1.0", "end")
+        win._copy()
+        assert root.clipboard_get() == "回答 4"
+        saved = discussion.load(meta, article)
+        win.destroy()
+        win = show_discussion(root, meta, article)
+        pump(lambda: win.loaded)
+        assert win.messages == saved and "回答 4" in win.transcript.get("1.0", "end")
+        # 关闭窗口取消当前任务；晚到的结果不会访问已销毁的 Tk 控件。
+        gate.clear()
+        with patch.object(llm, "conversation", side_effect=lambda *a, **kw: gate.wait(1) or "late"):
+            win.prompt.insert("1.0", "关闭前提问")
+            win.send()
+            win.destroy()
+            gate.set()
+            for _ in range(8): root.update(); time.sleep(.02)
+        assert discussion.load(meta, article)[-1]["status"] == "stopped"
+        assert not callbacks, callbacks
+    finally:
+        gate.set()
+        root.destroy()
+
+
+@case("阅读页提问入口引用选区和当前段落且保持阅读位置")
+def test_discussion_reader_entry():
+    import tkinter as tk
+    from kandu.ui_reader import ReaderFrame
+    root = tk.Tk()
+    root.geometry("1180x800")
+    root.settings = dict(readerFontSize=13, sheetFontSize=11, vocabLevel="cet4", llms=[])
+    root.post = lambda *args: None
+    root.save_settings = lambda: None
+    article = dict(index=0, title="Reading discussion", paragraphs=[
+        f"Paragraph {i}. " + "A simple story. " * 100 for i in range(20)])
+    try:
+        reader = ReaderFrame(root, root, dict(META, id="T_DISCUSS_ENTRY"), 0)
+        reader.pack(fill="both", expand=True)
+        reader.on_content_loaded((dict(articles=[article]), 0))
+        root.update()
+        reader.text.yview(reader._para_range(12)[0])
+        root.update()
+        before = reader._capture_reading_position()
+        with patch("kandu.ui_reader.show_discussion") as show:
+            reader.discussion_btn.invoke()
+            assert show.call_args.args[-1] == before["paragraphIndex"]
+            assert reader._capture_reading_position() == before
+            start = reader._para_range(12)[0]
+            reader.text.tag_add("sel", start, f"{start}+12c")
+            reader._open_discussion()
+            assert show.call_args.args[-2] == reader.text.get(start, f"{start}+12c").strip()
+            assert show.call_args.args[-1] == 12
+            reader.text.tag_remove("sel", "1.0", "end")
+            reader._last_click = (5, 0)
+            reader._open_discussion(from_menu=True)
+            assert show.call_args.args[-1] == 5
+        assert reader._capture_reading_position() == before
+    finally:
+        root.destroy()
+
+
+@case("讨论保存失败不发送、读取损坏不覆盖与模型切换")
+def test_discussion_ui_failures():
+    import tkinter as tk
+    from kandu import core_discussion as discussion
+    from kandu.ui_discussion import show_discussion
+    root = tk.Tk()
+    root.withdraw()
+    root.settings = dict(llms=[dict(name="first", baseUrl="http://local.test", apiKey="fake", model="test-1"),
+                               dict(name="second", baseUrl="http://local.test", apiKey="fake", model="test-2")], defaultLlm="first")
+    meta = dict(META, id="T_DISCUSS_UI_ERRORS")
+    article = dict(index=0, title="Errors", paragraphs=["A source."])
+    try:
+        win = show_discussion(root, meta, article)
+        deadline = time.monotonic() + 3
+        while not win.loaded and time.monotonic() < deadline: root.update(); time.sleep(.02)
+        assert win.loaded
+        win.prompt.insert("1.0", "保留我的问题")
+        with patch.object(discussion, "save", side_effect=OSError("disk failure")), patch.object(llm, "conversation") as chat:
+            win.send()
+            chat.assert_not_called()
+        assert "保留我的问题" in win.prompt.get("1.0", "end") and not win.messages
+        assert "保存失败" in win.status.cget("text")
+        win.model.set("second")
+        with patch.object(llm, "conversation", return_value="second answer") as chat:
+            win.send()
+            deadline = time.monotonic() + 3
+            while win.busy and time.monotonic() < deadline: root.update(); time.sleep(.02)
+            assert not win.busy and chat.call_args.args[0]["model"] == "test-2"
+        for geometry in ("620x540", "920x790"):
+            win.geometry(geometry)
+            for _ in range(8): root.update(); time.sleep(.02)
+            for button in [win.send_btn, win.stop_btn, win.retry_btn, win.copy_btn]:
+                assert button.winfo_rootx() + button.winfo_width() <= win.winfo_rootx() + win.winfo_width(), (geometry, button.cget("text"), button.winfo_rootx(), button.winfo_width(), win.winfo_rootx(), win.winfo_width())
+                assert button.winfo_rooty() + button.winfo_height() <= win.winfo_rooty() + win.winfo_height(), geometry
+            assert win.transcript.winfo_height() > 80
+        win.destroy()
+        path = discussion.history_path(meta, article)
+        path.write_text("broken history", encoding="utf-8")
+        win = show_discussion(root, meta, article)
+        deadline = time.monotonic() + 3
+        while "读取失败" not in win.status.cget("text") and time.monotonic() < deadline: root.update(); time.sleep(.02)
+        assert not win.loaded and str(win.send_btn.cget("state")) == "disabled"
+        win.destroy()
+        assert path.read_text(encoding="utf-8") == "broken history"
+    finally:
+        root.destroy()
+
+
 def main():
     only = set(sys.argv[1:])
     if os.path.exists(SANDBOX):

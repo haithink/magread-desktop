@@ -3,12 +3,51 @@
 import json
 import re
 import time
+import threading
+from contextlib import contextmanager
 
 import requests
 
 
 class LlmError(Exception):
     pass
+
+
+class RequestCancelled(LlmError):
+    pass
+
+
+class RequestControl:
+    """跨线程取消；关闭响应不能阻塞 Tk 事件线程。"""
+    def __init__(self):
+        self.event = threading.Event()
+        self._lock = threading.Lock()
+        self._response = None
+
+    def check(self):
+        if self.event.is_set():
+            raise RequestCancelled("已停止回答")
+
+    def bind(self, response):
+        with self._lock:
+            self._response = response
+        self.check()
+
+    def unbind(self):
+        with self._lock:
+            self._response = None
+
+    def cancel(self):
+        self.event.set()
+        with self._lock:
+            response = self._response
+        if response is not None:
+            def close():
+                try:
+                    response.close()
+                except Exception:
+                    pass
+            threading.Thread(target=close, daemon=True).start()
 
 
 TIMEOUT = (20, 300)
@@ -59,12 +98,12 @@ def _body(cfg, system, user, max_tokens, temperature, stream):
     if cfg.get("provider") == "anthropic":
         if system:
             b["system"] = system
-        b["messages"] = [{"role": "user", "content": user}]
+        b["messages"] = user if isinstance(user, list) else [{"role": "user", "content": user}]
     else:
         msgs = []
         if system:
             msgs.append({"role": "system", "content": system})
-        msgs.append({"role": "user", "content": user})
+        msgs.extend(user if isinstance(user, list) else [{"role": "user", "content": user}])
         b["messages"] = msgs
     return b
 
@@ -86,9 +125,9 @@ def _str(v):
 
 
 class _StreamState:
-    __slots__ = ("parts", "saw_reasoning", "length_cut", "saw_response", "chars", "on_delta", "reported_at")
+    __slots__ = ("parts", "saw_reasoning", "length_cut", "saw_response", "chars", "on_delta", "reported_at", "on_text", "control")
 
-    def __init__(self, on_delta=None):
+    def __init__(self, on_delta=None, on_text=None, control=None):
         self.parts = []
         self.saw_reasoning = False
         self.length_cut = False
@@ -96,13 +135,23 @@ class _StreamState:
         self.chars = 0
         self.on_delta = on_delta
         self.reported_at = 0
+        self.on_text = on_text
+        self.control = control
+
+    def check(self):
+        if self.control:
+            self.control.check()
 
     def append(self, text):
+        self.check()
         self.parts.append(text)
         self.chars += len(text)
         now = time.monotonic()
-        if self.on_delta and now - self.reported_at >= 0.1:
-            self.on_delta(self.chars)
+        if now - self.reported_at >= 0.1:
+            if self.on_delta:
+                self.on_delta(self.chars)
+            if self.on_text:
+                self.on_text(_public_text(self.text))
             self.reported_at = now
 
     @property
@@ -110,8 +159,9 @@ class _StreamState:
         return "".join(self.parts)
 
 
-def _stream_once(cfg, system, user, max_tokens, temperature, state):
-    payload = _body(cfg, system, user, max_tokens, temperature, stream=True)
+@contextmanager
+def _stream_response(cfg, payload, state):
+    state.check()
     with requests.post(
         endpoint(cfg),
         headers={**_headers(cfg), "Accept": "text/event-stream"},
@@ -119,6 +169,19 @@ def _stream_once(cfg, system, user, max_tokens, temperature, state):
         stream=True,
         timeout=TIMEOUT,
     ) as resp:
+        try:
+            if state.control:
+                state.control.bind(resp)
+            yield resp
+        finally:
+            if state.control:
+                state.control.unbind()
+
+
+def _stream_once(cfg, system, user, max_tokens, temperature, state):
+    payload = _body(cfg, system, user, max_tokens, temperature, stream=True)
+    with _stream_response(cfg, payload, state) as resp:
+        state.check()
         if resp.status_code != 200:
             raise LlmError(f"HTTP {resp.status_code}（{endpoint(cfg)}）：{_first_line(resp.text)}")
         if "json" in resp.headers.get("Content-Type", "").lower():
@@ -136,6 +199,7 @@ def _stream_once(cfg, system, user, max_tokens, temperature, state):
         unframed = []
         saw_sse, ended = False, False
         for raw in resp.iter_lines(chunk_size=1024):
+            state.check()
             if isinstance(raw, bytes):
                 # 网关可能不标 charset，requests 默认按 latin-1 解码会产出 mojibake
                 line = raw.decode("utf-8", errors="replace")
@@ -244,6 +308,46 @@ _THINK = re.compile(r"<think>[\s\S]*?</think>")
 
 def _strip_think(text: str) -> str:
     return _THINK.sub("", text).strip()
+
+
+def _public_text(text):
+    # 不显示完整或尚未闭合的 think 块，仅用于交互对话的正文预览。
+    return re.sub(r"<think>[\s\S]*$", "", _THINK.sub("", text)).strip()
+
+
+def conversation(cfg, system, messages, on_text=None, control=None):
+    """交互讨论保留角色与历史；单次请求，不在接收中断后自动重发。"""
+    if not is_complete(cfg):
+        raise LlmError("大模型配置不完整，请先在设置中填写 URL / API Key / 模型名")
+    if not messages or messages[-1].get("role") != "user" or any(
+            m.get("role") not in {"user", "assistant"} or not isinstance(m.get("content"), str)
+            for m in messages):
+        raise LlmError("对话消息结构无效")
+    request_cfg = dict(cfg)
+    if "deepseek" in request_cfg.get("model", "").lower():
+        request_cfg["thinkingMode"] = "disabled"
+    state = _StreamState(on_text=on_text, control=control)
+    try:
+        _stream_once(request_cfg, system, messages, 4096, .3, state)
+        state.check()
+        content = _public_text(state.text)
+        if on_text:
+            on_text(content)
+        if state.length_cut:
+            raise LlmError("回答达到输出长度上限；已保留收到的内容，可继续追问")
+        if not content:
+            raise LlmError("模型未返回回答正文，请检查配置或重试")
+        return content
+    except RequestCancelled:
+        raise
+    except Exception as error:
+        state.check()
+        if on_text and state.parts:
+            on_text(_public_text(state.text))
+        message = str(error)
+        if cfg.get("apiKey"):
+            message = message.replace(cfg["apiKey"], "[redacted]")
+        raise LlmError(message) from None
 
 
 def _looks_truncated(body: str) -> bool:

@@ -10,6 +10,7 @@ from kandu import core_gen as gen
 from kandu import core_dict
 from kandu import core_wordbook as wordbook
 from kandu.ui_wordbook import show_wordbook
+from kandu.ui_discussion import show_discussion
 from kandu import core_config as cfgmod
 from kandu.core_config import app_dir
 from kandu.ui_analysis import (make_sheet as make_analysis_sheet,
@@ -94,6 +95,8 @@ class ReaderFrame(tk.Frame):
         self.vocab_btn.grid(row=0, column=3)
         self.wordbook_btn = self._button(tools, '个人生词本', self._open_wordbook)
         self.wordbook_btn.grid(row=0, column=4, padx=(8, 0))
+        self.discussion_btn = self._button(tools, "与 AI 讨论", self._open_discussion)
+        self.discussion_btn.grid(row=0, column=5, padx=(8, 0))
 
         footer = tk.Frame(self, bg=PAPER, padx=28, pady=10)
         footer.pack(side="bottom", fill="x")
@@ -139,6 +142,8 @@ class ReaderFrame(tk.Frame):
         self.menu = tk.Menu(self, tearoff=0)
         self.menu.add_command(label="查词（本地词典）", command=self._menu_lookup)
         self.menu.add_command(label='加入 / 查看个人生词本', command=self._open_wordbook)
+        self.menu.add_separator()
+        self.menu.add_command(label="向 AI 提问（引用选中内容 / 当前段落）", command=lambda: self._open_discussion(from_menu=True))
         self.menu.add_separator()
         self.menu.add_command(label="解析选中内容", command=self._analyze_selection)
         self.menu.add_command(label="解析整段", command=self._analyze_whole_paragraph)
@@ -570,6 +575,21 @@ class ReaderFrame(tk.Frame):
         lb.bind("<Double-1>", go)
 
     # ---------- 句解 ----------
+    def _open_discussion(self, from_menu=False):
+        if not self.article:
+            return
+        selected = self.text.tag_ranges("sel")
+        quote = self.text.get(*selected).strip() if selected else ""
+        paragraph = self._para_at(selected[0]) if selected else None
+        if not quote:
+            paragraph = self._last_click[0] if from_menu else None
+            if paragraph is None:
+                position = self._capture_reading_position()
+                paragraph = position["paragraphIndex"] if position else 0
+            if 0 <= paragraph < len(self.article["paragraphs"]):
+                quote = self.article["paragraphs"][paragraph]
+        show_discussion(self.app, self.meta, self.article, quote, paragraph)
+
     def _para_at(self, index):
         names = self.text.tag_names(index)
         for n in names:
