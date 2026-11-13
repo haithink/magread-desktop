@@ -2776,6 +2776,101 @@ def test_wordbook_ui():
         root.destroy()
 
 
+@case('未生成词表与个人收藏区分、全文生成入口和逐段状态')
+def test_vocab_generation_state_ui():
+    import tkinter as tk
+    from pathlib import Path
+    from kandu.ui_reader import ReaderFrame
+    from kandu import core_wordbook as words
+
+    root = tk.Tk()
+    root.geometry('1000x740')
+    root.settings = dict(readerFontSize=13, sheetFontSize=11, vocabLevel='cet4', llms=[])
+    root.post = lambda *args: None
+    root.save_settings = lambda: None
+    errors = []
+    root.report_callback_exception = lambda *args: errors.append(args)
+    article = dict(index=0, title='A simple view', paragraphs=[
+        'A simple story.', 'An opaque reply.', 'We read books.'])
+    meta = dict(META, id='T_VOCAB_STATE_UI')
+    try:
+        with patch.object(cfgmod, 'app_dir', return_value=Path(SANDBOX) / 'vocab_state_ui'), \
+             patch.object(core_dict, 'lookup_many', return_value={}), \
+             patch.object(llm, 'chat', side_effect=AssertionError('浏览状态不得请求模型')):
+            cfgmod.app_dir().mkdir(parents=True)
+            reader = ReaderFrame(root, root, meta, 0)
+            reader.pack(fill='both', expand=True)
+            reader.on_content_loaded((dict(articles=[article]), 0))
+            root.update()
+            words.save(dict(word='simple', sense='简单的'))
+            reader.on_wordbook_changed()
+            root.update()
+            assert reader.vocab is None and reader._total_words() == 2
+            # 有个人收藏仍然直接生成全文，不能把仅有的几个收藏当成完整词表。
+            assert reader.vocab_btn.cget('text') == '生成生词表'
+            with patch.object(reader, 'generate_vocab') as generate:
+                reader.vocab_btn.invoke()
+                generate.assert_called_once_with()
+            assert '尚未生成' in reader.status.cget('text') and '个人生词本' in reader.status.cget('text')
+
+            def badge(index):
+                return reader.text.get(*reader.text.tag_ranges(f'pv_{index}'))
+
+            assert all('待生成' in badge(i) for i in range(3))
+            assert '收藏 1' in badge(0)
+            # 未命中收藏的段落也有可点击入口，打开后说明尚未生成，不偷偷调用模型。
+            start = reader.text.tag_ranges('pv_1')[0]
+            reader.text.see(start)
+            root.update()
+            x, y, w, h = reader.text.bbox(start)
+            with patch.object(reader, 'generate_vocab') as generate:
+                reader.text.event_generate('<Motion>', x=x + 8, y=y + h // 2)
+                reader.text.event_generate('<Button-1>', x=x + 8, y=y + h // 2)
+                root.update()
+                win, txt, _ = reader._vocab_sheets[1]
+                assert '本段生词尚未生成' in txt.get('1.0', 'end')
+                generate.assert_not_called()
+                win._generate_button.invoke()
+                generate.assert_called_once_with()
+            reader._show_full_vocab()
+            full = reader._vocab_sheets[None][1]
+            assert '尚未生成全文生词表' in full.get('1.0', 'end')
+            assert '个人收藏' in full.get('1.0', 'end')
+            assert not store.load_vocab(meta['id'], 0, 'cet4'), '浏览收藏不得写成已生成缓存'
+
+            partial = dict(articleIndex=0, level='cet4', titleEntries=[], idioms=[],
+                           paragraphs=[dict(index=1, entries=[dict(word='opaque', sense='晦涩的')])],
+                           processedParagraphs=[-1, 1])
+            reader.vocab = partial
+            reader._rebuild()
+            reader._refresh_vocab_sheets()
+            reader._refresh_vocab_actions()
+            root.update()
+            assert reader.vocab_btn.cget('text') == '补缺生词表（缺 2 段）'
+            assert '待生成' not in badge(1) and '待生成' in badge(0)
+            assert 'opaque' in txt.get('1.0', 'end') and '尚未生成' not in txt.get('1.0', 'end')
+            assert '2 段待生成' in full.get('1.0', 'end')
+            with patch.object(reader, 'generate_vocab') as generate:
+                reader.vocab_btn.invoke()
+                generate.assert_called_once_with()
+
+            # 完成后同一个段落窗口刷新，零生词段也保留入口；主按钮改为查看。
+            complete = dict(partial, processedParagraphs=[-1, 0, 1, 2])
+            reader.on_vocab_done(complete)
+            root.update()
+            assert reader._vocab_sheets[1][0] is win
+            assert all('待生成' not in badge(i) for i in range(3))
+            assert '词 0' in badge(2)
+            assert '尚未完整生成' not in full.get('1.0', 'end')
+            with patch.object(reader, 'generate_vocab') as generate:
+                reader.vocab_btn.invoke()
+                generate.assert_not_called()
+            assert reader.vocab_btn.cget('text') == '生词表 3'
+            assert not errors, errors
+    finally:
+        root.destroy()
+
+
 @case('重点短语独立识别、旧缓存按段补充与失败重试')
 def test_phrase_enrichment():
     import copy

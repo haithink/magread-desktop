@@ -3,7 +3,7 @@
 「刊读」Android App 的 Windows 桌面版：选择期刊目录，基于大模型辅助精读
 经济学人 / Wired 等英文原刊（EPUB / PDF）。
 
-版本历史与每版变更见 [变更记录](CHANGELOG.md)（当前 v0.8.17）。
+版本历史与每版变更见 [变更记录](CHANGELOG.md)（当前 v0.8.18）。
 
 ## 界面预览
 
@@ -63,7 +63,7 @@
 
 ## 下载 Windows 安装包
 
-**[下载刊读 v0.8.17（Windows 64 位，约 62 MiB）](https://github.com/haithink/magread-desktop/raw/refs/heads/main/downloads/Kandu-v0.8.17-win64.zip)**
+**[下载刊读 v0.8.18（Windows 64 位，约 62 MiB）](https://github.com/haithink/magread-desktop/raw/refs/heads/main/downloads/Kandu-v0.8.18-win64.zip)**
 
 免安装：解压后运行 `Kandu.exe`（`_internal` 依赖目录需与 exe 同级保留）。
 数据目录在 `%LOCALAPPDATA%\KanduDesktop`，与解压位置无关。
@@ -89,6 +89,9 @@
 数据目录：`%LOCALAPPDATA%\KanduDesktop`（settings.json / books.json / vocab / covers / cache / article_states）。
 个人生词本保存在该目录的 `wordbook.sqlite3`，跨刊物共享，移除刊物或清理文章缓存不会删除收藏。
 
+v0.8.18 修复未生成词表时把少量个人收藏误当作全文生词表的入口行为。点击「生成生词表」直接生成全文；
+段落入口区分「待生成」、个人收藏数与已生成词条数，词表窗口说明尚未生成或缺段状态，查看收藏不会额外请求模型。
+
 v0.8.17 增加阅读页文本搜索：按 Ctrl+F 或点击「查找 Ctrl+F」，输入词语后高亮标题与正文中的匹配项，显示当前位置和总数。
 Enter / F3 查找下一个，Shift+Enter / Shift+F3 查找上一个，Esc 关闭；选中文字后打开可直接搜索选中内容。
 查找忽略大小写，支持中文和标点，全部本地执行，无需请求模型。生词徽标刷新后保留匹配和阅读位置。
@@ -98,6 +101,8 @@ Enter / F3 查找下一个，Shift+Enter / Shift+F3 查找上一个，Esc 关闭
 
 ### 生词表生成
 
+- 首次打开文章只自动匹配个人生词本，少量收藏不代表全文词表已经生成。点击顶部「生成生词表」开始生成；
+  每段「待生成」入口可查看已有收藏，再点击窗口中的「生成 / 补缺全文生词」。生成完成后显示各段词条数。
 - 默认词汇水平为 CET-4。用本地词表排除已掌握词，用 ECDICT 还原词形、批量补充音标；
   LLM 负责本文义项、词根词源、术语与熟词僻义判断。
 - 标题与首个正文块合并；每次只发送本块候选词，保留正文语境，最多两块同时生成。

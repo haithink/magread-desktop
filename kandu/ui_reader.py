@@ -518,12 +518,18 @@ class ReaderFrame(tk.Frame):
         page_hint = (f"   ·   PDF 第 {self.article['pageStart']}–{self.article['pageEnd']} 页"
                      if self.article.get("pageStart") else "")
         self.text.insert("end", f"{words:,} 词   ·   约 {minutes} 分钟   ·   {len(self.article['paragraphs'])} 段" + page_hint + "\n", "t_hint")
+        processed = set((self.vocab or {}).get('processedParagraphs', []))
         for i, para in enumerate(self.article["paragraphs"]):
             entries = self._entries_for(i)
-            if entries:
-                self.text.insert("end", f"  词 {len(entries)}  ·  本段生词  \n", ("t_badge", f"pv_{i}"))
-                self.text.tag_bind(f"pv_{i}", "<Button-1>",
-                                   lambda e, k=i: self._show_para_vocab(k))
+            if i not in processed:
+                collected = len(self._wordbook_matches.get(i, []))
+                hint = (f" · 收藏 {collected}" if collected else '')
+                badge = f"  本段生词 · 待生成{hint}  \n"
+            else:
+                badge = f"  词 {len(entries)}  ·  本段生词  \n"
+            self.text.insert("end", badge, ("t_badge", f"pv_{i}"))
+            self.text.tag_bind(f"pv_{i}", "<Button-1>",
+                               lambda e, k=i: self._show_para_vocab(k))
             self.text.insert("end", para + "\n", ("t_body", f"p_{i}"))
         self.text.configure(state="disabled")
         if self._find_visible:
@@ -550,8 +556,8 @@ class ReaderFrame(tk.Frame):
         self._on_text_scroll(*self.text.yview())
 
         total = self._total_words()
-        if self.vocab is None:
-            self.vocab_btn.config(text=f'生词表 {total} · 生成更多' if total else '生成生词表')
+        if not self.vocab:
+            self.vocab_btn.config(text='生成生词表')
         elif self.vocab.get("failedChunks") or self._missing_paragraphs() is not None:
             miss = self._missing_paragraphs()
             self.vocab_btn.config(text=f"补缺生词表" + (f"（缺 {miss} 段）" if miss else ""))
@@ -563,14 +569,29 @@ class ReaderFrame(tk.Frame):
         if self.vocab_running:
             return  # 进度由 on_vocab_* 事件刷新
         pending = gen.vocab_context_pending(self.vocab or {})
-        self.status.config(text=f"已补齐 {pending} 个漏词的词典释义 · 可在生词表中补充本文释义" if pending else "")
+        notice = self._vocab_notice()
+        context = f"已补齐 {pending} 个漏词的词典释义 · 可在生词表中补充本文释义" if pending else ""
+        self.status.config(text=' · '.join(part for part in (notice, context) if part))
+
+    def _vocab_notice(self, only_para=None):
+        """展示来源和生成覆盖范围，个人收藏不能代表模型已处理该段。"""
+        if self.article is None:
+            return ''
+        if only_para is not None:
+            processed = (self.vocab or {}).get('processedParagraphs', [])
+            if only_para not in processed:
+                return '本段生词尚未生成；当前仅展示已有词条和个人收藏。可点击「生成 / 补缺全文生词」。'
+            return ''
+        if not self.vocab:
+            return '尚未生成全文生词表；当前仅展示个人收藏（来自个人生词本）。点击「生成生词表」后按段整理。'
+        missing = self._missing_paragraphs()
+        if missing:
+            return f'全文生词表尚未完整生成，{missing} 段待生成；当前展示已完成部分和个人收藏。'
+        return ''
 
     # ---------- 生词表 ----------
     def _vocab_btn(self):
         if self.vocab_running:
-            return
-        if self.vocab is None and self._total_words():
-            self._show_full_vocab()
             return
         state = self._vocab_state()
         if state == "complete":
@@ -992,7 +1013,7 @@ class ReaderFrame(tk.Frame):
         for para, (win, txt, _) in list(self._vocab_sheets.items()):
             if win.winfo_exists():
                 position = txt.index('@0,0')
-                _render_vocab(txt, self._display_vocab, para)
+                _render_vocab(txt, self._display_vocab, para, notice=self._vocab_notice(para))
                 txt.yview(position)
 
     def _collect_vocab_entry(self, entry, para):
@@ -1066,9 +1087,6 @@ class ReaderFrame(tk.Frame):
 
     # ---------- 生词表弹层 ----------
     def _show_para_vocab(self, para):
-        if self.vocab is None and not self._entries_for(para):
-            self.generate_vocab()
-            return
         self._render_vocab_sheet(f"第 {para + 1} 段生词", only_para=para)
 
     def _show_full_vocab(self):
@@ -1097,7 +1115,7 @@ class ReaderFrame(tk.Frame):
             win.bind("<Destroy>", forget, add="+")
         win._enrich_button = None
         txt._vocab_on_collect = self._collect_vocab_entry
-        _render_vocab(txt, self._display_vocab, only_para)
+        _render_vocab(txt, self._display_vocab, only_para, notice=self._vocab_notice(only_para))
         if not getattr(win, '_wordbook_controls', None):
             def manage():
                 selection = txt.tag_ranges('sel')

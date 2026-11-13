@@ -231,9 +231,11 @@ def _finish(txt, summary):
         _search(txt, jump=False)
 
 
-def render_vocab(txt, vocab, only_para):
+def render_vocab(txt, vocab, only_para, notice=''):
     from kandu.core_gen import is_phrase
     _reset(txt)
+    if notice:
+        txt.insert('end', notice + '\n\n', 'warn')
     count = 0
     phrase_count = 0
 
@@ -314,7 +316,8 @@ def render_vocab(txt, vocab, only_para):
             for entry in phrases:
                 entry_block(entry, paragraph['index'])
     if not count:
-        txt.insert("end", "本段没有收录生词\n" if only_para is not None else "本篇尚未收录生词\n", "meta")
+        empty = '当前没有可显示的词条\n' if notice else ("本段没有收录生词\n" if only_para is not None else "本篇尚未收录生词\n")
+        txt.insert("end", empty, "meta")
     _finish(txt, f"{count} 个词条（含 {phrase_count} 个短语）  ·  可选中复制")
 
 
