@@ -3493,6 +3493,170 @@ def test_reader_find_lifecycle():
         root.destroy()
 
 
+def _migration_fixture(folder, book_count=1):
+    from pathlib import Path
+    source = Path(folder)
+    source.mkdir(parents=True)
+    books = []
+    for index in range(book_count):
+        external = source.parent / f'external_{index}.epub'
+        external.write_bytes(b'epub test data ' + bytes([index]))
+        meta = dict(META, id=f'T_TRANSFER_{index}', path=str(external), size=external.stat().st_size)
+        books.append(meta)
+        cache = source / 'cache' / meta['id']
+        cache.mkdir(parents=True)
+        (cache / 'content.json').write_text(J.dumps(dict(bookSize=meta['size'], format='epub',
+            articles=[ART])), encoding='utf-8')
+        (cache / 'digest.json').write_text(J.dumps(dict(bookId=meta['id'], articles=[dict(
+            index=0, titleEn='t', titleZh='文章', summaryZh='已有摘要')])), encoding='utf-8')
+        (cache / 'vocab_0_cet4.json').write_text(J.dumps(dict(articleIndex=0, level='cet4',
+            processedParagraphs=[-1, 0], paragraphs=[dict(index=0, entries=[dict(word='opaque', sense='晦涩的')])])), encoding='utf-8')
+    (source / 'books.json').write_text(J.dumps(books), encoding='utf-8')
+    (source / 'settings.json').write_text(J.dumps(dict(booksDir='Z:/old-books', libraryDir='Z:/legacy',
+        vocabLevel='cet4', recentBooks=[m['id'] for m in books], llms=[dict(apiKey='DO_NOT_EXPORT_SOURCE_SECRET')],
+        unknownToken='DO_NOT_EXPORT_SOURCE_SECRET')), encoding='utf-8')
+    for folder_name in ('covers', 'reading_history', 'article_states', 'discussions', 'vocab'):
+        target = source / folder_name
+        target.mkdir()
+        (target / 'sample.txt').write_text('saved reading data', encoding='utf-8')
+    (source / 'ecdict.db').write_bytes(b'dictionary index can be rebuilt')
+    (source / 'error.log').write_text('DO_NOT_EXPORT_SOURCE_SECRET', encoding='utf-8')
+    return source, books
+
+
+@case('迁移包保留外部刊物与生成缓存、排除密钥并快照生词本')
+def test_migration_export():
+    from contextlib import closing
+    from pathlib import Path
+    import sqlite3
+    import zipfile
+    from tools.export_reading_data import export_data
+    root = Path(SANDBOX) / 'migration_export'
+    source, books = _migration_fixture(root / 'source', 2)
+    # 保持连接打开，验证 WAL 中已提交的内容也被备份。
+    db = sqlite3.connect(source / 'wordbook.sqlite3')
+    try:
+        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('CREATE TABLE words (word TEXT)')
+        db.execute("INSERT INTO words VALUES ('candid')")
+        db.commit()
+        output = root / 'backup.zip'
+        manifest = export_data(source, output, on_progress=lambda _: None)
+        assert manifest['books'] == 2
+        with zipfile.ZipFile(output) as archive:
+            assert archive.testzip() is None
+            names = archive.namelist()
+            assert not any('ecdict' in n or 'error.log' in n or '-wal' in n for n in names)
+            assert all(b'DO_NOT_EXPORT_SOURCE_SECRET' not in archive.read(n) for n in names)
+            data = J.loads(archive.read('Kandu-reading-data/data/books.json'))
+            assert [m['id'] for m in data] == [m['id'] for m in books]
+            assert all(m['path'] == f"books/{m['id']}.epub" for m in data)
+            for m in books:
+                assert archive.read(f"Kandu-reading-data/data/books/{m['id']}.epub") == Path(m['path']).read_bytes()
+            archive.extractall(root / 'unpacked')
+        with closing(sqlite3.connect(root / 'unpacked/Kandu-reading-data/data/wordbook.sqlite3')) as snapshot:
+            assert snapshot.execute('SELECT word FROM words').fetchone()[0] == 'candid'
+        try:
+            export_data(source, output, on_progress=lambda _: None)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError('已有备份不能被覆盖')
+        try:
+            export_data(source, source / 'cache' / 'backup.zip', on_progress=lambda _: None)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('不能把正在导出的包递归纳入自身')
+        Path(books[0]['path']).unlink()
+        try:
+            export_data(source, root / 'missing.zip', on_progress=lambda _: None)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError('缺失源刊物不能静默生成不完整迁移包')
+        assert not (root / 'missing.zip').exists()
+    finally:
+        db.close()
+
+
+@case('Windows迁移恢复跨路径复用缓存、保留目标模型与原数据备份')
+def test_migration_restore():
+    from pathlib import Path
+    import subprocess
+    import zipfile
+    from tools.export_reading_data import export_data
+    root = Path(SANDBOX) / 'migration_restore'
+    for count in (0, 1, 2):
+        current = root / str(count)
+        source, original = _migration_fixture(current / 'source', count)
+        archive = current / 'backup.zip'
+        export_data(source, archive, on_progress=lambda _: None)
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(current / 'unpacked')
+        target = current / '新电脑 路径' / 'KanduDesktop'
+        target.mkdir(parents=True)
+        (target / 'old-marker.txt').write_text('keep me', encoding='utf-8')
+        (target / 'settings.json').write_text(J.dumps(dict(llms=[dict(name='target', apiKey='TARGET_SECRET')],
+            defaultLlm='target')), encoding='utf-8')
+        script = current / 'unpacked' / 'Kandu-reading-data' / 'Restore-ReadingData.ps1'
+        result = subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+            '-File', str(script), '-DataRoot', str(target)], capture_output=True, timeout=30)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert b'RESTORE COMPLETE' in result.stdout and b'TARGET_SECRET' not in result.stdout
+        backup = next(target.parent.glob('KanduDesktop.backup-*'))
+        assert (backup / 'old-marker.txt').read_text(encoding='utf-8') == 'keep me'
+        settings = J.loads((target / 'settings.json').read_text(encoding='utf-8'))
+        assert settings['llms'][0]['apiKey'] == 'TARGET_SECRET' and settings['defaultLlm'] == 'target'
+        assert settings['booksDir'] == str(target / 'books') and settings['libraryDir'] == '' and settings['migratedLibrary']
+        library = J.loads((target / 'books.json').read_text(encoding='utf-8'))
+        assert isinstance(library, list) and len(library) == count
+        with patch.object(cfgmod, 'app_dir', return_value=target), \
+             patch.object(store, 'epub_parse', side_effect=AssertionError('已有正文不得重建')), \
+             patch.object(llm, 'chat', side_effect=AssertionError('迁移不调用模型')):
+            for meta in store.load_library():
+                assert Path(meta['path']).is_file() and Path(meta['path']).parent == target / 'books'
+                assert store.ensure_content(meta)['articles'] == [ART]
+                assert store.load_digest(meta['id'])['articles'][0]['summaryZh'] == '已有摘要'
+                assert store.load_vocab(meta['id'], 0, 'cet4')['paragraphs'][0]['entries'][0]['word'] == 'opaque'
+
+
+@case('迁移包损坏或含越界路径时拒绝恢复且保留目标数据')
+def test_migration_restore_invalid():
+    from pathlib import Path
+    import subprocess
+    import zipfile
+    from tools.export_reading_data import export_data
+    root = Path(SANDBOX) / 'migration_invalid'
+    source, _ = _migration_fixture(root / 'source')
+    output = root / 'backup.zip'
+    export_data(source, output, on_progress=lambda _: None)
+    with zipfile.ZipFile(output) as z:
+        z.extractall(root / 'unpacked')
+    package = root / 'unpacked/Kandu-reading-data'
+    target = root / 'target'
+    target.mkdir()
+    (target / 'marker.txt').write_text('original', encoding='utf-8')
+    corrupt = package / 'data/cache/T_TRANSFER_0/digest.json'
+    original = corrupt.read_bytes()
+    corrupt.write_bytes(b'corrupt')
+
+    def reject():
+        result = subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+            '-File', str(package / 'Restore-ReadingData.ps1'), '-DataRoot', str(target)], capture_output=True, timeout=30)
+        assert result.returncode != 0 and b'RESTORE FAILED' in result.stdout
+        assert (target / 'marker.txt').read_text(encoding='utf-8') == 'original'
+        assert not list(root.glob('target.backup-*'))
+
+    reject()
+    corrupt.write_bytes(original)
+    manifest_path = package / 'manifest.json'
+    manifest = J.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest['files'][0]['path'] = 'data/../../outside.json'
+    manifest_path.write_text(J.dumps(manifest), encoding='utf-8')
+    reject()
+
+
 def main():
     only = set(sys.argv[1:])
     if os.path.exists(SANDBOX):

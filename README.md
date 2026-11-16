@@ -68,6 +68,24 @@
 免安装：解压后运行 `Kandu.exe`（`_internal` 依赖目录需与 exe 同级保留）。
 数据目录在 `%LOCALAPPDATA%\KanduDesktop`，与解压位置无关。
 
+### 换电脑时迁移已有阅读数据
+
+已有摘要、生词和句解可以直接迁移，不需要重新调用 LLM。源电脑在仓库目录运行：
+
+```powershell
+.venv\Scripts\python.exe tools\export_reading_data.py --output "D:\备份\Kandu-reading-data.zip"
+```
+
+迁移包包含原刊文件（包括自定义书库目录中的文件）、正文和生成缓存、封面、阅读位置、文章标记、个人生词本与 AI 讨论。
+保留原书籍 ID，恢复时自动修正文件路径。导出不包含源电脑的模型配置、API 密钥、运行日志或可重建的词典索引。
+导出前等待生成任务完成；导出时若文件发生变化会提示重试，个人生词本使用 SQLite 一致性快照。
+
+新电脑先完整解压迁移包，关闭刊读，双击 `Kandu-reading-data\Restore-ReadingData.cmd`。
+看到 `RESTORE COMPLETE` 后打开刊读 v0.8.18 或更新版本即可，不需要重新导入刊物或生成已有结果，恢复不需要 Python。
+目标电脑原数据目录会先改名为 `KanduDesktop.backup-时间-编号`，再恢复整份书库；这不是两份书库的合并。
+恢复保留目标电脑已有的 LLM 配置；新电脑尚未配置时自行添加。设置了 `KANDU_DATA_DIR` 时恢复到该目录。
+程序 ZIP 和个人迁移包分别拷贝；个人书库和迁移包不提交到 Git 仓库。
+
 ## 功能
 
 1. **书库** — 添加刊物（多选）/ 从文件夹导入，文件纳入应用自管的存储与索引，
