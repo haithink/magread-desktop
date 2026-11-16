@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#183f35">
+  <title>刊读 · 在文字间，看见世界</title>
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="site-header"><a class="brand" href="#/library" aria-label="刊读首页"><img src="/static/icon.svg" alt=""><span>刊读<small>MAGREAD</small></span></a><nav id="navigation" hidden><a href="#/library">书库</a><a href="#/wordbook">生词本</a><a href="#/settings">设置</a><button id="logout" class="text-button">退出</button></nav><span id="connection" class="connection">WEB EDITION</span></header>
+  <main id="app" tabindex="-1"><div class="loading">正在打开书库…</div></main>
+  <div id="toast" role="status" hidden></div>
+  <aside id="jobbar" class="jobbar" hidden aria-live="polite"><span class="spinner"></span><span id="job-status"></span></aside>
+  <dialog id="sheet"><div class="sheet-head"><div><span class="eyebrow">READING COMPANION</span><h2 id="sheet-title"></h2></div><button id="sheet-close" class="icon-button" aria-label="关闭">×</button></div><div id="sheet-content"></div></dialog>
+  <template id="login-template"><section class="login"><div class="login-art"><span class="eyebrow">YOUR PRIVATE READING ROOM</span><h1>在文字间，<br>看见更大的世界。</h1><p>收藏值得读的文章，让每一个不懂的词、<br>每一句值得琢磨的话，都有回应。</p><div class="book-lines" aria-hidden="true">Read.<br>Understand.<br>Connect.</div></div><form id="login-form" class="login-form"><span class="eyebrow">欢迎回来</span><h2>进入你的阅读室</h2><p class="muted">用服务器上的访问密码，打开同一个书库。</p><label>访问密码<input id="password" type="password" autocomplete="current-password" required></label><button class="primary" type="submit">打开书库 <span>→</span></button><p id="login-error" class="error" role="alert"></p></form></section></template>
+  <footer class="site-footer"><span>刊读 · 慢一点，读深一点。</span><span>Personal library · Web 0.1.0</span></footer>
+</body>
+</html>
