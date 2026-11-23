@@ -3,9 +3,11 @@
 「刊读」Android App 的 Windows 桌面版：选择期刊目录，基于大模型辅助精读
 经济学人 / Wired 等英文原刊（EPUB / PDF）。
 
-版本历史与每版变更见 [变更记录](CHANGELOG.md)（当前 v0.8.18）。
+版本历史与每版变更见 [变更记录](CHANGELOG.md)（当前 v0.9.0）。
 
-刊读 **Web 版 v0.1.0** 已有独立的浏览器入口：在本机或局域网集中管理书库、已有摘要、生词表和阅读进度，电脑与手机通过浏览器接续阅读。支持首次导入桌面生成结果、个人生词本及 AI 讨论。启动与局域网配置见 [Web 版使用说明](WEB.md)；桌面 exe 仍为 v0.8.18。
+Windows **v0.9.0** 已移植上下文句解与查词、短语收藏、思考强度、阅读计时/统计、文章去重与标签、Lex Fridman Transcript 导入等功能。操作入口与计时规则见 [v0.9.0 使用说明](docs/DESKTOP-0.9.md)。
+
+浏览器版由独立的 [magread-web](https://github.com/haithink/magread-web) 仓库维护。桌面数据仍保存在本机，功能移植不等于桌面与 Web 数据自动同步。
 
 ## 界面预览
 
@@ -49,7 +51,7 @@
 
 [![句子讲解：分区排版、语法成分对应与参考译文](docs/screenshots/desktop-analysis.png)](docs/screenshots/desktop-analysis.png)
 
-以上桌面截图来自当前版本实际运行的程序，使用现有书库中的真实刊物封面和文章：书库与摘要展示 Wired 等刊物，原文、生词与句解展示《经济学人》2026 年 10 月 10 日期的 “This year’s Nobel science prizes are real-life sci-fi”。摘要、释义与讲解均使用已有的实际生成结果。下载包的版本以下载区标注为准。
+以上桌面截图保留自 v0.8.x 实际运行的程序，使用现有书库中的真实刊物封面和文章：书库与摘要展示 Wired 等刊物，原文、生词与句解展示《经济学人》2026 年 10 月 10 日期的 “This year’s Nobel science prizes are real-life sci-fi”。摘要、释义与讲解均使用已有的实际生成结果。下载包的版本以下载区标注为准。
 
 ### 其他版本
 
@@ -65,7 +67,7 @@
 
 ## 下载 Windows 安装包
 
-**[下载刊读 v0.8.18（Windows 64 位，约 62 MiB）](https://github.com/haithink/magread-desktop/raw/refs/heads/main/downloads/Kandu-v0.8.18-win64.zip)**
+**[下载刊读 v0.9.0（Windows 64 位，约 53 MiB）](https://github.com/haithink/magread-desktop/raw/refs/heads/main/downloads/Kandu-v0.9.0-win64.zip)**
 
 免安装：解压后运行 `Kandu.exe`（`_internal` 依赖目录需与 exe 同级保留）。
 数据目录在 `%LOCALAPPDATA%\KanduDesktop`，与解压位置无关。
@@ -130,11 +132,11 @@ Enter / F3 查找下一个，Shift+Enter / Shift+F3 查找上一个，Esc 关闭
 - 逐块保存并兼容旧缓存；已处理段落不重新请求，失败块仍可换模型补缺。
 - 模型偶尔把词条放错段时，按原文唯一匹配自动归位；部分段落失败只补这些段落，
   保留同次响应中已成功的段落。再次点击补缺可重试曾失败的同名渠道。
-- DeepSeek 的生词任务显式关闭思考模式，避免长时间等待后只有推理、没有词条；
-  摘要和句解保持各自的请求设置。
+- 默认关闭 DeepSeek 常规生词、查词与句解的思考，深入复核默认中等思考；
+  设置中的每模型思考强度可覆盖任务默认，其他模型默认沿用接口设置。
 - 校验严格保留未完成状态；流式中断、缺段或格式错误会记录具体原因到缓存 `chunkErrors`，
   失败原因也显示在状态栏并写入 `error.log`，便于区分接口、输出格式与安全过滤问题。
-- 生成时显示已完成块数和实时接收字数，完成后显示用时；缓存中的 `generationStats`
+- 生成时显示实际调用的 LLM 配置与模型、已完成块数和接收字数，完成后显示用时；缓存中的 `generationStats`
   记录调用次数、输入/输出字符数与用时（字符数不等于模型 token 数）。
 
 速度受模型和网关影响。首次使用离线词典需要建索引，进入阅读页时会后台预热。
@@ -142,7 +144,7 @@ Enter / F3 查找下一个，Shift+Enter / Shift+F3 查找上一个，Esc 关闭
 ## 开发运行
 
 ```bash
-python -m venv .venv
+py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 .venv\Scripts\python.exe main.py
 ```
@@ -157,9 +159,15 @@ build_exe.bat
 
 产物：`dist\Kandu\Kandu.exe`（整目录拷走即可用），并同步生成
 `dist\Kandu-v<版本>-win64.zip` 分发包。
-tcl/tk、sqlite3 等 DLL 从 anaconda（`D:\anaconda\Library`）手动打入，见脚本参数；
-如 Python 安装位置不同，改脚本里的路径。构建脚本自带自检：exe 未更新或被
-运行中进程锁定时会明确报错。
+使用官方 CPython 3.12 64 位（包含 Tcl/Tk）。PyInstaller 自动收集 Tcl/Tk、SQLite 等依赖，无需编辑本机绝对路径。
+构建脚本检查 EXE 的实际 PE 版本，并在临时数据目录验证启动、资源加载和正常退出，再生成含许可证的 ZIP。
+本次构建使用 Python 3.12、PyInstaller 6.22.3。完整回归入口：
+
+```powershell
+.venv\Scripts\python.exe -B tests\run_tests.py
+```
+
+测试使用独立临时目录并阻止未模拟的网络请求，不改动个人书库。
 
 ## 与 Android 版的关系
 

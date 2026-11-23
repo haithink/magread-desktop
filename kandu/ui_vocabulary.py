@@ -318,7 +318,9 @@ def render_vocab(txt, vocab, only_para, notice=''):
     if not count:
         empty = '当前没有可显示的词条\n' if notice else ("本段没有收录生词\n" if only_para is not None else "本篇尚未收录生词\n")
         txt.insert("end", empty, "meta")
-    _finish(txt, f"{count} 个词条（含 {phrase_count} 个短语）  ·  可选中复制")
+    models=(vocab.get('generationStats') or {}).get('modelsUsed',[])
+    source='；'.join(f"{m.get('name','默认')} / {m.get('model','')}" for m in models)
+    _finish(txt, f"{count} 个词条（含 {phrase_count} 个短语）  ·  可选中复制" + (' · 最近生成：'+source if source else ''))
 
 
 def render_lookup(txt, word, result):

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """刊读桌面版回归测试入口。
 
-强制沙箱：所有测试必须经由本脚本运行（它把数据目录重定向到项目内
-_sandbox/，并在结束后清理），绝不触碰真实 %LOCALAPPDATA% 数据。
+强制沙箱：所有测试必须经由本脚本运行（它把数据目录重定向到独立
+临时目录，并在结束后清理），绝不触碰真实 %LOCALAPPDATA% 数据。
 用法：.venv\\Scripts\\python.exe tests\\run_tests.py [名称...]
 """
 import os
@@ -10,7 +10,7 @@ import sys
 import tempfile
 
 # 必须在导入 kandu 之前设置沙箱数据目录
-SANDBOX = os.path.join(tempfile.gettempdir(), "kandu_test_sandbox")
+SANDBOX = tempfile.mkdtemp(prefix="kandu-test-")
 os.environ["KANDU_DATA_DIR"] = SANDBOX
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -21,6 +21,7 @@ import re
 import shutil
 import threading
 import time
+import faulthandler
 from unittest.mock import patch
 
 from kandu import core_config as cfgmod
@@ -37,6 +38,26 @@ def case(name):
         RESULTS.append((name, fn))
         return fn
     return deco
+
+
+def _ui_background(app):
+    """Existing layout tests run local metadata jobs without scheduling models."""
+    if getattr(app, '_test_metadata_jobs', False):
+        return
+    original = getattr(app, 'post', lambda *a: None)
+    def post(fn, *args):
+        if fn.__name__ in ('_directory_insights_worker', '_counts_worker'):
+            owner = fn.__self__
+            def emit(kind, payload=None):
+                handler = getattr(owner, 'on_' + kind, None)
+                if handler:
+                    handler(payload)
+            with patch.object(app, 'emit', emit, create=True):
+                fn(*args)
+        else:
+            original(fn, *args)
+    app.post = post
+    app._test_metadata_jobs = True
 
 
 META = {"id": "T", "fileName": "t.epub", "ext": "epub", "size": 1, "lastModified": 0, "path": ""}
@@ -234,7 +255,8 @@ def test_vocab_context_cache():
     assert old == original, "迁移不能原位改动原始缓存"
     assert audited["coverageVersion"] == gen.VOCAB_COVERAGE_VERSION
     assert audited["processedParagraphs"] == [-1, 0] and audited["chunkFailures"] == {"1": ["old"]}
-    assert audited["phraseProcessedParagraphs"] == [-1, 0]
+    assert audited["phraseProcessedParagraphs"] == []
+    assert audited["phraseCoverageVersion"] == gen.PHRASE_COVERAGE_VERSION
     assert all(p["index"] != 1 for p in audited["paragraphs"])
     entries = {e["word"]: e for e in audited["paragraphs"][0]["entries"]}
     assert "he’d" not in entries and "he'd" not in entries
@@ -734,49 +756,63 @@ def test_analysis_progress_ui():
     from kandu.ui_reader import ReaderFrame
     root = tk.Tk()
     root.geometry("900x620")
-    posts, errors = [], []
+    posts, errors, calls = [], [], []
+    entered, release = threading.Event(), threading.Event()
     cfg = {"name": "test", "provider": "anthropic", "baseUrl": "http://local.test",
            "apiKey": "not-real", "model": "deepseek-v4-flash"}
     app = SimpleNamespace(settings={"readerFontSize": 13, "sheetFontSize": 11, "vocabLevel": "cet4",
                                     "llms": [cfg], "defaultLlm": "test"},
                           post=lambda *args: posts.append(args), save_settings=lambda: None,
+                          _handle_handler_error=lambda e: errors.append(e),
                           open_digest=lambda *args: None)
     root.report_callback_exception = lambda *args: errors.append(args)
+    analysis = {"vocab": [], "grammarDiagram": "A shop opens.", "grammarPoints": [],
+                "context": "示例", "translation": "小店开门了。",
+                "generationStats": {"elapsedMs": 2580, "model": cfg["model"]}}
+    def fake(*args, **kwargs):
+        calls.append(kwargs)
+        kwargs['on_progress'](dict(chars=120, elapsedMs=500))
+        entered.set()
+        assert release.wait(3)
+        return analysis
+    def pump(predicate):
+        end=time.monotonic()+3
+        while not predicate() and time.monotonic()<end:
+            root.update()
+            time.sleep(.01)
+        assert predicate()
     try:
-        reader = ReaderFrame(root, app, dict(META, id="T_ANALYSIS_UI"), 0)
-        reader.pack(fill="both", expand=True)
-        reader.on_content_loaded(({"articles": [{"index": 0, "title": "A shop", "paragraphs": ["A shop opens."]}]}, 0))
-        root.update()
-        reader._start_analysis(0, "A shop opens.")
-        root.update()
-        win, txt, bar = reader._sheets["A shop opens."]
-        label = bar._analysis_status
-        assert "等待模型响应" in label.cget("text")
-        count = len(posts)
-        reader._start_analysis(0, "A shop opens.")
-        assert len(posts) == count, "等待中重复双击不能再发请求"
-        reader.on_analysis_progress(("A shop opens.", {"chars": 120, "attempt": 2}))
-        reader.after_cancel(reader._analysis_tick_after)
-        reader._tick_analysis_progress()
-        assert "120" in label.cget("text") and "第 2 次" in label.cget("text")
-        analysis = {"vocab": [], "grammarDiagram": "A shop opens.", "grammarPoints": [],
-                    "context": "示例", "translation": "小店开门了。",
-                    "generationStats": {"elapsedMs": 2580, "model": cfg["model"]}}
-        reader.on_analysis_done(("A shop opens.", "A shop opens.", analysis))
-        assert "完成 · 2.6 秒" in label.cget("text")
-        assert "小店开门了。" in txt.get("1.0", "end")
-        assert "2.6 秒" in txt.get("1.0", "end")
-        reader._start_analysis(0, "A shop closes.")
-        reader.on_analysis_error(("A shop closes.", "示例错误"))
-        failed_bar = reader._sheets["A shop closes."][2]
-        assert "失败" in failed_bar._analysis_status.cget("text")
-        reader._retry_analysis(cfg, "A shop closes.")
-        assert len([w for w in failed_bar.winfo_children() if w is failed_bar._analysis_status]) == 1
-        win.destroy()
-        reader.destroy()
-        root.update()
-        assert not errors, errors
+        with patch.object(gen, 'analyze', side_effect=fake):
+            reader = ReaderFrame(root, app, dict(META, id="T_ANALYSIS_UI"), 0)
+            reader.pack(fill="both", expand=True)
+            reader.on_content_loaded(({"articles": [{"index": 0, "title": "A shop", "paragraphs": ["A shop opens."]}]}, 0))
+            root.update()
+            reader._start_analysis(0, "A shop opens.")
+            request=next(iter(reader._analysis_requests.values()))
+            label, txt=request['status'], request['txt']
+            assert "等待模型响应" in label.cget("text") and 'test / deepseek' in label.cget('text')
+            assert entered.wait(2)
+            reader._start_analysis(0, "A shop opens.")
+            assert len(calls)==1, "等待中重复双击不能再发请求"
+            pump(lambda:'120' in label.cget('text'))
+            key=next(iter(reader._analysis_requests))
+            old=request['control']
+            reader._cancel_sentence(key)
+            release.set()
+            pump(lambda:not reader._tool_events.empty())
+            reader._poll_reading_tools()
+            assert request['previous'] is None, '取消后旧结果不能覆盖界面'
+            reader._start_analysis(0, 'A shop opens.', force=True)
+            pump(lambda:request['previous'] is not None)
+            assert '完成 · 2.6 秒' in label.cget('text')
+            assert '小店开门了。' in txt.get('1.0','end')
+            reader._sentence_event('sentence_error',(key,old,'迟到的错误'))
+            assert '完成' in label.cget('text')
+            reader.destroy()
+            root.update()
+            assert not errors, errors
     finally:
+        release.set()
         root.destroy()
 
 
@@ -974,6 +1010,7 @@ def test_library_layout_and_navigation():
         root.geometry("900x620")
         with patch.object(store, "load_library", return_value=metas), patch.object(store, "has_digest", return_value=False), \
              patch("kandu.ui_library.Image.open", wraps=Image.open) as images:
+            _ui_background(app)
             frame = LibraryFrame(root, app)
             frame.pack(fill="both", expand=True)
             pump()
@@ -1068,6 +1105,7 @@ def test_library_empty_and_refresh():
         batch_state={"running": False, "done": 0})
     try:
         with patch.object(store, "load_library", return_value=[]):
+            _ui_background(app)
             frame = LibraryFrame(root, app)
         frame.pack(fill="both", expand=True)
         root.update()
@@ -1119,6 +1157,7 @@ def test_vocab_sheet_scroll():
     app.withdraw()
     holder = tk.Frame(app)
     holder.app = SimpleNamespace(settings={"sheetFontSize": 11}, save_settings=lambda: None)
+    holder._track_aid_activity = lambda win: None
     win, txt, toolbar = ReaderFrame._make_sheet(holder, "生词表测试", "长文章")
     try:
         _render_vocab(txt, {"paragraphs": [{"index": 0, "startWords": "Long article", "entries": [
@@ -1423,6 +1462,7 @@ def test_digest_browsing():
     frame = None
     try:
         with patch.object(gen, "digest_incomplete", return_value=False):
+            _ui_background(app)
             frame = DigestFrame(root, app, meta)
         frame.pack(fill="both", expand=True)
         root.update()
@@ -1499,6 +1539,7 @@ def test_digest_browsing():
         previous = frame.canvas.yview()[0]
         frame.destroy()
         with patch.object(gen, "digest_incomplete", return_value=False):
+            _ui_background(app)
             frame = DigestFrame(root, app, meta)
         frame.pack(fill="both", expand=True)
         root.update()
@@ -1550,6 +1591,7 @@ def test_digest_compact_header():
     root = tk.Tk()
     try:
         with patch.object(gen, "digest_incomplete", return_value=False):
+            _ui_background(app)
             frame = DigestFrame(root, app, meta)
         frame.pack(fill="both", expand=True)
         for geometry in ("900x620", "1180x800"):
@@ -1595,6 +1637,7 @@ def test_digest_incremental_mark():
     root.report_callback_exception = lambda *args: errors.append(args)
     try:
         with patch.object(gen, "digest_incomplete", return_value=False):
+            _ui_background(app)
             frame = DigestFrame(root, app, meta)
         frame.pack(fill="both", expand=True)
         root.update()
@@ -1678,6 +1721,7 @@ def test_digest_filter_cache():
     app = SimpleNamespace(settings={}, show_library=lambda: None, open_reader=lambda *a: None)
     try:
         with patch.object(gen, "digest_incomplete", return_value=False):
+            _ui_background(app)
             frame = DigestFrame(root, app, meta)
         frame.pack(fill="both", expand=True)
         root.update()
@@ -2089,7 +2133,8 @@ def test_reading_resume():
         open_reader(meta, 2)
         pump()
         assert app.current.text.yview()[0] == 0, "回到开头后也应更新保存位置"
-        assert len(posts) == 6 + bool(os.environ.get("KANDU_CAPTURE_RESUME")) and not errors, (len(posts), errors)
+        loads=[p for p in posts if p[0].__name__ != '_directory_insights_worker']
+        assert len(loads) == 6 + bool(os.environ.get("KANDU_CAPTURE_RESUME")) and not errors, (len(loads), errors)
     finally:
         if root.winfo_exists():
             root.destroy()
@@ -2197,8 +2242,12 @@ def test_grammar_components():
         assert chat.call_count == 1
     result["grammarComponents"] = [{"text": "made up", "label": "无效"}]
     with patch.object(gen, "_chat_retry", return_value=J.dumps(result)):
-        invalid = gen.analyze(meta, ART, "Another sentence.", "", "", {"model": "test"})
-        assert invalid["partial"] and store.load_analysis(meta["id"], "Another sentence.", 0) is None
+        try:
+            gen.analyze(meta, ART, "Another sentence.", "", "", {"model": "test"})
+            assert False, '无效成分不能作为成功讲解返回'
+        except gen.GenError:
+            pass
+        assert store.load_analysis(meta["id"], "Another sentence.", 0) is None
     old = {"grammarDiagram": "We read books.\n主语 谓语 宾语", "context": "原缓存", "translation": "我们读书。"}
     store.save_analysis(meta["id"], "Old cached sentence.", 0, old)
     with patch.object(gen, "_chat_retry", side_effect=AssertionError("旧缓存不应请求模型")):
@@ -2285,6 +2334,7 @@ def test_library_publication_groups():
                           batch_state={"running": False, "done": 0})
     try:
         with patch.object(store, "load_library", return_value=metas):
+            _ui_background(app)
             frame = LibraryFrame(root, app)
         frame.pack(fill="both", expand=True)
         root.update()
@@ -2358,6 +2408,7 @@ def test_cover_repair():
                           emit=lambda *args: events.append(args))
     try:
         with patch.object(store, "load_library", return_value=[meta, bad]):
+            _ui_background(app)
             frame = LibraryFrame(root, app)
         frame.pack(fill="both", expand=True)
         root.update()
@@ -2420,6 +2471,7 @@ def test_recent_articles_more():
                           open_reader=lambda m, i: opened.append((m["id"], i)))
     try:
         with patch.object(store, "load_library", return_value=metas):
+            _ui_background(app)
             frame = LibraryFrame(root, app)
         frame.pack(fill="both", expand=True)
         root.update()
@@ -2901,13 +2953,13 @@ def test_phrase_enrichment():
         assert all(e['inText'] in article['paragraphs'][0] for e in entries)
         assert gen.phrase_pending(result, article, 0) == 0
         gen.generate_vocab(meta, article, 'cet4', dict(name='test'), phrases_only=True, only_para=0)
-        assert len(calls) == 1, '已检查的段落（包括无短语）不应重复请求'
+        assert len(calls) == 2, '显式再次检查短语必须允许复查'
         result = gen.generate_vocab(meta, article, 'cet4', dict(name='test'), phrases_only=True)
-        assert len(calls) == 2 and '### 段落 0\n' not in calls[1]
+        assert len(calls) == 3 and '### 段落 0\n' in calls[2]
         assert result['phraseProcessedParagraphs'] == [-1, 0, 1, 2]
         assert gen.phrase_pending(result, article) == 0
         gen.generate_vocab(meta, article, 'cet4', dict(name='test'), phrases_only=True)
-        assert len(calls) == 2
+        assert len(calls) == 4
     # 不存在的短语和错误返回的单词不能把段落标为已检查；有效兄弟段落应保留。
     meta = dict(meta, id='T_PHRASES_RETRY')
     store.save_vocab(meta['id'], copy.deepcopy(old))
@@ -2924,8 +2976,8 @@ def test_phrase_enrichment():
     with patch.object(llm, 'chat', fake):
         result = gen.generate_vocab(meta, article, 'cet4', dict(name='test'), phrases_only=True)
     assert result['failedPhraseChunks'] == 0 and not result['phraseFailures']
-    assert '### 段落 -1\n' not in calls[0] and '### 段落 2\n' not in calls[0]
-    # 新生成的普通生词表同时检查短语，之后无需额外请求。
+    assert '### 段落 -1\n' in calls[0] and '### 段落 2\n' in calls[0], '显式全文复查包括已检查的段落'
+    # 普通生词生成会收录模型给出的短语，但不冒充一次独立的短语检查。
     meta = dict(meta, id='T_PHRASES_NEW')
     def normal(cfg, system, user, **kwargs):
         assert '必须独立检查重点短语' in system
@@ -2933,7 +2985,8 @@ def test_phrase_enrichment():
             ['fell for', 'phr.', '上当', '', False, '']])]))
     with patch.object(llm, 'chat', normal):
         result = gen.generate_vocab(meta, dict(article, paragraphs=article['paragraphs'][:1]), 'cet4', dict(name='test'))
-    assert result['phraseProcessedParagraphs'] == [-1, 0]
+    assert result['phraseProcessedParagraphs'] == []
+    assert gen.phrase_pending(result,dict(article,paragraphs=article['paragraphs'][:1])) == 2
 
 
 @case('段落词条和短语一键收藏、编辑与查词后正文位置稳定')
@@ -3031,10 +3084,10 @@ def test_vocab_collect_and_position():
             reader.on_vocab_progress(dict(done=0, total=1, llm='test'))
             reader.on_vocab_chars(80)
             assert '短语解释' in txt._vocab_status.cget('text') and '80' in txt._vocab_status.cget('text')
-            reader.on_vocab_done(dict(reader.vocab, phraseProcessedParagraphs=[21]))
+            reader.on_vocab_done(dict(reader.vocab, phraseProcessedParagraphs=[21], phraseCoverageVersion=gen.PHRASE_COVERAGE_VERSION))
             root.update()
             assert reader._vocab_sheets[21][0] is win and not reader.vocab_running
-            assert win._phrase_button.cget('text') == '短语已检查' and str(win._phrase_button.cget('state')) == 'disabled'
+            assert win._phrase_button.cget('text') == '短语已检查' and str(win._phrase_button.cget('state')) == 'normal'
             assert '重点短语' in txt.get('1.0', 'end') and '可选中复制' in txt._vocab_status.cget('text')
             assert not errors, errors
     finally:
@@ -3515,12 +3568,17 @@ def _migration_fixture(folder, book_count=1):
     (source / 'settings.json').write_text(J.dumps(dict(booksDir='Z:/old-books', libraryDir='Z:/legacy',
         vocabLevel='cet4', recentBooks=[m['id'] for m in books], llms=[dict(apiKey='DO_NOT_EXPORT_SOURCE_SECRET')],
         unknownToken='DO_NOT_EXPORT_SOURCE_SECRET')), encoding='utf-8')
-    for folder_name in ('covers', 'reading_history', 'article_states', 'discussions', 'vocab'):
+    for folder_name in ('covers', 'reading_history', 'article_states', 'discussions', 'vocab', 'article_tags', 'podcasts'):
         target = source / folder_name
         target.mkdir()
         (target / 'sample.txt').write_text('saved reading data', encoding='utf-8')
     (source / 'ecdict.db').write_bytes(b'dictionary index can be rebuilt')
     (source / 'error.log').write_text('DO_NOT_EXPORT_SOURCE_SECRET', encoding='utf-8')
+    (source / 'reading-stats.json').write_text(J.dumps(dict(sources={},excluded=['old'])),encoding='utf-8')
+    import sqlite3
+    with sqlite3.connect(source / 'reading-activity.sqlite3') as activity:
+        activity.execute('CREATE TABLE port_test (words INTEGER)')
+        activity.execute('INSERT INTO port_test VALUES (123)')
     return source, books
 
 
@@ -3611,6 +3669,13 @@ def test_migration_restore():
         assert settings['booksDir'] == str(target / 'books') and settings['libraryDir'] == '' and settings['migratedLibrary']
         library = J.loads((target / 'books.json').read_text(encoding='utf-8'))
         assert isinstance(library, list) and len(library) == count
+        assert (target / 'article_tags/sample.txt').read_text(encoding='utf-8') == 'saved reading data'
+        assert (target / 'podcasts/sample.txt').read_text(encoding='utf-8') == 'saved reading data'
+        assert J.loads((target / 'reading-stats.json').read_text(encoding='utf-8'))['excluded'] == ['old']
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(target / 'reading-activity.sqlite3')) as activity:
+            assert activity.execute('SELECT words FROM port_test').fetchone()[0] == 123
         with patch.object(cfgmod, 'app_dir', return_value=target), \
              patch.object(store, 'epub_parse', side_effect=AssertionError('已有正文不得重建')), \
              patch.object(llm, 'chat', side_effect=AssertionError('迁移不调用模型')):
@@ -3657,16 +3722,36 @@ def test_migration_restore_invalid():
     reject()
 
 
+@case('Web迁移核心与原生窗口隔离验收')
+def test_web_port_contracts():
+    from port_feature_cases import run_contracts
+    run_contracts()
+
+
+@case('PDF跨页段落无损迁移与中断恢复')
+def test_pdf_paragraph_contracts():
+    import unittest
+    from port_pdf_cases import PdfParagraphTests
+    result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(PdfParagraphTests))
+    assert result.wasSuccessful(), 'PDF paragraph migration contracts failed'
+
+
 def main():
     only = set(sys.argv[1:])
+    if only - {name for name, _ in RESULTS}:
+        raise SystemExit('Unknown test names: '+', '.join(sorted(only - {name for name, _ in RESULTS})))
     if os.path.exists(SANDBOX):
         shutil.rmtree(SANDBOX, ignore_errors=True)
     failed = []
+    # Tests may mock HTTP explicitly, but no accidental live model/website calls.
+    network_guard = patch('requests.sessions.Session.request', side_effect=AssertionError('Live network disabled in desktop tests'))
+    network_guard.start()
     for name, fn in RESULTS:
         if only and name not in only:
             continue
         original_chat, original_retry = llm.chat, gen._chat_retry
         try:
+            faulthandler.dump_traceback_later(90)
             fn()
             print(f"PASS {name}")
         except Exception as e:
@@ -3675,7 +3760,11 @@ def main():
             import traceback
             traceback.print_exc()
         finally:
+            faulthandler.cancel_dump_traceback_later()
+            from kandu.reading_tasks import WRITER
+            WRITER.submit(lambda: None).result(timeout=20)
             llm.chat, gen._chat_retry = original_chat, original_retry
+    network_guard.stop()
     shutil.rmtree(SANDBOX, ignore_errors=True)
     if failed:
         print("FAILED:", failed)

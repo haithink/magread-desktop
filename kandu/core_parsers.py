@@ -5,7 +5,7 @@ import re
 import threading
 import zipfile
 import xml.etree.ElementTree as ET
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 
 import pymupdf
@@ -17,6 +17,15 @@ from . import core_pdf
 PDF_PARSER_VERSION = core_pdf.PARSER_VERSION
 _CONTENT_LOCKS = {}
 _CONTENT_LOCKS_GUARD = threading.Lock()
+LIBRARY_LOCK = threading.RLock()
+
+
+def _library_locked(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        with LIBRARY_LOCK:
+            return fn(*args, **kwargs)
+    return run
 
 WATERMARK = re.compile(r"(?i)zlibrary|this (article|file) was downloaded by|中商海外高资")
 SKIP_NAME = ["cover", "toc", "ad_page", "masthead", "titlepage", "title_page", "colophon", "nav"]
@@ -370,6 +379,9 @@ def _ensure_content(meta):
     cf = _cache_dir(meta["id"]) / "content.json"
     cache = _json_read(cf)
     if _content_current(meta, cache):
+        if meta['ext'] == 'pdf' and cache.get('pdfParagraphVersion') != core_pdf.PARAGRAPH_VERSION:
+            from . import core_pdf_migration
+            cache = core_pdf_migration.upgrade(meta, cache)
         return {
             "bookId": meta["id"],
             "format": cache["format"],
@@ -384,6 +396,7 @@ def _ensure_content(meta):
     payload = {"bookSize": meta["size"], "format": fmt, "articles": articles}
     if fmt == "pdf":
         payload["pdfParserVersion"] = PDF_PARSER_VERSION
+        payload["pdfParagraphVersion"] = core_pdf.PARAGRAPH_VERSION
         if cache and cache.get("pdfParserVersion") != PDF_PARSER_VERSION:
             _migrate_pdf_cache(meta, cache, articles)
     _atomic_json_write(cf, payload)
@@ -530,7 +543,8 @@ def _reading_record(data):
     return {**{k: data[k] for k in numeric}, "title": data["title"],
             "titleZh": data.get("titleZh", ""), "paragraphStart": data.get("paragraphStart", ""),
             "progress": progress, "atStart": data.get("atStart") is True,
-            "atEnd": data.get("atEnd") is True}
+            "atEnd": data.get("atEnd") is True,
+            **({"completionMode": "explicit"} if data.get("completionMode") == "explicit" else {})}
 
 
 def load_reading_history(book_id: str) -> dict:
@@ -542,12 +556,12 @@ def load_reading_history(book_id: str) -> dict:
             if key.isdecimal() and (record := _reading_record(value)) is not None}
 
 
-def save_reading_progress(book_id: str, article_index: int, progress: dict) -> dict:
+def save_reading_progress(book_id: str, article_index: int, progress: dict, *, read_at=None) -> dict:
     import time
 
     if type(article_index) is not int or article_index < 0:
         raise ValueError("文章索引必须是非负整数")
-    record = _reading_record(dict(progress, lastReadAt=int(time.time() * 1000)))
+    record = _reading_record(dict(progress, lastReadAt=int(time.time() * 1000) if read_at is None else read_at))
     if record is None:
         raise ValueError("阅读位置无效")
     history = load_reading_history(book_id)
@@ -577,17 +591,18 @@ def save_vocab(book_id: str, vocab: dict):
     )
 
 
-def analysis_key(book_id: str, article_index: int, text: str) -> str:
-    return hashlib.sha1(f"{book_id}|{article_index}|{text}".encode("utf-8")).hexdigest()
+def analysis_key(book_id: str, article_index: int, text: str, identity='') -> str:
+    key = f"{book_id}|{article_index}|{text}" + (f"|{identity}" if identity else '')
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
 
-def load_analysis(book_id: str, text: str, article_index: int):
-    return _json_read(_cache_dir(book_id) / f"analysis_{analysis_key(book_id, article_index, text)}.json")
+def load_analysis(book_id: str, text: str, article_index: int, identity=''):
+    return _json_read(_cache_dir(book_id) / f"analysis_{analysis_key(book_id, article_index, text, identity)}.json")
 
 
-def save_analysis(book_id: str, text: str, article_index: int, analysis: dict):
-    _json_write(
-        _cache_dir(book_id) / f"analysis_{analysis_key(book_id, article_index, text)}.json",
+def save_analysis(book_id: str, text: str, article_index: int, analysis: dict, identity=''):
+    _atomic_json_write(
+        _cache_dir(book_id) / f"analysis_{analysis_key(book_id, article_index, text, identity)}.json",
         analysis,
     )
 
@@ -619,10 +634,10 @@ def load_library():
 
 
 def save_library(entries):
-    import json
-    library_file().write_text(json.dumps(entries, ensure_ascii=False, indent=1), encoding="utf-8")
+    _atomic_json_write(library_file(), entries)
 
 
+@_library_locked
 def add_book(src: str, books_dir: str):
     """把刊物文件复制进书库存储并返回 (meta, status)；status: added/exists。"""
     import json
@@ -658,6 +673,7 @@ def add_book(src: str, books_dir: str):
     return meta, status
 
 
+@_library_locked
 def remove_book(book_id: str):
     """从书库移除：删除登记、书库内文件副本、缓存/封面与阅读标记。"""
     entries = [e for e in load_library() if e.get("id") != book_id]

@@ -1,12 +1,14 @@
 """文章摘要浏览：手动阅读标记、状态筛选和本地搜索。"""
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, simpledialog
 
 from kandu import core_parsers as store
 from kandu import core_llm as llm
 from kandu import core_gen as gen
 from kandu import core_config as cfgmod
 from kandu.ui_recent import show_recent
+from kandu import article_duplicates, article_tags, reading_stats
+from kandu.reading_tasks import WRITER
 
 FAMILY = "Microsoft YaHei UI"
 PAPER = "#f3f4ef"
@@ -39,6 +41,10 @@ class DigestFrame(tk.Frame):
         self._heights_after = None
         self._states = store.load_article_states(meta["id"])
         self._reading_history = store.load_reading_history(meta["id"])
+        self._earlier = {}
+        self._tags_by_index = {}
+        self.show_duplicates = tk.BooleanVar(self, False)
+        self.tag_filter = tk.StringVar(self, '全部标签')
         self._recent_signature = None
         self.recent_buttons = {}
         self._search_after = None
@@ -69,7 +75,7 @@ class DigestFrame(tk.Frame):
         self.gen_btn = self._button(actions, "补全摘要", self.generate, bg="#dfece3", fg=GREEN)
         self.gen_btn.pack(side="left")
 
-        heading = tk.Frame(self, bg=PAPER, padx=32, pady=6)
+        heading = tk.Frame(self, bg=PAPER, padx=32, pady=2)
         heading.pack(fill="x")
         title_row = tk.Frame(heading, bg=PAPER)
         title_row.pack(fill="x")
@@ -101,7 +107,16 @@ class DigestFrame(tk.Frame):
         self.search_entry.bind("<Escape>", lambda e: self._reset_filters())
         self._button(search_box, "×", lambda: self.search_var.set(""), padx=3, pady=0).pack(side="left")
         self.result_label = tk.Label(controls, text="", bg=PAPER, fg=MUTED, font=(FAMILY, 9), anchor="w")
-        self.result_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 4))
+        self.result_label.grid(row=1, column=0, sticky="ew", pady=(4, 4))
+        extras = tk.Frame(controls, bg=PAPER)
+        extras.grid(row=1, column=1, sticky='e', pady=(0, 4))
+        tk.Checkbutton(extras, text='显示更早刊物中的重复文章', variable=self.show_duplicates,
+            command=self._render, bg=PAPER, fg=MUTED, activebackground=PAPER,
+            font=(FAMILY,9)).pack(side='left')
+        self.tags_choice = ttk.Combobox(extras, textvariable=self.tag_filter, values=['全部标签'],
+            state='readonly', width=14)
+        self.tags_choice.pack(side='right')
+        self.tags_choice.bind('<<ComboboxSelected>>', lambda e:self._render())
 
         self.progress_row = tk.Frame(self, bg=PAPER, padx=32, pady=8)
         self.progress_row.pack(side="bottom", fill="x")
@@ -309,6 +324,7 @@ class DigestFrame(tk.Frame):
             return
         try:
             self._states = store.set_article_state(self.meta["id"], index, state)
+            WRITER.submit(self._record_completion, index)
         except (OSError, ValueError) as e:
             self.status.config(text=f"标记保存失败：{e}")
             return
@@ -382,13 +398,14 @@ class DigestFrame(tk.Frame):
             return
         others = cfgmod.other_llms(self.app.settings, exclude_name=cfg.get("name"))
         self._tried_name = cfg.get("name", "")
+        self._digest_model = f"{cfg.get('name','默认')} / {cfg.get('model','')}"
         self._can_switch = bool(others)
         self.generating = True
         _RUNNING.add(self.meta["id"])
         self.gen_btn.config(state="disabled")
         self.bar.config(value=0)
         self.bar.grid()
-        self.status.config(text="解析刊物正文…")
+        self.status.config(text="解析刊物正文… · " + self._digest_model)
         self.app.post(self._worker, dict(cfg))
 
     def _worker(self, cfg):
@@ -404,6 +421,11 @@ class DigestFrame(tk.Frame):
             self.app.emit("digest_done", digest)
         except Exception as e:
             self.app.emit("digest_error", str(e))
+        finally:
+            _RUNNING.discard(self.meta['id'])
+
+    def _record_completion(self, index):
+        reading_stats.mark_cached(self.meta, index)
 
     def on_digest_progress(self, p):
         total = max(p["total"], 1)
@@ -411,11 +433,11 @@ class DigestFrame(tk.Frame):
         if p["total"] == 0:
             self.status.config(text="摘要已完整，无需生成")
         else:
-            self.status.config(text=f"生成中… 第 {p['done']}/{p['total']} 批（只请求缺失部分）")
+            self.status.config(text=f"生成中… 第 {p['done']}/{p['total']} 批（只请求缺失部分） · " + self._digest_model)
 
     def on_digest_chars(self, n):
         if n > 0:
-            head = self.status.cget("text").split(" · ")[0]
+            head = self.status.cget("text").split(" · 已接收")[0]
             self.status.config(text=f"{head} · 已接收 {n} 字")
 
     def on_digest_done(self, digest):
@@ -455,6 +477,7 @@ class DigestFrame(tk.Frame):
             self._states = store.load_article_states(self.meta["id"])
             self._reading_history = store.load_reading_history(self.meta["id"])
         self._articles = digest["articles"]
+        self.app.post(self._directory_insights_worker, list(self._articles))
         self._render_recent()
         signatures = {a["index"]: self._article_signature(a) for a in self._articles}
         # 摘要生成后只替换内容改变或已删除的卡片，筛选/搜索不使缓存失效。
@@ -469,16 +492,55 @@ class DigestFrame(tk.Frame):
 
     @staticmethod
     def _article_signature(article):
-        return tuple(article.get(key, "") for key in ("titleEn", "titleZh", "summaryZh", "pageStart", "pageEnd"))
+        return tuple(article.get(key, "") for key in ("titleEn", "titleZh", "summaryZh", "pageStart", "pageEnd")) + (tuple(article.get('tags', [])),)
+
+    def _directory_insights_worker(self, articles):
+        duplicates = article_duplicates.earlier_occurrences(self.meta,
+            [dict(index=a['index'], title=a.get('titleEn', '')) for a in articles])
+        self.app.emit('directory_insights', (duplicates, article_tags.load(self.meta['id'])))
+
+    def on_directory_insights(self, payload):
+        self._earlier, self._tags_by_index = payload
+        for article in self._articles:
+            article['tags'] = self._tags_by_index.get(str(article['index']), [])
+            card = self._card_cache.get(article['index'])
+            if card and card['signature'] != self._article_signature(article):
+                self.canvas.delete(card['item'])
+                card['frame'].destroy()
+                self._card_cache.pop(article['index'])
+                self._cards.pop(article['index'], None)
+                self._mapped_cards.discard(article['index'])
+        values = sorted({tag for a in self._articles for tag in a.get('tags', [])})
+        self.tags_choice.configure(values=['全部标签', *values])
+        if self.tag_filter.get() not in ['全部标签', *values]:
+            self.tag_filter.set('全部标签')
+        self._render(keep_scroll=True)
+
+    def _eligible_articles(self):
+        return [a for a in self._articles if self.show_duplicates.get() or a['index'] not in self._earlier]
+
+    def _edit_tags(self, index):
+        old = self._tags_by_index.get(str(index), [])
+        value = simpledialog.askstring('文章标签', '用中文或英文逗号分隔，最多 8 个标签；留空可清除。',
+            initialvalue='，'.join(old), parent=self)
+        if value is None:
+            return
+        try:
+            article_tags.save(self.meta['id'], index, [v.strip() for v in value.replace('，', ',').split(',') if v.strip()])
+        except ValueError as error:
+            self.status.configure(text=str(error))
+            return
+        self.on_directory_insights((self._earlier, article_tags.load(self.meta['id'])))
 
     def _render(self, keep_scroll=False):
         scroll = self.canvas.yview()[0] if keep_scroll else 0
         self._update_counts()
         query = self.search_var.get().strip().casefold()
-        self._visible_articles = [a for a in self._articles
+        self._visible_articles = [a for a in self._eligible_articles()
                                   if (self._filter == "all" or self._state(a["index"]) == self._filter)
+                                  and (self.tag_filter.get() == '全部标签' or self.tag_filter.get() in a.get('tags', []))
                                   and all(term in " ".join(str(a.get(k, "")) for k in
-                                          ("titleEn", "titleZh", "summaryZh")).casefold()
+                                          ("titleEn", "titleZh", "summaryZh", "tags")).casefold()
                                           for term in query.split())]
         self._update_result_label()
         visible_ids = {a["index"] for a in self._visible_articles}
@@ -508,8 +570,9 @@ class DigestFrame(tk.Frame):
         self._queue_viewport()
 
     def _update_counts(self):
-        self._counts = {s: sum(self._state(a["index"]) == s for a in self._articles) for s in STATES}
-        total = len(self._articles)
+        articles = self._eligible_articles()
+        self._counts = {s: sum(self._state(a["index"]) == s for a in articles) for s in STATES}
+        total = len(articles)
         for key, button in self.filter_buttons.items():
             label = "全部" if key == "all" else STATES[key][0]
             count = total if key == "all" else self._counts[key]
@@ -520,6 +583,7 @@ class DigestFrame(tk.Frame):
     def _update_result_label(self):
         query = self.search_var.get().strip()
         self.result_label.config(text=f"显示 {len(self._visible_articles)} / {len(self._articles)} 篇" +
+                                 (f" · 已隐藏 {len(self._earlier)} 篇早期重复" if self._earlier and not self.show_duplicates.get() else '') +
                                  (f" · 搜索：{query}" if query else ""))
 
     def _show_empty(self):
@@ -564,6 +628,12 @@ class DigestFrame(tk.Frame):
             widget.pack(fill="x", pady=padding)
             widget.bind("<Button-1>", lambda e, i=index: self._open(i))
             text_widgets.append(widget)
+        tags = article.get('tags', [])
+        if tags:
+            widget = tk.Label(card, text='  ·  '.join(tags), bg='white', fg='#56765c', font=(FAMILY,9),
+                anchor='w', justify='left', wraplength=self._content_width-56)
+            widget.pack(fill='x', pady=(0,10))
+            text_widgets.append(widget)
         tk.Frame(card, bg="#edf0ea", height=1).pack(fill="x", pady=(0, 12))
         footer = tk.Frame(card, bg="white")
         footer.pack(fill="x")
@@ -578,6 +648,7 @@ class DigestFrame(tk.Frame):
             buttons[key] = button
         open_button = self._button(footer, "阅读全文  →", lambda i=index: self._open(i), bg=GREEN, fg="white")
         open_button.pack(side="right")
+        self._button(footer, '标签', lambda:self._edit_tags(index), fg=MUTED, padx=8, pady=5).pack(side='right', padx=6)
         item = self.canvas.create_window(0, 0, window=card, anchor="nw",
                                          width=self._content_width, state="hidden")
         result = {"item": item, "y": 0, "height": 1, "frame": card, "badge": badge, "marks": buttons,

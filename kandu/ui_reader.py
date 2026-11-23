@@ -4,6 +4,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+from kandu.ui_reading_tools import ReadingTools
 from kandu import core_parsers as store
 from kandu import core_llm as llm
 from kandu import core_gen as gen
@@ -31,7 +32,7 @@ INK = "#2d3e36"
 MUTED = "#79847c"
 
 
-class ReaderFrame(tk.Frame):
+class ReaderFrame(ReadingTools, tk.Frame):
     def __init__(self, parent, app, meta, article_index):
         super().__init__(parent, bg=PAPER)
         self.app = app
@@ -148,7 +149,7 @@ class ReaderFrame(tk.Frame):
         self._make_find_bar()
 
         self.menu = tk.Menu(self, tearoff=0)
-        self.menu.add_command(label="查词（本地词典）", command=self._menu_lookup)
+        self.menu.add_command(label="查词并收藏（单词 / 2–3 词短语）", command=self._menu_lookup)
         self.menu.add_command(label='加入 / 查看个人生词本', command=self._open_wordbook)
         self.menu.add_separator()
         self.menu.add_command(label="向 AI 提问（引用选中内容 / 当前段落）", command=lambda: self._open_discussion(from_menu=True))
@@ -156,6 +157,7 @@ class ReaderFrame(tk.Frame):
         self.menu.add_command(label="解析选中内容", command=self._analyze_selection)
         self.menu.add_command(label="解析整段", command=self._analyze_whole_paragraph)
 
+        self._init_reading_tools(footer)
         self.app.post(self._load_worker)
 
     @staticmethod
@@ -288,9 +290,11 @@ class ReaderFrame(tk.Frame):
             self.text.tag_raise("reader_find_current")
             self.text.tag_raise("sel")
             if jump:
+                self._reading_navigation()
                 self.text.see(start)
 
     def _find_step(self, delta):
+        self._reading_navigation()
         if not self._find_visible:
             self._show_find()
             if self.find_var.get():
@@ -313,6 +317,7 @@ class ReaderFrame(tk.Frame):
             button.configure(state="normal" if total else "disabled")
 
     def _on_text_scroll(self, first, last):
+        self._reading_tools_scroll()
         self.vbar.set(first, last)
         first, last = float(first), float(last)
         travel = 1 - (last - first)
@@ -353,7 +358,7 @@ class ReaderFrame(tk.Frame):
                 "paragraphStart": self.article["paragraphs"][paragraph][:160] if ranges else "",
                 "paragraphCount": len(self.article["paragraphs"]), "wordCount": self._article_word_count,
                 "progress": 1 if at_end else max(0, min(1, progress)),
-                "atStart": first == 0, "atEnd": at_end}
+                "atStart": first == 0, "atEnd": at_end, "completionMode": "explicit"}
 
     def save_reading_position(self):
         if self._position_after is not None:
@@ -392,10 +397,12 @@ class ReaderFrame(tk.Frame):
         if not restored:
             self.text.yview_moveto(0)
         self._position_ready = True
+        self._reading_tools_loaded()
         self._on_text_scroll(*self.text.yview())
         self.save_reading_position()
 
     def destroy(self):
+        self._close_reading_tools()
         self.save_reading_position()
         self._cancel_find()
         for sequence, binding in self._find_bindings:
@@ -564,6 +571,7 @@ class ReaderFrame(tk.Frame):
         else:
             self.vocab_btn.config(text=f"生词表 {total}")
         self._refresh_status()
+        self._queue_highlights()
 
     def _refresh_status(self):
         if self.vocab_running:
@@ -633,6 +641,12 @@ class ReaderFrame(tk.Frame):
             self.status.config(text=f"⚠ {invalid}（设置里配置）")
             return
         self.vocab_running = True
+        self._vocab_rotation = [dict(p) for p in self.app.settings.get('llms', [])]
+        self._vocab_level = self.app.settings['vocabLevel']
+        self._vocab_model = self._model_label(cfg)
+        self._vocab_models_active = {}
+        self._vocab_done_total = (0, 0)
+        self._vocab_chars = 0
         self._phrases_running = phrases_only
         self._phrase_target = only_para
         self.vocab_btn.config(state="disabled")
@@ -647,28 +661,44 @@ class ReaderFrame(tk.Frame):
         def chars(n):
             self.app.emit("vocab_chars", n)
 
-        rotation = [dict(p) for p in (self.app.settings.get("llms") or [])]
+        def model(key, actual, active):
+            self.app.emit('vocab_model', (key, self._model_label(actual), active))
+
+        rotation = self._vocab_rotation
         try:
             vocab = gen.generate_vocab(
-                self.meta, self.article, self.app.settings["vocabLevel"], cfg,
+                self.meta, self.article, self._vocab_level, cfg,
                 on_progress=progress, on_chars=chars, llm_rotation=rotation,
                 enrich=enrich, phrases_only=phrases_only, only_para=only_para,
+                on_model=model,
             )
             self.app.emit("vocab_done", vocab)
         except Exception as e:
             self.app.emit("vocab_error", str(e))
 
     def on_vocab_progress(self, p):
-        llm = p.get("llm")
-        self.status.config(text=f"{'短语解释' if self._phrases_running else '生词表'}生成中… 已完成 {p['done']}/{p['total']} 块"
-                                + (f" · {llm}" if llm else ""))
+        self._vocab_done_total = (p['done'], p['total'])
+        self._render_vocab_progress()
+
+    def on_vocab_model(self, payload):
+        key, model, active = payload
+        if active:
+            self._vocab_models_active[key] = model
+        else:
+            self._vocab_models_active.pop(key, None)
+        self._render_vocab_progress()
+
+    def _render_vocab_progress(self):
+        done,total = self._vocab_done_total
+        models = '；'.join(dict.fromkeys(self._vocab_models_active.values())) or self._vocab_model
+        self.status.config(text=f"{'短语解释' if self._phrases_running else '生词表'}生成中… 已完成 {done}/{total} 块 · {models}"
+            + (f' · 已接收 {self._vocab_chars:,} 字' if self._vocab_chars else ' · 等待模型响应'))
         self._update_vocab_sheet_progress()
 
     def on_vocab_chars(self, n):
         if n > 0:
-            head = self.status.cget("text").split(" · ")[0]
-            self.status.config(text=f"{head} · 已接收 {n} 字")
-            self._update_vocab_sheet_progress()
+            self._vocab_chars = n
+            self._render_vocab_progress()
 
     def _update_vocab_sheet_progress(self):
         for para, (win, txt, _) in list(self._vocab_sheets.items()):
@@ -764,7 +794,10 @@ class ReaderFrame(tk.Frame):
                 paragraph = position["paragraphIndex"] if position else 0
             if 0 <= paragraph < len(self.article["paragraphs"]):
                 quote = self.article["paragraphs"][paragraph]
-        show_discussion(self.app, self.meta, self.article, quote, paragraph)
+        dialog=show_discussion(self.app, self.meta, self.article, quote, paragraph)
+        if dialog is not None:
+            dialog._reading_owner=self
+            self._track_aid_activity(dialog)
 
     def _para_at(self, index):
         names = self.text.tag_names(index)
@@ -792,11 +825,14 @@ class ReaderFrame(tk.Frame):
         para_text = self.article["paragraphs"][para]
         sent = gen.sentence_at(gen.split_sentences(para_text), local)
         if sent:
-            self._start_analysis(para, sent[2])
+            self._start_analysis(para, sent[2], start=para_text.find(sent[2], sent[0]))
         return "break"
 
     def _on_right_click(self, event):
         self._last_click = self._word_at_click(event)
+        ranges = self.text.tag_ranges('sel')
+        selected = self.text.get(*ranges).strip() if ranges else ''
+        self.menu.entryconfigure(0, state='disabled' if len(selected.split()) > 3 else 'normal')
         try:
             self.menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -853,7 +889,7 @@ class ReaderFrame(tk.Frame):
         sents = gen.split_sentences(self.article["paragraphs"][para])
         return sents
 
-    def _start_analysis(self, para, sentence):
+    def _legacy_start_analysis(self, para, sentence):
         key = sentence
         if key in self.analysis_busy:
             entry = self._sheets.get(key)
@@ -917,7 +953,7 @@ class ReaderFrame(tk.Frame):
             progress["label"].configure(text=text)
 
     # ---------- 本地查词（不依赖 LLM） ----------
-    def _lookup_selection(self, para, offset):
+    def _legacy_lookup_selection(self, para, offset):
         """右键「查词」：优先取选中文本，否则取点击位置的单词。"""
         word = ""
         rng = self.text.tag_ranges("sel")
@@ -985,7 +1021,7 @@ class ReaderFrame(tk.Frame):
 
     def _word_source(self, para):
         text = self.article['paragraphs'][para] if isinstance(para, int) and 0 <= para < len(self.article['paragraphs']) else self.article['title']
-        return dict(bookId=self.meta['id'], bookTitle=self.meta['fileName'], articleIndex=self.article_index,
+        return dict(bookId=self.meta['id'], bookTitle=self.meta.get('publication') or self.meta['fileName'], articleIndex=self.article_index,
                     articleTitle=self.article['title'], paragraph=para if isinstance(para, int) else -1, context=text[:800])
 
     def _open_wordbook(self, query=''):
@@ -1037,7 +1073,7 @@ class ReaderFrame(tk.Frame):
                 continue
             pending = gen.phrase_pending(self.vocab, self.article, para)
             win._phrase_button.configure(text='补充短语解释' if pending else '短语已检查',
-                                         state='normal' if pending and not self.vocab_running else 'disabled')
+                                         state='disabled' if self.vocab_running else 'normal')
             win._generate_button.configure(state='disabled' if self.vocab_running else 'normal')
 
     def _analysis_worker(self, cfg, para, sentence, key):
@@ -1158,7 +1194,10 @@ class ReaderFrame(tk.Frame):
 
     # ---------- 公共弹层 ----------
     def _make_sheet(self, title, subtitle):
-        return make_vocabulary_sheet(self, self.app, title, subtitle)
+        sheet = make_vocabulary_sheet(self, self.app, title, subtitle)
+        if hasattr(self, '_track_aid_activity'):
+            self._track_aid_activity(sheet[0])
+        return sheet
 
 
 

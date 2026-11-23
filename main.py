@@ -28,6 +28,7 @@ class App(tk.Tk):
         cfgmod.ensure_wordlists()
         self.settings = cfgmod.load_settings()
         self.q = queue.Queue()
+        self._worker_context = threading.local()
         self.current = None
         self._erroring = False
         self.index_state = {"running": False, "done": 0, "total": 0,
@@ -40,8 +41,9 @@ class App(tk.Tk):
         self.container.pack(fill="both", expand=True)
         # 滚轮统一路由：各页面实现 on_wheel 即可，销毁无需解绑
         self.bind_all("<MouseWheel>", self._route_wheel)
-        self.after(80, self._poll)
+        self._poll_after = self.after(80, self._poll)
         self.show_library()
+        self.protocol('WM_DELETE_WINDOW', self._close)
 
     def start_indexing(self):
         """后台为书库全部书籍建立内容索引与封面（可随时查看进度）。"""
@@ -131,22 +133,34 @@ class App(tk.Tk):
     # ---- 线程：worker 在后台跑，事件经队列回 UI 线程 ----
     def post(self, fn, *args):
         def run():
+            owner = getattr(fn, '__self__', None)
+            self._worker_context.owner = owner if isinstance(owner, tk.Widget) else None
             try:
                 fn(*args)
             except Exception as e:
-                self.q.put(("error", str(e)))
+                self.emit('error', str(e))
         threading.Thread(target=run, daemon=True).start()
 
     def emit(self, kind, payload=None):
-        self.q.put((kind, payload))
+        owner = getattr(self._worker_context, 'owner', None)
+        if owner is not None and owner is not self and kind != 'wordbook_changed':
+            self.q.put(('target', (owner, kind, payload)))
+        else:
+            self.q.put((kind, payload))
 
     def _poll(self):
+        self.after_cancel(self._poll_after)
         try:
             while True:
                 try:
                     kind, payload = self.q.get_nowait()
                 except queue.Empty:
                     break
+                target = self.current
+                if kind == 'target':
+                    target, kind, payload = payload
+                    if not target.winfo_exists():
+                        continue
                 if kind == "error":
                     if not self._erroring:
                         self._erroring = True
@@ -164,7 +178,7 @@ class App(tk.Tk):
                     except Exception as e:
                         self._handle_handler_error(e)
                     continue
-                handler = getattr(self.current, f"on_{kind}", None)
+                handler = getattr(target, f"on_{kind}", None)
                 if handler:
                     try:
                         handler(payload)
@@ -172,7 +186,11 @@ class App(tk.Tk):
                         # 异常必须被隔离：否则 after 链中断，界面永久假死
                         self._handle_handler_error(e)
         finally:
-            self.after(80, self._poll)
+            self._poll_after = self.after(80, self._poll)
+
+    def destroy(self):
+        self.after_cancel(self._poll_after)
+        super().destroy()
 
     # ---- 导航 ----
     def _swap(self, frame):
@@ -222,6 +240,9 @@ class App(tk.Tk):
         SettingsDialog(self, on_saved=on_saved)
 
     def open_digest(self, meta):
+        if meta.get('sourceType') == 'podcast':
+            from kandu import podcast_library
+            meta = podcast_library.metadata(podcast_library.parent_id(meta) or '') or meta
         # 先落盘再构建摘要页，确保顶部最近阅读显示刚刚离开的文章与最新位置。
         save_position = getattr(self.current, "save_reading_position", None)
         if save_position is not None:
@@ -231,10 +252,20 @@ class App(tk.Tk):
         rec.insert(0, meta["id"])
         self.settings["recentBooks"] = rec[:12]
         self.save_settings()
-        self._swap(DigestFrame(self.container, self, meta))
+        if meta.get('sourceType') == 'podcast-series':
+            from kandu.ui_podcasts import PodcastSeriesFrame
+            self._swap(PodcastSeriesFrame(self.container, self, meta))
+        else:
+            self._swap(DigestFrame(self.container, self, meta))
 
     def open_reader(self, meta, article_index):
         self._swap(ReaderFrame(self.container, self, meta, article_index))
+
+    def _close(self):
+        if self.current is not None:
+            self.current.destroy()
+            self.current = None
+        self.destroy()
 
 
 def main():

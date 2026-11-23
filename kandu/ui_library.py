@@ -9,6 +9,8 @@ from PIL import Image, ImageTk
 from kandu import core_config as cfgmod
 from kandu import core_parsers as store
 from kandu.ui_recent import show_recent
+from kandu import article_duplicates, podcast_library
+from kandu.ui_statistics import show_statistics
 
 FAMILY = "Microsoft YaHei UI"
 THUMB_W, THUMB_H = 126, 166
@@ -21,6 +23,8 @@ WHITE = "#fffdf8"
 
 def publication(meta):
     """按刊名归类；文件名的日期与格式不影响分类。"""
+    if meta.get('publication'):
+        return meta['publication']
     name = re.sub(r"[^a-z0-9\u3400-\u9fff]", "", meta["fileName"].casefold())
     for needles, label in ((("economist", "经济学人"), "The Economist · 经济学人"),
                            (("wired", "连线"), "Wired · 连线"),
@@ -36,6 +40,7 @@ class LibraryFrame(tk.Frame):
         super().__init__(parent, bg=PAPER)
         self.app = app
         self.metas = store.load_library()
+        self.metas = self._group_podcasts(self.metas)
         self._photo_cache = {}
         self._importing = False
         self._cards = {}
@@ -62,6 +67,7 @@ class LibraryFrame(tk.Frame):
         tk.Label(bar, text="刊读", bg=GREEN, fg="white", font=(FAMILY, 15, "bold")).pack(side="left")
         tk.Label(bar, text="ENGLISH READING", bg=GREEN, fg="#bdd0c5", font=(FAMILY, 8)).pack(side="left", padx=16)
         self._button(bar, "设置", self.app.open_settings, bg=GREEN, fg="#e0eae2").pack(side="right")
+        self._button(bar, '阅读统计', lambda:show_statistics(self.app), bg=GREEN, fg='#e0eae2').pack(side='right', padx=6)
         from kandu.ui_wordbook import show_wordbook
         self._button(bar, '个人生词本', lambda: show_wordbook(self.app), bg=GREEN, fg='#e0eae2').pack(side='right', padx=10)
         self._button(bar, "从文件夹导入", self.import_folder, bg=GREEN, fg="#e0eae2").pack(side="right", padx=12)
@@ -76,6 +82,7 @@ class LibraryFrame(tk.Frame):
         self.digest_btn.pack(side="right")
         self.index_btn = self._button(heading, "建立索引", self.app.start_indexing)
         self.index_btn.pack(side="right", padx=(0, 8))
+        self._button(heading, '导入播客', self._import_podcast).pack(side='right', padx=(0,8))
 
         controls = tk.Frame(self, bg=PAPER, padx=28, pady=2)
         controls.pack(fill="x")
@@ -304,6 +311,7 @@ class LibraryFrame(tk.Frame):
     # ---------- 渲染 ----------
     def _render(self):
         """仅书库数据变化时刷新；筛选、排序和缩放窗口复用已有卡片与封面。"""
+        self.metas = self._group_podcasts(self.metas)
         by_id = {m["id"]: m for m in self.metas}
         for book_id in set(self._cards) - by_id.keys():
             self._cards.pop(book_id)["frame"].destroy()
@@ -332,6 +340,47 @@ class LibraryFrame(tk.Frame):
         self._render_recent(by_id)
         self._apply_filters()
         self._repair_missing_covers()
+        self.app.post(self._counts_worker)
+
+    @staticmethod
+    def _group_podcasts(metas):
+        entries = [m for m in metas if m.get('sourceType') != 'podcast-series']
+        # Refresh actual episode metadata from disk, keeping all other imports.
+        episodes = [m for m in store.load_library() if m.get('sourceType') == 'podcast']
+        known = {m['id'] for m in entries}
+        entries.extend(m for m in episodes if m['id'] not in known)
+        result = [m for m in entries if not podcast_library.source_id(m)]
+        for source_id in sorted({m['sourceId'] for m in entries if podcast_library.source_id(m)}):
+            grouped = podcast_library.metadata(podcast_library.PREFIX+source_id, entries)
+            if grouped:
+                first = podcast_library.episodes(source_id, entries)[0]
+                result.append(dict(grouped, path=first['path'], size=first['size'], lastModified=first.get('lastModified',0)))
+        return result
+
+    def _import_podcast(self):
+        from kandu.ui_podcasts import show_import
+        show_import(self.app)
+
+    def _counts_worker(self):
+        library = store.load_library()
+        digests = {m['id']:store.load_digest(m['id']) or {} for m in library}
+        counts = article_duplicates.library_counts(library, digests)
+        for meta in self.metas:
+            if meta.get('sourceType') == 'podcast-series':
+                entries = podcast_library.episodes(meta['sourceId'], library)
+                counts[meta['id']] = podcast_library.card(meta, entries, digests)
+        self.app.emit('library_counts', counts)
+
+    def on_library_counts(self, counts):
+        for book_id, value in counts.items():
+            entry = self._cards.get(book_id)
+            if entry and value.get('articleCountKnown'):
+                entry['state'].configure(text=f"{value['articleCount']} 篇 · 未读 {value['unreadCount']} 篇",
+                    fg=GREEN if value['unreadCount'] else MUTED)
+
+    def on_podcast_imported(self, payload=None):
+        self.metas = store.load_library()
+        self._render()
 
     def _repair_missing_covers(self, metas=None, retry=False):
         """提取只在后台运行；文件缺失时不阻塞首页，也不在滚动时反复重试。"""
@@ -353,7 +402,11 @@ class LibraryFrame(tk.Frame):
         results = {}
         for meta in metas:
             try:
-                results[meta["id"]] = bool(store.ensure_cover(meta))
+                if meta.get('sourceType') == 'podcast-series':
+                    from kandu import podcast_covers, podcasts
+                    results[meta['id']] = bool(podcast_covers.ensure_series_cover(podcasts.source(meta['sourceId'])))
+                else:
+                    results[meta["id"]] = bool(store.ensure_cover(meta))
             except Exception:
                 results[meta["id"]] = False
         self.app.emit("covers_ready", results)
@@ -369,7 +422,7 @@ class LibraryFrame(tk.Frame):
 
     @staticmethod
     def _book_title(meta):
-        return os.path.splitext(meta["fileName"])[0].replace("_", " ")
+        return meta.get('title') or os.path.splitext(meta["fileName"])[0].replace("_", " ")
 
     def _make_card(self, meta):
         card = tk.Frame(self.shelf, bg=WHITE, width=186, height=264,
@@ -613,9 +666,12 @@ class LibraryFrame(tk.Frame):
         self._card_popup = menu
         menu.add_command(label="打开", command=lambda: self.app.open_digest(meta))
         menu.add_command(label="补取缺失封面", command=lambda: self._repair_missing_covers([meta], retry=True))
-        menu.add_command(label="清除本书摘要", command=lambda: self._purge_one(meta, digest_only=True))
-        menu.add_separator()
-        menu.add_command(label="移出书库（删除文件与缓存）", command=lambda: self._remove_book(meta))
+        if meta.get('sourceType') == 'podcast-series':
+            menu.add_command(label='导入 / 补缺节目', command=self._import_podcast)
+        else:
+            menu.add_command(label="清除本书摘要", command=lambda: self._purge_one(meta, digest_only=True))
+            menu.add_separator()
+            menu.add_command(label="移出书库（删除文件与缓存）", command=lambda: self._remove_book(meta))
         try:
             menu.tk_popup(x, y)
         finally:
@@ -695,3 +751,4 @@ class LibraryFrame(tk.Frame):
                 entry["loaded"] = False
         self.overview.configure(text=f"{len(self.metas)} 本刊物  ·  {len(self._digest_ids)} 本有摘要")
         self._queue_thumbs()
+        self.app.post(self._counts_worker)

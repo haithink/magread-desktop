@@ -5,12 +5,41 @@ from pathlib import Path
 import pymupdf
 
 PARSER_VERSION = 2
+PARAGRAPH_VERSION = 1
 _NAV = re.compile(r"^\|?\s*(?:(?:Next|Previous|Section menu|Main menu)\s*\|\s*)+(?:Next|Previous|Section menu|Main menu)?\s*\|?$", re.I)
 _WATERMARK = re.compile(r"zlibrary|this (?:article|file) was downloaded by|中商海外高资", re.I)
 
 
 def _text(value):
     return " ".join(value.replace("\u00ad", "").split())
+
+
+def _continues(previous, current):
+    """Only join body text spilling across consecutive pages, never article boundaries."""
+    if not previous or current['page'] != previous['page'] + 1:
+        return False
+    a, b = previous, current
+    # A complete sentence, heading, list, indent or short last line is evidence
+    # for a real paragraph break. Prefer leaving an ambiguous break intact.
+    if re.search(r'[.!?…:][\s\)\]”’"\']*$', a['text']):
+        return False
+    if re.match(r'(?:[•●▪*]|\d+[.)])\s', b['text']):
+        return False
+    return (a['bottom'] >= a['height'] * .80 and b['top'] <= b['height'] * .20
+            and a['lines'] >= 2 and abs(a['size'] - b['size']) <= .5 and a['font'] == b['font']
+            and abs(a['left'] - b['left']) <= max(3, a['size'] * .3)
+            and a['lastWidth'] >= a['width'] * .80)
+
+
+def _layout(page, block, text):
+    lines = block['lines']
+    first = lines[0]
+    return dict(text=text, page=page.number, height=page.rect.height,
+                top=block['bbox'][1], bottom=block['bbox'][3], left=first['bbox'][0],
+                width=block['bbox'][2] - block['bbox'][0], lines=len(lines),
+                size=first['spans'][0]['size'],
+                font=first['spans'][0]['font'],
+                lastWidth=lines[-1]['bbox'][2] - lines[-1]['bbox'][0])
 
 
 def _outline_starts(doc):
@@ -82,35 +111,46 @@ def parse(file_path):
         for i, start in enumerate(starts):
             end = starts[i + 1] if i + 1 < len(starts) else {"page": len(doc), "y": 0}
             paragraphs, paragraph_pages = [], []
+            previous = None
             for page_no in range(start["page"], min(end["page"] + 1, len(doc))):
                 lower = start["y"] if page_no == start["page"] else 0
                 upper = end["y"] if page_no == end["page"] else float("inf")
                 if upper <= lower:
                     continue
                 if page_no not in page_blocks:
-                    page_blocks[page_no] = doc[page_no].get_text("blocks")
+                    # Article starts are ordered; only the shared boundary page
+                    # can be needed again. Do not retain every page's font spans.
+                    page_blocks.clear()
+                    page_blocks[page_no] = doc[page_no].get_text(
+                        "dict", flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)['blocks']
                 for block in page_blocks[page_no]:
-                    if block[6] != 0:
+                    if block['type'] != 0 or not block.get('lines'):
                         continue
+                    box = block['bbox']
                     # 按行判断同页边界，跨越目录锚点的文本块也不会串篇。
-                    if block[3] <= lower or block[1] >= upper:
+                    if box[3] <= lower or box[1] >= upper:
                         continue
-                    if block[1] < lower - 2 or block[3] > upper + 2:
-                        text = doc[page_no].get_textbox(pymupdf.Rect(block[0], max(block[1], lower),
-                                                                   block[2], min(block[3], upper)))
+                    if box[1] < lower - 2 or box[3] > upper + 2:
+                        text = doc[page_no].get_textbox(pymupdf.Rect(box[0], max(box[1], lower),
+                                                                   box[2], min(box[3], upper)))
                     else:
-                        text = block[4]
+                        text = '\n'.join(''.join(s['text'] for s in line['spans']) for line in block['lines'])
                     text = _text(text)
                     if not text or _NAV.fullmatch(text) or _WATERMARK.search(text):
                         continue
                     if text.casefold() == start["title"].casefold():
                         continue
-                    paragraphs.append(text)
-                    paragraph_pages.append(page_no + 1)
+                    layout = _layout(doc[page_no], block, text)
+                    if _continues(previous, layout):
+                        paragraphs[-1] += ' ' + text
+                    else:
+                        paragraphs.append(text)
+                        paragraph_pages.append(page_no + 1)
+                    previous = layout
             if not paragraphs:
                 continue
             articles.append({"index": len(articles), "title": start["title"], "paragraphs": paragraphs,
-                             "pageStart": start["page"] + 1, "pageEnd": paragraph_pages[-1],
+                             "pageStart": start["page"] + 1, "pageEnd": previous['page'] + 1,
                              "paragraphPages": paragraph_pages, "pdfSplitMethod": method})
         if not articles:
             raise ValueError("PDF 未提取到可阅读文字，可能是扫描件，需要先进行 OCR 文字识别。")

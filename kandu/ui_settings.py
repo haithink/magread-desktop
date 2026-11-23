@@ -170,12 +170,12 @@ class LlmProfileDialog(tk.Toplevel):
         self.app = parent.app if hasattr(parent, "app") else parent
         self.on_save = on_save
         self.title("编辑 LLM 配置" if initial else "新增 LLM 配置")
-        self.geometry("640x660")
+        self.geometry("680x760")
         self.transient(parent)
         self.grab_set()
 
         self.q = queue.Queue()
-        self.after(80, self._poll)
+        self._poll_after = self.after(80, self._poll)
 
         s = self.app.settings
         box = ttk.Frame(self, padding=14)
@@ -209,6 +209,21 @@ class LlmProfileDialog(tk.Toplevel):
         self.base_url = field_row("API 地址 Base URL", "baseUrl")
         self.api_key = field_row("API Key", "apiKey")
         self.model = field_row("模型名 Model", "model")
+
+        self.thinking_labels = {
+            'auto': '默认（沿用各任务原有设置）', 'disabled': '关闭思考',
+            'low': '低', 'medium': '中', 'high': '高',
+        }
+        self.thinking = tk.StringVar(value=self.thinking_labels.get(
+            (initial or {}).get('thinkingLevel', 'auto'), self.thinking_labels['auto']))
+        g(ttk.Label(box, text='思考强度'), r, 0, sticky='w', pady=(8, 0))
+        g(ttk.Combobox(box, textvariable=self.thinking,
+            values=list(self.thinking_labels.values()), state='readonly'), r, pady=(8, 0))
+        r += 1
+        g(ttk.Label(box, text='默认保留原行为：DeepSeek 常规查词、生词和句解关闭思考；深入复核开启中等思考。\n'
+            '其他模型沿用接口默认。手动选择会覆盖任务默认；支持程度由模型接口决定，强度越高通常越慢。',
+            wraplength=500, foreground='#738079'), r, sticky='w', pady=(4, 0))
+        r += 1
 
         g(ttk.Label(box, text="从 cc-switch JSON 粘贴："), r, 0, sticky="nw", pady=(12, 0))
         paste_frame = ttk.Frame(box)
@@ -248,6 +263,7 @@ class LlmProfileDialog(tk.Toplevel):
             "baseUrl": self.base_url.get().strip(),
             "apiKey": self.api_key.get().strip(),
             "model": self.model.get().strip(),
+            "thinkingLevel": next(k for k, label in self.thinking_labels.items() if label == self.thinking.get()),
         }
 
     def _test(self):
@@ -314,7 +330,11 @@ class LlmProfileDialog(tk.Toplevel):
                 self._show_models(payload)
             elif kind == "models_err":
                 self.test_label.config(text=f"获取模型列表失败：{payload}", foreground="#b00")
-        self.after(80, self._poll)
+        self._poll_after = self.after(80, self._poll)
+
+    def destroy(self):
+        self.after_cancel(self._poll_after)
+        super().destroy()
 
     def _save(self):
         cfg = self._current_cfg()

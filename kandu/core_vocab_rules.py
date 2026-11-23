@@ -48,3 +48,30 @@ def contextual_words(text):
     text = normalize_apostrophes(text)
     return {word: {"translation": sense, "pos": pos, "senseSource": "context_rule"}
             for word, pattern, pos, sense in _CONTEXT_RULES if pattern.search(text)}
+
+
+# 这里只列有明确边界的固定表达；不是把相邻的常用词拼成候选。
+# 释义用于模型漏项时兜底，展示时标记为本地提示，仍允许模型按本文改写。
+_PHRASE_RULES = (
+    ("paper over", r"paper(?:s|ed|ing)?\s+over", "掩盖、粉饰（问题等），并未真正解决；也可指用纸覆盖"),
+    ("gloss over", r"gloss(?:es|ed|ing)?\s+over", "对问题轻描淡写、敷衍带过"),
+    ("boil down to", r"boil(?:s|ed|ing)?\s+down\s+to", "归根结底是；可归结为"),
+    ("fall short of", r"(?:fall(?:s|ing)?|fell|fallen)\s+short\s+of", "未达到（预期、要求或目标）"),
+    ("in light of", r"in\s+(?:the\s+)?light\s+of", "鉴于、考虑到（某种情况）"),
+    ("at odds with", r"at\s+odds\s+with", "与……不一致、相冲突"),
+    ("in the wake of", r"in\s+the\s+wake\s+of", "随着……而来；在……之后（常指后果）"),
+    ("on the brink of", r"on\s+the\s+brink\s+of", "濒临；即将发生（某种变化）"),
+)
+_PHRASE_PATTERNS = [(lemma, re.compile(r"(?<![\w'-])" + pattern + r"(?![\w'-])", re.I), sense)
+                    for lemma, pattern, sense in _PHRASE_RULES]
+
+
+def phrase_candidates(text):
+    """保留原文连续片段和词形，不受读者已知单词表影响。"""
+    text = normalize_apostrophes(text)
+    result = {}
+    for lemma, pattern, sense in _PHRASE_PATTERNS:
+        for match in pattern.finditer(text):
+            word = re.sub(r"\s+", " ", match.group()).lower()
+            result[word] = dict(lemma=lemma, translation=sense, pos="phr.", senseSource="phrase_rule")
+    return result

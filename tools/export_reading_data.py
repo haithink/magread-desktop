@@ -13,7 +13,7 @@ import zipfile
 
 
 SAFE_SETTINGS = ('vocabLevel', 'levelChosen', 'readerFontSize', 'sheetFontSize', 'recentBooks')
-DATA_FOLDERS = ('cache', 'covers', 'reading_history', 'article_states', 'discussions', 'vocab')
+DATA_FOLDERS = ('cache', 'covers', 'reading_history', 'article_states', 'discussions', 'vocab', 'article_tags', 'podcasts')
 
 
 def export_data(source, output, on_progress=print):
@@ -41,7 +41,9 @@ def export_data(source, output, on_progress=print):
             raise ValueError(f'Book changed since import: {book}')
         relative = f'books/{bid}.{ext}'
         books.append((book, relative))
-        entries.append({**{k: entry[k] for k in ('id', 'fileName', 'ext', 'size', 'lastModified', 'addedAt') if k in entry},
+        entries.append({**{k: entry[k] for k in ('id', 'fileName', 'ext', 'size', 'lastModified', 'addedAt',
+                        'title', 'publication', 'sourceType', 'sourceId', 'sourceUrl', 'episodeNumber',
+                        'publishedAt', 'guest') if k in entry},
                         'path': relative})
 
     safe = {k: settings[k] for k in SAFE_SETTINGS if k in settings}
@@ -95,8 +97,12 @@ def export_data(source, output, on_progress=print):
                         if file.is_symlink() or not file.resolve().is_relative_to(root.resolve()):
                             raise ValueError(f'Linked data file is unsupported: {file}')
                         add(file.relative_to(source).as_posix(), file=file)
-            database = source / 'wordbook.sqlite3'
-            if database.exists():
+            stats = source / 'reading-stats.json'
+            if stats.exists():
+                add(stats.name, file=stats)
+            for database in (source / name for name in ('wordbook.sqlite3', 'reading-activity.sqlite3')):
+                if not database.exists():
+                    continue
                 # SQLite backup includes committed WAL changes even if the reader is open.
                 with tempfile.TemporaryDirectory(prefix='kandu-wordbook-') as staging:
                     snapshot = Path(staging) / database.name
@@ -116,7 +122,7 @@ def export_data(source, output, on_progress=print):
                 '1. 在新电脑完整解压此压缩包（不要在压缩软件里直接运行）。\r\n'
                 '2. 关闭新电脑上正在运行的刊读，双击 Restore-ReadingData.cmd。\r\n'
                 '3. 看到 RESTORE COMPLETE 后，打开刊读 v0.8.18 或更新版本。无需重新导入刊物。\r\n\r\n'
-                '包含：原刊文件、摘要、生词、句解、封面、阅读记录、文章标记、个人生词本、AI 讨论。\r\n'
+                '包含：原刊文件、摘要、生词、句解、封面、阅读记录、文章标记、个人生词本、AI 讨论、阅读统计、文章标签和播客元数据。\r\n'
                 '恢复会自动修正刊物路径，保留原书籍 ID，使已有生成结果继续生效。\r\n'
                 '目标电脑原数据目录会先改名备份，再恢复本包的整个书库；此操作不是两份书库的合并。\r\n'
                 '目标电脑已配置的 LLM 保留；包内不带源电脑的 API 密钥，首次使用需自行配置。\r\n'

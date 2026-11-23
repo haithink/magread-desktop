@@ -54,8 +54,11 @@ def list_words(query=''):
     with connection() as db:
         rows = [_record(r) for r in db.execute('SELECT * FROM words ORDER BY updated_at DESC, word')]
     query = str(query).strip().casefold()
-    return [r for r in rows if not query or query in '\n'.join(
-        [r['word'], r['sense'], r['note'], *r['aliases']]).casefold()]
+    def searchable(record):
+        source = record['source'] if isinstance(record['source'], dict) else {}
+        return '\n'.join([record['word'], record['sense'], record['note'], *record['aliases'],
+            *[str(source.get(field) or '') for field in ('bookTitle', 'articleTitle', 'context')]]).casefold()
+    return [r for r in rows if not query or query in searchable(r)]
 
 
 def save(value, original=None):
@@ -117,6 +120,22 @@ def delete(word):
         return db.execute('DELETE FROM words WHERE word=?', (normalize(word),)).rowcount > 0
 
 
+def attach_context(word, meaning, source):
+    """Save an occurrence's explanation without overwriting edits or reviving deleted words."""
+    with connection() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT * FROM words WHERE word=?', (normalize(word),)).fetchone()
+        if row is None:
+            return None
+        record = _record(row)
+        # A different lookup or edit may have occurred while the model ran.
+        if record['source'] != source:
+            return record
+        record['source'] = dict(source, contextMeaning=meaning)
+        _write(db, record)
+    return get(word)
+
+
 def remember_entry(entry, source):
     """收藏生成的词条或短语；保留本文义，不请求词典或模型，不覆盖个人编辑。"""
     raw = normalize(entry.get('word'))
@@ -129,7 +148,7 @@ def remember_entry(entry, source):
         for field in ('phonetic', 'pos', 'sense', 'root', 'note'):
             r[field] = r.get(field) or str(entry.get(field) or '').strip()[:12000]
         r['aliases'] = list(dict.fromkeys([*r['aliases'], raw]))
-        _write(db, dict(r, updated_at=now))
+        _write(db, dict(r, source=source, updated_at=now))
     return get(key)
 
 

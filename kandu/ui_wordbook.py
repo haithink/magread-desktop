@@ -217,7 +217,9 @@ class WordbookWindow(tk.Toplevel):
         source = self._source_data
         info = ' · '.join(filter(None, [source.get('bookTitle'), source.get('articleTitle'),
                               f"第 {source['paragraph'] + 1} 段" if source.get('paragraph', -1) >= 0 else '']))
-        self.source.configure(text=('最近来源：' + info + '\n' + source.get('context', ''))[:350] if info else '手动收录 · 可填写释义和自己的学习笔记')
+        meaning = source.get('contextMeaning') or {}
+        detail = ('\n本文义：' + meaning['sense']) if meaning.get('sense') else ''
+        self.source.configure(text=('最近来源：' + info + detail + '\n' + source.get('context', ''))[:500] if info else '手动收录 · 可填写释义和自己的学习笔记')
         self._loading = self._dirty = False
         self.status.configure(text='词条已载入，可修改后保存。' if original else '填写英文单词和释义，然后保存。')
 

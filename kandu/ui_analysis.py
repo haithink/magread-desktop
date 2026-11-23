@@ -125,16 +125,9 @@ def make_sheet(parent, app, subtitle):
     vertical.grid(row=0, column=1, sticky="ns")
     horizontal = ttk.Scrollbar(page, orient="horizontal", command=txt.xview)
     horizontal.grid(row=1, column=0, sticky="ew")
-    horizontal.grid_remove()
-
-    def horizontal_range(first, last):
-        horizontal.set(first, last)
-        if float(first) > 0 or float(last) < .999:
-            horizontal.grid()
-        else:
-            horizontal.grid_remove()
-
-    txt.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal_range)
+    # Tk calculates xview from visible lines. Showing/hiding the bar changes
+    # those lines and can oscillate forever when a wide diagram is at the edge.
+    txt.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
     txt._analysis_nav = {}
     txt._analysis_source = ""
     txt._analysis_size = int(app.settings.get("sheetFontSize", 11))
@@ -228,6 +221,12 @@ def render_analysis(txt, analysis, sentence=None):
         txt.insert("end", sentence.strip() + "\n", "source")
     if analysis.get("partial"):
         txt.insert("end", "本次讲解尚不完整，关闭窗口后可重新双击此句重试。\n", "warn")
+    if analysis.get("context"):
+        _section(txt, "context", "03  /  放回上下文")
+        txt.insert("end", analysis["context"] + "\n", "body")
+    if analysis.get("translation"):
+        _section(txt, "translation", "04  /  参考译文")
+        txt.insert("end", analysis["translation"] + "\n", "translation")
     vocab = analysis.get("vocab") or []
     if vocab:
         _section(txt, "vocab", "01  /  疑难词汇")
@@ -261,12 +260,6 @@ def render_analysis(txt, analysis, sentence=None):
             txt.insert("end", f"{i:02d}   {point.get('title', '')}\n", "point")
             if point.get("text"):
                 txt.insert("end", point["text"] + "\n", "body")
-    if analysis.get("context"):
-        _section(txt, "context", "03  /  放回上下文")
-        txt.insert("end", analysis["context"] + "\n", "body")
-    if analysis.get("translation"):
-        _section(txt, "translation", "04  /  参考译文")
-        txt.insert("end", analysis["translation"] + "\n", "translation")
     stats = analysis.get("generationStats") or {}
     if stats.get("elapsedMs") is not None:
         txt.insert("end", f"\n生成耗时 {stats['elapsedMs'] / 1000:.1f} 秒\n", "meta")

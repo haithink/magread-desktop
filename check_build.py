@@ -1,17 +1,24 @@
-# -*- coding: utf-8 -*-
-"""构建后自检：exe 存在、mtime 在本轮构建之后、内嵌版本与 __version__ 一致。"""
-import sys, time
+"""Verify a fresh Windows artifact and its actual PE version resource."""
 from pathlib import Path
-
-sys.path.insert(0, '.')
+import time
+import pefile
 from kandu import __version__
 
-exe = Path('dist/Kandu/Kandu.exe')
-if not exe.exists():
-    print('FAIL: exe 不存在')
-    sys.exit(1)
-age = time.time() - exe.stat().st_mtime
-if age > 300:
-    print(f'FAIL: exe 是 {int(age/60)} 分钟前的旧文件（可能被运行中的进程锁定，构建静默失败）')
-    sys.exit(1)
-print(f'OK: dist/Kandu/Kandu.exe 已更新，版本 v{__version__}')
+
+def check(exe=Path('dist/Kandu/Kandu.exe')):
+    if not exe.is_file():
+        raise RuntimeError('Executable missing')
+    if time.time() - exe.stat().st_mtime > 300:
+        raise RuntimeError('Executable was not updated by this build')
+    expected=tuple(map(int,__version__.split('.'))) + (0,)
+    with pefile.PE(str(exe),fast_load=True) as pe:
+        pe.parse_data_directories([pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
+        info=pe.VS_FIXEDFILEINFO[0]
+        actual=(info.FileVersionMS>>16,info.FileVersionMS&65535,info.FileVersionLS>>16,info.FileVersionLS&65535)
+        if actual != expected:
+            raise RuntimeError(f'PE version mismatch: {actual} != {expected}')
+    print(f'OK: {exe} v{__version__}, PE version verified')
+
+
+if __name__=='__main__':
+    check()

@@ -8,7 +8,7 @@ from . import core_config as cfgmod
 from . import core_llm as llm
 from . import core_prompts as prompts
 from . import core_parsers as store
-from .core_vocab_rules import contextual_words, is_basic_contraction, normalize_apostrophes
+from .core_vocab_rules import contextual_words, is_basic_contraction, normalize_apostrophes, phrase_candidates
 
 LEVEL_LABEL = {"cet4": "大学英语四级 CET-4", "cet6": "大学英语六级 CET-6", "toefl": "托福词汇 TOEFL", "gre": " GRE 词汇"}
 
@@ -159,6 +159,7 @@ def candidates(paragraph_texts, dict_set, lexicon=None):
 
 
 VOCAB_COVERAGE_VERSION = 2
+PHRASE_COVERAGE_VERSION = 1
 
 
 def _vocab_lexicon(units):
@@ -246,11 +247,51 @@ def vocab_context_pending(vocab):
         bool(entry.get("contextPending")) for section in vocab.get("paragraphs", []) for entry in section["entries"])
 
 
+def _backfill_phrase_section(section, text, required):
+    section = dict(section, entries=[dict(entry) for entry in section.get("entries", [])])
+    for word, hit in required.items():
+        # 模型可能返回原形；不再重复添加 papered over / paper over 两条。
+        if any(_norm_text(entry["word"]) in {word, hit["lemma"]} for entry in section["entries"]):
+            continue
+        section["entries"].append(dict(word=word, phonetic="", pos="phr.", sense=hit["translation"],
+            root="", term=False, inText=_vocab_context(word, text, {}),
+            senseSource="phrase_rule", contextPending=True))
+    return section
+
+
+def audit_phrase_coverage(vocab, article):
+    """纯本地补齐已生成段落的明确短语；读取旧词表不建词典、不调用模型、不写缓存。"""
+    result = vocab_normalize(vocab, article)
+    checked = set(result.get("phraseProcessedParagraphs", [])) if (
+        result.get("phraseCoverageVersion") == PHRASE_COVERAGE_VERSION) else set()
+    processed = set(result.get("processedParagraphs", [])) | checked
+    sections = {p["index"]: p for p in result.get("paragraphs", [])}
+    result = dict(result)
+    for idx, text in [(-1, article["title"]), *enumerate(article["paragraphs"])]:
+        if idx not in processed:
+            continue
+        required = phrase_candidates(text)
+        if not required:
+            continue
+        section = ({"index": -1, "entries": result.get("titleEntries", [])} if idx == -1 else
+                   sections.get(idx, {"index": idx, "startWords": text[:30], "entries": []}))
+        section = _backfill_phrase_section(section, text, required)
+        if any(is_phrase(entry) and entry.get("contextPending") for entry in section["entries"]):
+            checked.discard(idx)
+        if idx == -1:
+            result["titleEntries"] = section["entries"]
+        else:
+            sections[idx] = section
+    result.update(paragraphs=sorted(sections.values(), key=lambda p: p["index"]),
+                  phraseProcessedParagraphs=sorted(checked), phraseCoverageVersion=PHRASE_COVERAGE_VERSION)
+    return vocab_normalize(result, article)
+
+
 def audit_vocab_coverage(vocab, article, level):
     """离线补齐旧缓存遗漏，不调用模型，也不把尚未生成的段落标成完成。"""
     from . import core_dict
 
-    vocab = _clean_vocab_contractions(vocab)
+    vocab = audit_phrase_coverage(vocab, article)
     if vocab.get("coverageVersion") == VOCAB_COVERAGE_VERSION:
         return vocab
     core_dict.ensure_db(background=False)
@@ -292,16 +333,19 @@ class VocabValidationError(GenError):
         super().__init__("；".join(f"段落 {i}: {text}" for i, text in errors.items())[:500])
 
 
-def _chat_retry(cfg, system, user, max_tokens, on_chars=None, attempts=2, on_attempt=None):
+def _chat_retry(cfg, system, user, max_tokens, on_chars=None, attempts=2, on_attempt=None,
+                **kwargs):
     last = None
     for i in range(attempts):
         if on_attempt:
             on_attempt(i + 1)
         try:
-            return llm.chat(cfg, system, user, max_tokens=max_tokens, on_delta=on_chars)
+            return llm.chat(cfg, system, user, max_tokens=max_tokens, on_delta=on_chars, **kwargs)
+        except llm.RequestCancelled:
+            raise
         except Exception as e:
             last = e
-            if i == 0:
+            if i + 1 < attempts:
                 time.sleep(1.5)
     raise last if last else GenError("调用失败")
 
@@ -410,6 +454,17 @@ def generate_digest(meta, cfg, on_progress=None, on_chars=None, resume=True):
     resume=True 时只对缺摘要/占位的文章发请求（智能续传）；
     落盘保证全量文章都在，失败批次留占位（下次续传补齐）。
     """
+    if meta.get('sourceType') == 'podcast':
+        from . import podcasts
+        def update(**value):
+            if on_chars:
+                on_chars(len(value.get('status', '')))
+        if on_progress:
+            on_progress(0, 1)
+        result = podcasts.generate_digest(meta, cfg, update, llm.RequestControl())
+        if on_progress:
+            on_progress(1, 1)
+        return result
     content = store.ensure_content(meta)
     articles = content["articles"]
     if not articles:
@@ -609,12 +664,12 @@ def _vocab_sections(obj, chunk, lexicon, phrases_only=False):
 
 
 def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, llm_rotation=None, max_workers=2,
-                   enrich=False, phrases_only=False, only_para=None):
+                   enrich=False, phrases_only=False, only_para=None, on_model=None):
     """本地筛词/音标 + 紧凑语境释义；最多两个请求并行，主线程逐块落盘。"""
     started = time.perf_counter()
     existing = store.load_vocab(meta["id"], article["index"], level) or {}
     if existing:
-        audited = audit_vocab_coverage(existing, article, level)
+        audited = audit_phrase_coverage(existing, article) if phrases_only else audit_vocab_coverage(existing, article, level)
         if audited != existing:
             store.save_vocab(meta["id"], audited)
         existing = audited
@@ -626,24 +681,29 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                      for idx, section in old_sections.items()}
     units = [(-1, article["title"]), *enumerate(article["paragraphs"])]
     if phrases_only:
+        # 点击“补充短语”是明确复查请求；旧版把普通词表也标成已检查，不能据此直接跳过。
         units = [(idx, text) for idx, text in units
-                 if idx not in phrase_processed and (only_para is None or idx == only_para)]
+                 if only_para is None or idx == only_para]
     else:
         units = [(idx, text) for idx, text in units if idx not in processed or (enrich and pending_words.get(idx))]
     if not units:
         return vocab_normalize(existing, article)
 
     from . import core_dict
-    cfgmod.ensure_wordlists()
-    dict_set = cfgmod.wordset(level)
-    core_dict.ensure_db(background=False)
-    lexicon = _vocab_lexicon(units)
+    if phrases_only:
+        dict_set, lexicon = set(), {}
+    else:
+        cfgmod.ensure_wordlists()
+        dict_set = cfgmod.wordset(level)
+        core_dict.ensure_db(background=False)
+        lexicon = _vocab_lexicon(units)
     cand = {idx: ([] if phrases_only else candidates([text.replace("’", "'")], dict_set, lexicon))
             for idx, text in units}
     for idx in cand:
         if enrich and idx in processed:
             cand[idx] = pending_words[idx]
     required = {idx: ({} if phrases_only else _required_candidates(text, cand[idx], lexicon)) for idx, text in units}
+    phrase_required = {idx: phrase_candidates(text) for idx, text in units}
 
     rotation = [dict(cfg)]
     for p in llm_rotation or []:
@@ -671,9 +731,9 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
     pending = []
     for chunk in chunks:
         tried = set.intersection(*(tried_by_index.get(idx, set()) for idx, _ in chunk))
-        # 显式点击补缺就是重试授权。优先新渠道，过去失败的配置也不能永久封锁。
-        pending.append((chunk, [c for c in rotation if c.get("name") not in tried]
-                              + [c for c in rotation if c.get("name") in tried]))
+        # 每次显式生成/补缺都先用当前选定模型；历史失败只调整备用渠道的顺序。
+        pending.append((chunk, [rotation[0]] + [c for c in rotation[1:] if c.get("name") not in tried]
+                              + [c for c in rotation[1:] if c.get("name") in tried]))
 
     merged_sections = {p["index"]: p for p in existing.get("paragraphs", [])}
     merged_title = list(existing.get("titleEntries", []))
@@ -683,7 +743,7 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
     censor_hit = False
     lock = threading.Lock()
     received = {}
-    stats = {"chunks": len(chunks), "requests": 0, "inputChars": 0, "outputChars": 0,
+    stats = {"chunks": len(chunks), "requests": 0, "inputChars": 0, "outputChars": 0, "modelsUsed": [],
              "workers": min(max(1, max_workers), 2, len(chunks))}
     system = prompts.phrases_system() if phrases_only else prompts.vocab_system(level_label(level))
 
@@ -703,20 +763,22 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                 break
             name = config.get("name", "?")
             local_words = {w for idx, _ in remaining for w in cand[idx] if (lexicon.get(w) or {}).get("phonetic")}
-            user = (f"文章标题：{article['title'][:80]}\n" + "\n\n".join(
-                f"### 段落 {idx}\n{text}" for idx, text in remaining)) if phrases_only else prompts.vocab_user(
-                    article["title"], -1, remaining, cand, local_words, required)
-            candidate_count = sum(len(cand[idx]) for idx, _ in remaining)
+            user = prompts.vocab_user(article["title"], -1, remaining, cand, local_words, required,
+                                      phrases=phrase_required, phrases_only=phrases_only)
+            candidate_count = sum(len(cand[idx]) + len(phrase_required[idx]) for idx, _ in remaining)
             budget = min(8192, max(2048, 512 + candidate_count * 110
                                   + sum(len(text) for _, text in remaining) // 3))
-            request_cfg = dict(config)
-            if "deepseek" in (config.get("model") or "").lower():
-                request_cfg["thinkingMode"] = "disabled"
+            request_cfg = llm.thinking_config(config, deepseek_mode='disabled')
             with lock:
                 stats["requests"] += 1
                 stats["inputChars"] += len(system) + len(user)
+                info = {"name": name, "model": config.get("model", "")}
+                if info not in stats["modelsUsed"]:
+                    stats["modelsUsed"].append(info)
                 if on_progress:
                     on_progress(completed, len(chunks), name)
+            if on_model:
+                on_model(key, config, True)
             try:
                 raw = llm.chat(request_cfg, system, user, max_tokens=budget, on_delta=chars_received, require_complete=True)
                 with lock:
@@ -738,6 +800,9 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                 if config.get("apiKey"):
                     message = message.replace(config["apiKey"], "[redacted]")
                 details.append({"llm": name, "error": message[:500]})
+            finally:
+                if on_model:
+                    on_model(key, config, False)
         return key, collected, failures, censor, remaining, details
 
     def save():
@@ -745,6 +810,7 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                  "paragraphs": sorted(merged_sections.values(), key=lambda p: p["index"]),
                  "idioms": list({i["word"].lower(): i for i in merged_idioms}.values()),
                  "processedParagraphs": sorted(processed), "phraseProcessedParagraphs": sorted(phrase_processed),
+                 "phraseCoverageVersion": PHRASE_COVERAGE_VERSION,
                  failure_key: chunk_failures, error_key: chunk_errors,
                  ("failedPhraseChunks" if phrases_only else "failedChunks"): failed_chunks,
                  "censorHint": censor_hit,
@@ -764,11 +830,16 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
             censor_hit |= censor
             if sections:
                 for idx, section in sections.items():
-                    section["entries"] = _merge_vocab_entries(old_sections.get(idx, {}).get("entries", []), section["entries"])
+                    generated_words = {e["word"] for e in section["entries"]}
+                    old_entries = [e for e in old_sections.get(idx, {}).get("entries", []) if not (
+                        e.get("senseSource") == "phrase_rule" and e["word"] in phrase_required[idx] and
+                        phrase_required[idx][e["word"]]["lemma"] in generated_words)]
+                    section["entries"] = _merge_vocab_entries(old_entries, section["entries"])
                     sections[idx] = _backfill_vocab_section(section, dict(units)[idx], required[idx], lexicon)
+                    sections[idx] = _backfill_phrase_section(sections[idx], dict(units)[idx], phrase_required[idx])
                 entries = [e for section in sections.values() for e in section["entries"]]
                 # 原形/音标查询用一条 SQLite 连接，本地数据优先，未收录词保留模型音标。
-                phonetics = core_dict.lookup_many([e["word"] for e in entries])
+                phonetics = {} if phrases_only else core_dict.lookup_many([e["word"] for e in entries])
                 for entry in entries:
                     if (phonetics.get(entry["word"]) or {}).get("phonetic"):
                         entry["phonetic"] = phonetics[entry["word"]]["phonetic"]
@@ -783,7 +854,11 @@ def generate_vocab(meta, article, level, cfg, on_progress=None, on_chars=None, l
                         merged_sections[idx] = section
                 if not phrases_only:
                     processed.update(sections)
-                phrase_processed.update(sections)
+                for idx, section in sections.items():
+                    if any(is_phrase(e) and e.get("contextPending") for e in section["entries"]):
+                        phrase_processed.discard(idx)
+                    elif phrases_only:
+                        phrase_processed.add(idx)
                 finished = phrase_processed if phrases_only else processed
                 chunk_failures = {k: v for k, v in chunk_failures.items()
                                   if not all(int(i) in finished for i in k.split(","))}
@@ -810,7 +885,9 @@ def is_phrase(entry):
 
 
 def phrase_pending(vocab, article, only_para=None):
-    checked = set((vocab or {}).get("phraseProcessedParagraphs", []))
+    vocab = vocab or {}
+    checked = set(vocab.get("phraseProcessedParagraphs", [])) if (
+        vocab.get("phraseCoverageVersion") == PHRASE_COVERAGE_VERSION) else set()
     indices = [-1, *range(len(article["paragraphs"]))] if only_para is None else [only_para]
     return sum(idx not in checked for idx in indices)
 
@@ -869,14 +946,17 @@ def _analysis_partial(analysis: dict) -> bool:
     )
 
 
-def analyze(meta, article, sentence, before, after, cfg, on_progress=None):
-    cached = store.load_analysis(meta["id"], sentence, article["index"])
-    if cached and not _analysis_partial(cached):
+def analyze(meta, article, sentence, before, after, cfg, on_progress=None, *,
+            context=None, force=False, deep=False, on_partial=None, control=None, cache_identity=''):
+    from . import core_sentence
+    from .core_grammar import normalize_components
+    import json
+    request_cfg = llm.thinking_config(cfg, deepseek_mode='enabled' if deep else 'disabled',
+                                      deepseek_effort='medium' if deep else None)
+    cached = store.load_analysis(meta["id"], sentence, article["index"], cache_identity)
+    if cached and not force and not deep and not _analysis_partial(cached):
         return cached
     started = time.monotonic()
-    request_cfg = dict(cfg)
-    if "deepseek" in (cfg.get("model") or "").lower():
-        request_cfg["thinkingMode"] = "disabled"
     attempt, first_text_ms = 0, None
 
     def progress(chars):
@@ -892,17 +972,34 @@ def analyze(meta, article, sentence, before, after, cfg, on_progress=None):
         attempt = number
         progress(0)
 
-    user = prompts.analysis_user(sentence, before, after, article["title"])
-    raw = _chat_retry(request_cfg, prompts.analysis_system(), user, 12000,
-                      on_chars=progress, on_attempt=begin)
+    def preview(text):
+        if not on_partial:
+            return
+        obj = core_sentence.partial_object(text)
+        value = {k: obj[k] for k in ('context', 'translation') if isinstance(obj.get(k), str)}
+        if isinstance(obj.get('grammarComponents'), list):
+            value['grammarComponents'] = normalize_components(obj['grammarComponents'], sentence)
+        if isinstance(obj.get('grammarPoints'), list):
+            value['grammarPoints'] = [dict(title=p.get('title', ''), text=p.get('text', ''))
+                for p in obj['grammarPoints'] if isinstance(p, dict)
+                and isinstance(p.get('title', ''), str) and isinstance(p.get('text', ''), str)]
+        on_partial(value)
+
+    user = prompts.analysis_user(sentence, before, after, article["title"], context=context)
+    raw = _chat_retry(request_cfg, prompts.analysis_system(deep=deep), user, 8000 if deep else 5000,
+                      on_chars=progress, on_attempt=begin, attempts=1,
+                      on_text=preview, control=control, require_complete=True)
     model_ms = round((time.monotonic() - started) * 1000)
-    obj = _parse_json(raw, want_array=False)
+    try:
+        obj = json.loads(_extract_json(raw))
+        if not isinstance(obj, dict):
+            raise ValueError('not object')
+    except (ValueError, TypeError):
+        raise GenError('句子讲解返回的 JSON 不完整，请重试；已有讲解已保留') from None
 
     def _s(o, k, default=""):
         v = o.get(k)
         return v if isinstance(v, str) else default
-
-    from .core_grammar import normalize_components
 
     analysis = {
         "vocab": [],
@@ -910,18 +1007,18 @@ def analyze(meta, article, sentence, before, after, cfg, on_progress=None):
         "grammarDiagram": _s(obj, "grammarDiagram").replace("\\n", "\n"),
         "grammarPoints": [
             {"title": gp.get("title", ""), "text": gp.get("text", "")}
-            for gp in obj.get("grammarPoints", [])
-            if isinstance(gp, dict)
+            for gp in (obj.get("grammarPoints") or [])
+            if isinstance(gp, dict) and isinstance(gp.get('title', ''), str) and isinstance(gp.get('text', ''), str)
         ],
         "context": _s(obj, "context"),
         "translation": _s(obj, "translation"),
     }
-    for v in obj.get("vocab", []):
-        if isinstance(v, dict) and (v.get("word") or "").strip():
+    for v in (obj.get("vocab") or []):
+        if isinstance(v, dict) and _s(v, "word").strip():
             analysis["vocab"].append(
                 {
                     "word": v["word"].strip(),
-                    "phonetic": (v.get("phonetic") or "").strip(),
+                    "phonetic": _s(v, "phonetic").strip(),
                     "sense": _s(v, "sense"),
                     "note": _s(v, "note"),
                 }
@@ -932,11 +1029,15 @@ def analyze(meta, article, sentence, before, after, cfg, on_progress=None):
         "modelMs": model_ms, "firstTextMs": first_text_ms,
         "calls": attempt, "outputChars": len(raw),
         "model": cfg.get("model", ""), "thinkingMode": request_cfg.get("thinkingMode", "default"),
+        "reasoningEffort": request_cfg.get("reasoningEffort", "default"),
+        "reviewMode": "deep" if deep else "normal", "contextVersion": core_sentence.CONTEXT_VERSION,
     }
     analysis["partial"] = _analysis_partial(analysis)
-    if not analysis["partial"]:
-        # 残缺结果不落盘：下次双击会自动重试
-        store.save_analysis(meta["id"], sentence, article["index"], analysis)
+    if analysis["partial"]:
+        raise GenError('句子讲解缺少含义、译文或语法结构，请重试；已有讲解已保留')
+    if control:
+        control.check()
+    store.save_analysis(meta["id"], sentence, article["index"], analysis, cache_identity)
     return analysis
 
 
